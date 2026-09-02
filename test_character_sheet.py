@@ -133,6 +133,21 @@ class TestGenerationCore(unittest.TestCase):
             self.assertEqual([v["key"] for v in out["views"]],
                              list(P.CHARACTER_SHEET_VIEWS))
 
+    def test_anchor_chain_false_drops_the_second_reference(self):
+        # anchor_chain=True (the default, exercised above) chains the
+        # rendered front view in as a second ref on later views to fight
+        # hair-color drift — but two same-pose refs can outweigh the pose
+        # instruction in the prompt and leave side/three-quarter views
+        # barely turning the head. anchor_chain=False is the escape
+        # hatch: every view renders from the single avatar reference only.
+        with sheet_env() as env:
+            P.generate_character_sheet("bizarrotrn",
+                                       engine_override="hidream_inline",
+                                       anchor_chain=False)
+            self.assertEqual(len(env.calls), 3)
+            for call in env.calls:
+                self.assertEqual(call["refs"], [str(env.ref.resolve())])
+
     def test_wardrobe_string_is_appended_when_provided(self):
         with sheet_env() as env:
             P.generate_character_sheet("bizarrotrn",
@@ -465,9 +480,11 @@ class TestSheetGenerateRoute(unittest.TestCase):
 
         calls: list[dict] = []
 
-        def fake_sheet(cid, *, engine_override, views, wardrobe, seed):
+        def fake_sheet(cid, *, engine_override, views, wardrobe, seed,
+                       anchor_chain):
             calls.append({"cid": cid, "engine_override": engine_override,
-                          "views": views, "wardrobe": wardrobe, "seed": seed})
+                          "views": views, "wardrobe": wardrobe, "seed": seed,
+                          "anchor_chain": anchor_chain})
             if effect is not None:
                 raise effect
             return {"ok": True, "character_id": cid}
@@ -487,19 +504,21 @@ class TestSheetGenerateRoute(unittest.TestCase):
         self.assertEqual(reply["status"], 200, reply)
         self.assertEqual(calls, [{"cid": "bizarrotrn",
                                   "engine_override": "hidream_inline",
-                                  "views": None, "wardrobe": "", "seed": -1}])
+                                  "views": None, "wardrobe": "", "seed": -1,
+                                  "anchor_chain": True}])
         self.assertTrue(reply["payload"]["ok"])
 
     def test_body_fields_are_forwarded(self):
         reply, calls = self._post(
             "/characters/bizarrotrn/sheet/generate",
             {"engine_override": "mock_inline", "views": ["front"],
-             "wardrobe": "a trench coat", "seed": 7})
+             "wardrobe": "a trench coat", "seed": 7, "anchor_chain": False})
         self.assertEqual(reply["status"], 200)
         self.assertEqual(calls[0], {"cid": "bizarrotrn",
                                     "engine_override": "mock_inline",
                                     "views": ["front"],
-                                    "wardrobe": "a trench coat", "seed": 7})
+                                    "wardrobe": "a trench coat", "seed": 7,
+                                    "anchor_chain": False})
 
     def test_invalid_json_is_400_and_never_renders(self):
         reply, calls = self._post("/characters/bizarrotrn/sheet/generate",

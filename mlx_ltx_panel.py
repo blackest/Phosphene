@@ -23827,7 +23827,8 @@ def generate_character_sheet(character_id: str, *,
                              engine_override: str = "hidream_inline",
                              views: list[str] | None = None,
                              wardrobe: str = "",
-                             seed: int = -1) -> dict:
+                             seed: int = -1,
+                             anchor_chain: bool = True) -> dict:
     """Render a multi-view character sheet for one trained character.
 
     Resolves the character through list_characters(), takes its reference
@@ -23854,6 +23855,20 @@ def generate_character_sheet(character_id: str, *,
     `seed=-1` means random per view; a non-negative seed gives view i
     `seed + i` (the engine's own base_seed+i convention, so a whole sheet
     reproduces from one number).
+
+    `anchor_chain=True` (default, unchanged behavior) feeds every view
+    after the first the rendered front view as a SECOND reference
+    alongside the character's avatar — added to stop hair-color drift
+    on side angles (see the comment at the call site). Measured
+    trade-off: two same-pose reference images can outweigh the pose
+    instruction in the prompt, so at anchor_chain=True the side/
+    three-quarter views sometimes barely turn the head at all. Pass
+    anchor_chain=False to render every view from the single avatar
+    reference only — better pose fidelity, at the cost of the
+    original hair-drift risk the chaining was added to fix. Caller's
+    call: there's no engine-side signal to make one image "identity
+    only" and the other "color only", so this is a whole-sheet
+    on/off switch, not a per-image weight.
     """
     cid = _character_safe_id(character_id)
     engine_override = (engine_override or "hidream_inline").strip().lower()
@@ -23957,7 +23972,8 @@ def generate_character_sheet(character_id: str, *,
             # studio frontal from the same run re-anchors exactly the
             # attributes the avatar leaves ambiguous. hidream and the
             # qwen_edit family both take multi-ref natively.
-            view_refs = [str(ref)] + ([anchor_png] if anchor_png else [])
+            view_refs = [str(ref)] + (
+                [anchor_png] if (anchor_png and anchor_chain) else [])
             push(f"[sheet] {cid}: view {i + 1}/{len(view_keys)} ({key}) "
                  f"via {engine_override}")
             candidates = agent_image_engine.generate(

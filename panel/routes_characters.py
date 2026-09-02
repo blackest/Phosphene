@@ -189,7 +189,7 @@ def get_style_preview(h, parsed) -> None:
 
 # ====== Character sheet — synchronous, JSON body ==================
 # POST /characters/<id>/sheet/generate. All body fields optional:
-# {engine_override, wardrobe, views, seed}. Synchronous like
+# {engine_override, wardrobe, views, seed, anchor_chain}. Synchronous like
 # /image/generate (the caller blocks for the 3-view render);
 # generate_character_sheet owns the GPU gate and refuses with a
 # busy error rather than queueing.
@@ -227,6 +227,7 @@ def post_character_sheet_generate(h, path, qs, ctype) -> None:
             views=payload.get("views"),
             wardrobe=str(payload.get("wardrobe") or ""),
             seed=payload.get("seed", -1),
+            anchor_chain=bool(payload.get("anchor_chain", True)),
         )
     except P.CharacterSheetBusyError as e:
         h._json({"error": str(e)}, 429); return
