@@ -25,6 +25,56 @@ def get_characters(h, parsed) -> None:
     h._json({"characters": P.list_library_characters()})
 
 
+# Register a "draft" character from a single reference photo already on
+# this machine — no LoRA, no training. See create_draft_character()'s
+# docstring for why this exists: generate_character_sheet() needs a
+# character_id to resolve through list_characters(), but requiring a
+# trained LoRA for that made it useless for its own stated purpose of
+# producing the missing-angle images a LoRA is trained FROM.
+#
+# Local-caller endpoint: source_image_path is a path already on this
+# machine's disk (this panel and its caller — e.g. Immich Ring
+# Visualizer — run on the same box), not an uploaded file, so there's
+# no multipart handling here, unlike /train/upload.
+@post("/characters")
+def post_characters_create_draft(h, path, qs, ctype) -> None:
+    try:
+        length = int(h.headers.get("Content-Length") or "0")
+    except ValueError:
+        h._json({"error": "invalid Content-Length"}, 400); return
+    if length <= 0:
+        h._json({"error": "JSON body required: trigger, source_image_path"}, 400)
+        return
+    if length > 8 * 1024:
+        h._json({"error": "body too large (max 8192 bytes)"}, 413); return
+    try:
+        payload = P.json.loads(h.rfile.read(length).decode() or "{}")
+    except (P.json.JSONDecodeError, UnicodeDecodeError):
+        h._json({"error": "invalid JSON body"}, 400); return
+    if not isinstance(payload, dict):
+        h._json({"error": "JSON body must be an object"}, 400); return
+
+    trigger = str(payload.get("trigger") or "").strip()
+    source_image_path = str(payload.get("source_image_path") or "").strip()
+    if not trigger or not source_image_path:
+        h._json({"error": "trigger and source_image_path are required"}, 400)
+        return
+    try:
+        character = P.create_draft_character(
+            trigger, source_image_path,
+            name=str(payload.get("name") or ""),
+            pronoun=str(payload.get("pronoun") or ""),
+            subject_noun=str(payload.get("subject_noun") or ""),
+        )
+    except P.DraftCharacterExistsError as e:
+        h._json({"error": str(e)}, 409); return
+    except FileNotFoundError as e:
+        h._json({"error": str(e)}, 404); return
+    except ValueError as e:
+        h._json({"error": str(e)}, 400); return
+    h._json({"ok": True, "character": character})
+
+
 # Progress poll for the one-click sample-character download.
 @get("/characters/download-sample/status")
 def get_characters_download_sample_status(h, parsed) -> None:

@@ -81,7 +81,7 @@ def sheet_env(*, with_bundle=True, preview=None, with_ref=True,
         saved = (P.list_characters, P._CHARACTERS_CACHE_PATH,
                  P.LORA_LAB_ROOT, P._preflight_image_job, P.push,
                  P.agent_image_engine.generate)
-        P.list_characters = lambda: [record]
+        P.list_characters = lambda **kw: [record]
         P._CHARACTERS_CACHE_PATH = chars
         P.LORA_LAB_ROOT = lab
         P._preflight_image_job = lambda *a, **k: None
@@ -191,7 +191,7 @@ class TestGenerationCore(unittest.TestCase):
 
     def test_unknown_character_is_lookup_error(self):
         with sheet_env():
-            P.list_characters = lambda: []
+            P.list_characters = lambda **kw: []
             with self.assertRaises(LookupError):
                 P.generate_character_sheet("bizarrotrn")
 
@@ -474,7 +474,7 @@ class TestSheetGenerateRoute(unittest.TestCase):
 
         saved = (P.generate_character_sheet, P.list_characters, P.push)
         P.generate_character_sheet = fake_sheet
-        P.list_characters = lambda: []
+        P.list_characters = lambda **kw: []
         P.push = lambda line: None
         try:
             h.do_POST()

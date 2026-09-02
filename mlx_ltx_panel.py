@@ -3377,7 +3377,7 @@ def _character_bundle(trigger: str) -> dict:
         return {}
 
 
-def list_characters() -> list[dict]:
+def list_characters(*, include_drafts: bool = False) -> list[dict]:
     """Scan mlx_models/loras/ for character LoRAs and return one record per
     discovered character.
 
@@ -3393,40 +3393,73 @@ def list_characters() -> list[dict]:
     callers should skip audio cues in their prompts. `has_voice` exposes
     that state to the UI so a Silent badge + disabled audio toggle can
     render appropriately.
+
+    `include_drafts=True` also surfaces "draft" characters — an id with
+    a bundle.json + reference photo (see create_draft_character()) but no
+    trained LoRA yet. These exist so generate_character_sheet() can render
+    turnaround views from a single photo BEFORE training: the sheet's own
+    views become part of the dataset used to actually train the LoRA, so
+    requiring a LoRA to reach the sheet generator was backwards for that
+    path. Default is False so every existing caller (the Characters tab,
+    /characters/<id>/generate, list_library_characters()) keeps seeing
+    only real, generation-ready characters — a draft has no face LoRA and
+    can't drive video generation at all.
     """
     loras_dir = _safe_loras_dir()
-    if not loras_dir.is_dir():
-        return []
     voice_exts = sorted(TRAIN_VOICE_EXTS)
+    trained_paths: dict[str, Path] = {}
+    if loras_dir.is_dir():
+        for face_path in sorted(loras_dir.glob("*_v2.safetensors")):
+            trigger = face_path.name[: -len("_v2.safetensors")]
+            if _CHARACTERS_ID_RE.match(trigger):
+                trained_paths[trigger] = face_path
+
+    draft_triggers: set[str] = set()
+    if include_drafts and _CHARACTERS_CACHE_PATH.is_dir():
+        for char_dir in sorted(_CHARACTERS_CACHE_PATH.iterdir()):
+            trigger = char_dir.name
+            if (char_dir.is_dir() and trigger not in trained_paths
+                    and _CHARACTERS_ID_RE.match(trigger)
+                    and (char_dir / "bundle.json").is_file()):
+                draft_triggers.add(trigger)
+
     out: list[dict] = []
-    for face_path in sorted(loras_dir.glob("*_v2.safetensors")):
-        trigger = face_path.name[: -len("_v2.safetensors")]
-        if not _CHARACTERS_ID_RE.match(trigger):
-            continue
+    for trigger in sorted(set(trained_paths) | draft_triggers):
+        face_path = trained_paths.get(trigger)
         audio_path = loras_dir / f"{trigger}.audio.safetensors"
-        has_audio = audio_path.is_file()
+        has_audio = bool(face_path) and audio_path.is_file()
         # Look for any voice sample with a supported extension; pick the
         # first match in TRAIN_VOICE_EXTS order. The Train tab writes
         # whatever extension the user uploaded.
         voice_sample_path: Path | None = None
-        for ext in voice_exts:
-            candidate = loras_dir / f"{trigger}.voice{ext}"
-            if candidate.is_file():
-                voice_sample_path = candidate
-                break
+        if face_path:
+            for ext in voice_exts:
+                candidate = loras_dir / f"{trigger}.voice{ext}"
+                if candidate.is_file():
+                    voice_sample_path = candidate
+                    break
         bundle = _character_bundle(trigger)
         sample = _character_dataset_image(trigger)
         sheet = _character_sheet_png(trigger)
-        compat_parts = [_ltx_lora_compatibility(face_path)]
-        if has_audio:
-            compat_parts.append(_ltx_lora_compatibility(audio_path))
-        incompatible = next(
-            (part for part in compat_parts if part["ltx_compatible"] is False),
-            None,
-        )
-        compatibility_known = all(
-            part["ltx_compatible"] is not None for part in compat_parts
-        )
+        # Compatibility checking needs an actual LoRA file — a draft has
+        # none, so it's neither compatible nor incompatible, just N/A.
+        # ltx_compatible=None already reads as "unknown/not applicable" to
+        # every existing consumer (list_library_characters() only filters
+        # out `is False`), so drafts pass through untouched.
+        incompatible = None
+        compatibility_known = False
+        if face_path:
+            compat_parts = [_ltx_lora_compatibility(face_path)]
+            if has_audio:
+                compat_parts.append(_ltx_lora_compatibility(audio_path))
+            incompatible = next(
+                (part for part in compat_parts
+                 if part["ltx_compatible"] is False),
+                None,
+            )
+            compatibility_known = all(
+                part["ltx_compatible"] is not None for part in compat_parts
+            )
         out.append({
             "id": trigger,
             "trigger": trigger,
@@ -3435,7 +3468,12 @@ def list_characters() -> list[dict]:
             "subject_noun": bundle.get("subject_noun") or "person",
             "default_action": bundle.get("default_action") or "",
             "sexy_directive": bool(bundle.get("sexy_directive", False)),
-            "face_lora_path": str(face_path),
+            # True once a trained face LoRA exists. A draft (photo +
+            # bundle.json, no LoRA yet) is False — it can render a
+            # character sheet (generate_character_sheet doesn't touch
+            # the LoRA) but can't drive video generation.
+            "trained": face_path is not None,
+            "face_lora_path": str(face_path) if face_path else None,
             # Legacy field — present iff the audio LoRA exists. New callers
             # should prefer `audio_lora` + `has_voice` for clarity.
             "audio_lora_path": str(audio_path) if has_audio else None,
@@ -3464,7 +3502,7 @@ def list_characters() -> list[dict]:
             "ltx_fusion_tallies": [
                 part["ltx_fusion_tally"] for part in compat_parts
                 if part.get("ltx_fusion_tally")
-            ],
+            ] if face_path else [],
         })
     return out
 
@@ -3475,6 +3513,82 @@ def list_library_characters() -> list[dict]:
         char for char in list_characters()
         if char.get("ltx_compatible") is not False
     ]
+
+
+class DraftCharacterExistsError(Exception):
+    """Raised by create_draft_character() when the trigger is already
+    taken, trained or draft."""
+
+
+def create_draft_character(trigger: str, source_image_path: str, *,
+                            name: str = "", pronoun: str = "",
+                            subject_noun: str = "") -> dict:
+    """Register an untrained "draft" character from a single reference
+    photo already on disk (e.g. a face picked in Immich Ring Visualizer,
+    a frame pulled from a video, or any local file) — no LoRA required.
+
+    This exists to break a real chicken-and-egg problem: building a good
+    face LoRA needs multiple angles, but the character-sheet generator
+    that synthesizes those missing angles (generate_character_sheet)
+    used to require a trigger already discoverable via list_characters(),
+    which in turn required a trained LoRA. A draft sidesteps that: it's
+    just an id + a copied reference photo + a bundle.json with no LoRA
+    fields, discoverable only via list_characters(include_drafts=True).
+    Train the character normally once you've got a dataset (the sheet's
+    own views can become part of it) and the same trigger keeps working
+    - list_characters() treats a trigger as trained the moment a LoRA
+    with that name shows up in mlx_models/loras/, draft bundle or not.
+
+    Raises ValueError on a bad trigger/path/extension, FileNotFoundError
+    if source_image_path doesn't exist, and DraftCharacterExistsError if
+    the trigger is already in use (trained or draft) - delete the
+    existing character first (POST /characters/<id>/delete) to reuse it.
+    """
+    cid = _character_safe_id(trigger)
+    existing = next((c for c in list_characters(include_drafts=True)
+                     if c["id"] == cid), None)
+    if existing is not None:
+        raise DraftCharacterExistsError(
+            f"character {cid!r} already exists "
+            f"({'trained' if existing['trained'] else 'draft'})")
+
+    src = Path(source_image_path)
+    if not src.is_file():
+        raise FileNotFoundError(f"source_image_path not found: {src}")
+    ext = src.suffix.lower()
+    if ext not in TRAIN_IMAGE_EXTS:
+        raise ValueError(
+            f"unsupported image type {ext!r}; want one of "
+            f"{sorted(TRAIN_IMAGE_EXTS)}")
+    size = src.stat().st_size
+    if size <= 0 or size > TRAIN_MAX_BYTES_PER_IMAGE:
+        raise ValueError(
+            f"source image is {size} bytes; must be > 0 and <= "
+            f"{TRAIN_MAX_BYTES_PER_IMAGE} (32 MB)")
+
+    char_dir = _CHARACTERS_CACHE_PATH / cid
+    char_dir.mkdir(parents=True, exist_ok=True)
+    # Same convention _character_dataset_image() already looks for first:
+    # mlx_models/characters/<trigger>/avatar.<ext> — a straight copy, not
+    # a re-encode, so a JPEG stays a JPEG (matches run_train_job_inner's
+    # own "copies the first training image" behavior).
+    avatar_path = char_dir / f"avatar{ext}"
+    shutil.copyfile(src, avatar_path)
+    bundle_path = char_dir / "bundle.json"
+    bundle_path.write_text(json.dumps({
+        "schema": "phosphene/character_bundle@1",
+        "id": cid,
+        "name": (name or "").strip() or cid,
+        "pronoun": (pronoun or "").strip() or "they",
+        "subject_noun": (subject_noun or "").strip() or "person",
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    created = next((c for c in list_characters(include_drafts=True)
+                    if c["id"] == cid), None)
+    if created is None:  # pragma: no cover - defensive; we just wrote it
+        raise RuntimeError(f"draft character {cid!r} not discoverable "
+                            "right after creation")
+    return created
 
 
 # ---- Shipped sample character ------------------------------------------------
@@ -23887,7 +24001,10 @@ def generate_character_sheet(character_id: str, *,
     except (TypeError, ValueError):
         raise ValueError("seed must be an integer")
 
-    char = next((c for c in list_characters() if c["id"] == cid), None)
+    # include_drafts=True: an untrained (photo-only) character is
+    # exactly who calls this — see list_characters()'s docstring.
+    char = next((c for c in list_characters(include_drafts=True)
+                 if c["id"] == cid), None)
     if char is None:
         raise LookupError(f"character {cid!r} not found")
 
