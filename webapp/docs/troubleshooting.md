@@ -37,7 +37,7 @@ If you updated and the panel still behaves like the old version, it is still run
 
 ## The GPU watchdog {#gpu-watchdog}
 
-*"the macOS GPU watchdog killed a Metal command buffer"* — macOS itself stopped a GPU task that ran too long. It is a driver-level kill, not a Phosphene bug report. Phosphene retries the prompt encoding at a shorter length for the rest of the session. If it keeps happening, the message links to the GitHub issue where chip, macOS version and the crash log help most.
+*"the macOS GPU watchdog killed a Metal command buffer"* — macOS itself stopped a GPU task that ran too long. It is a driver-level kill, not a Phosphene bug report, and it is most common on M1 and M2 Macs. Phosphene renders the same job again once, straight away, in **short GPU steps** (smaller pieces of GPU work, a little slower), and remembers the size: its next render on this Mac starts in short steps, and the Queue row says so. If macOS stops it even in short steps, that size is paused on this Mac for 24 hours (or until the next update) and the card offers **Retry smaller**. If it keeps happening, the message links to the GitHub issue where chip, macOS version and the crash log help most.
 
 ## A character training run failed {#training-failed}
 

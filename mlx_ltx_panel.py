@@ -284,6 +284,52 @@ def _engine_install_running() -> bool:
     return True
 
 
+#: 4.17.5 - why the engine environment is not usable, in one closed word.
+#: The installer's own words (scripts/pinokio/install_cause.sh) plus the two
+#: the panel can see for itself. docs/ANALYTICS.md, install_step.cause.
+ENGINE_ENV_CAUSES = ("network", "disk", "uv_error", "python_missing", "timeout",
+                     "installing", "other", "unknown")
+ENGINE_ENV_RESULT_NAME = ".phosphene_engine_result.json"
+
+
+def engine_env_record() -> dict | None:
+    """What ltx_engine_env.sh wrote on its last finished run, or None."""
+    try:
+        rec = json.loads((HELPER_PYTHON.parent.parent / ENGINE_ENV_RESULT_NAME)
+                         .read_text(encoding="utf-8"))
+        return rec if isinstance(rec, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def engine_env_cause() -> str:
+    """Why the engine venv cannot render, in ENGINE_ENV_CAUSES. Only meaningful
+    while engine_env_fault() is non-empty.
+
+    An installer still running wins (a first boot during Install is the usual
+    way a fresh install reports a broken venv - two of the four 4.17.4 cases);
+    then a missing interpreter, which the panel sees directly; then the
+    installer's record of its own last failure; else "unknown" (an install
+    that stopped before the engine step, or one older than 4.17.5)."""
+    try:
+        if _engine_install_running():
+            return "installing"
+        if not HELPER_PYTHON.is_file():
+            return "python_missing"
+        rec = engine_env_record() or {}
+        cause = str(rec.get("cause") or "")
+        if rec.get("outcome") == "failed" and cause in ENGINE_ENV_CAUSES:
+            return cause
+    except Exception:                                          # noqa: BLE001
+        pass
+    return "unknown"
+
+
+#: Whether the last engine_env_status() saw an installer running - so the panel
+#: reports engine_env again when an Install that was mid-way at boot finishes.
+_ENGINE_ENV_WATCH = {"installing": None}
+
+
 def engine_env_status() -> dict:
     """/status.engine_env: can a render start, and if not, what is happening."""
     fault = engine_env_fault()
@@ -293,9 +339,24 @@ def engine_env_status() -> dict:
     # NOT ready while an installer is still writing the venv, even once the
     # package directory has appeared (Codex 4.17.4 #1): the --reinstall pass
     # and the codec patch come after it.
-    installing = bool(repair.get("active")) or _engine_install_running()
-    return {"ok": not fault and not installing, "fault": fault,
-            "installing": installing, "repair": repair}
+    external = _engine_install_running()
+    installing = bool(repair.get("active")) or external
+    # An Install that was running when the panel booted reported engine_env
+    # "failed" (cause installing). When it finishes, say how it ended - the
+    # funnel otherwise keeps that install as broken until its next boot. Only
+    # Pinokio's Install (its lock file): the panel's own Repair reports itself.
+    was = _ENGINE_ENV_WATCH.get("installing")
+    _ENGINE_ENV_WATCH["installing"] = external
+    if was and not external and not repair.get("active"):
+        _analytics_install_step(
+            "engine_env", "failed" if fault else "ok",
+            _analytics_error_class(fault) if fault else "",
+            cause=engine_env_cause() if fault else "")
+    out = {"ok": not fault and not installing, "fault": fault,
+           "installing": installing, "repair": repair}
+    if fault and not installing:
+        out["cause"] = engine_env_cause()
+    return out
 
 
 def engine_env_busy() -> str:
@@ -379,7 +440,8 @@ def _engine_env_repair_thread() -> None:
     push("[engine] " + (f"repair failed: {error}" if error
                         else "engine environment repaired - renders can run"))
     _analytics_install_step("engine_env", "failed" if fault else "ok",
-                            "venv_broken" if fault else "")
+                            "venv_broken" if fault else "",
+                            cause=engine_env_cause() if fault else "")
 
 if not HELPER_PYTHON.is_file():
     sys.stderr.write(
@@ -521,6 +583,20 @@ def _resolve_ffprobe(ffmpeg: Path) -> Path:
 FFMPEG = _resolve_ffmpeg()
 FFMPEG_BIN = FFMPEG.parent
 FFPROBE = _resolve_ffprobe(FFMPEG)
+
+
+def media_tool_path(path: str = "") -> str:
+    """PATH for a child process that shells out to ffmpeg AND ffprobe.
+
+    4.17.5 (fleet): a Control export died with "ffprobe not found on PATH" -
+    the engine library looks both tools up on PATH, and every child spawn
+    prepended only FFMPEG's folder. When ffprobe was resolved from another
+    folder (above) the child could not see it, though the panel had found it."""
+    dirs = [str(FFMPEG_BIN)]
+    if FFPROBE.exists() and str(FFPROBE.parent) not in dirs:
+        dirs.append(str(FFPROBE.parent))
+    rest = [d for d in (path or "").split(":") if d and d not in dirs]
+    return ":".join(dirs + rest)
 # Say it at boot, the way a missing helper venv is said above: an export that
 # dies 20 minutes into a render is a terrible place to learn this.
 if FFMPEG_NOTE:
@@ -5303,6 +5379,18 @@ def _check_remote_once() -> None:
         f"https://raw.githubusercontent.com/{_VERSION_REPO_OWNER}/"
         f"{_VERSION_REPO_NAME}/main/VERSION"
     )
+    # 4.17.5 (fleet): "Phosphene 4.17.4 is out - you're on 4.17.4". A local
+    # HEAD that is not among public main's commits (a local merge or commit
+    # on main, a re-made history) read as "30+ behind" even when the tree
+    # already IS the latest release - and the pop-up asked people to update
+    # to the build they run. Public main bumps VERSION on every release, so
+    # an unknown SHA carrying the remote's own VERSION is not behind.
+    with _VERSION_LOCK:
+        _local_v = (_VERSION_STATE.get("local_version") or "").strip()
+    same_release = bool(more and remote_version and _local_v
+                        and remote_version.strip() == _local_v)
+    if same_release:
+        behind_by, more, ahead = 0, False, []
     # The maintainer broadcast rides the same 30-min cadence. Failures and
     # absence read as "no message" — _fetch_broadcast never raises.
     broadcast = _fetch_broadcast()
@@ -5312,6 +5400,7 @@ def _check_remote_once() -> None:
         _VERSION_STATE["remote_version"] = remote_version
         _VERSION_STATE["behind_by"] = behind_by
         _VERSION_STATE["behind_more_than"] = more
+        _VERSION_STATE["local_unlisted_same_release"] = same_release
         _VERSION_STATE["commits_ahead"] = ahead
         _VERSION_STATE["checked_ts"] = time.time()
         _VERSION_STATE["error"] = None
@@ -5373,6 +5462,7 @@ def get_version_state() -> dict:
     snap["disk_version"] = _read_local_version()
     snap["stale_process"] = bool(
         disk_sha and boot["sha"] and disk_sha != boot["sha"])
+    snap["post_update"] = post_update_status()
     return snap
 
 
@@ -10109,6 +10199,173 @@ def m1_m2_long_clip_watchdog_refusal(mode: str, quality: str, model_frames: int)
         f"sliding windows (Video → Advanced → long clip mode) renders a longer "
         f"clip as a chain of short passes instead of one long one."
     )
+
+
+# ---- THE METAL WATCHDOG LOOP (4.17.5) ---------------------------------------
+# Fleet 4.17.4: one M1 Max 32 GB install rendered LTX Standard 768x448 121f
+# i2v (Sharp x2) from the form 50 times in 15 h and macOS's GPU watchdog
+# killed 48 of them ~30 s in (SIGABRT, kIOGPUCommandBufferCallbackErrorTimeout),
+# while every Retry of the same job succeeded (33 of 33). An M2 Max 96 GB
+# (keyframe) and an M2 Pro 32 GB (Balanced t2v) hit it too. Nothing made the
+# next attempt different, and nothing stopped the loop.
+#
+# What the watchdog times is ONE Metal command buffer. MLX packs ops into a
+# buffer until it holds max_ops_per_buffer ops or max_mb_per_buffer MB of
+# inputs (mlx/backend/metal/device.cpp: 50 ops / 50 MB on Max-class GPUs,
+# 40/40 on base/Pro), and exposes both as env vars, MLX_MAX_OPS_PER_BUFFER /
+# MLX_MAX_MB_PER_BUFFER. The same buffer that an M4 finishes in time runs
+# 2-4x longer on an M1/M2 (and longer still when the Mac pages under memory
+# pressure, which scales with the bytes the buffer touches). The VAE decode of
+# a clip at or under 121 frames is ONE graph with no stage barriers at all
+# (upstream tiles only past an 8 GB budget). So:
+#
+#   1. M1/M2-class GPUs always spawn the helper with smaller buffers
+#      (GPU_STEPS_M1M2) - command-buffer boundaries do not change any kernel,
+#      so the output is bit-identical; the cost was measured on this Mac
+#      (fleet_4175.txt).
+#   2. A watchdog kill re-runs THAT job once, at once, on SHORT steps
+#      (GPU_STEPS_SHORT: one op per command buffer, the decode's one big graph
+#      included, and - when it died in prompt encoding - the shorter Gemma
+#      encode #44 already had), with one line in the log saying why. Nothing
+#      was delivered yet, so nothing is lost but the time to the kill.
+#   3. The setting (engine, mode, quality, canvas, length) is remembered in
+#      state/metal_watchdog.json: its next run STARTS on short steps.
+#   4. If short steps are killed too, that setting is refused up front on
+#      this Mac (render_refused hardware_tier, the way out in the sentence)
+#      for 24 hours or until the next update. Two failures, never fifty.
+METAL_WATCHDOG_FILE = STATE_DIR / "metal_watchdog.json"
+METAL_WATCHDOG_REFUSE_SEC = 24 * 3600
+_METAL_WATCHDOG_LOCK = threading.Lock()
+#: M1/M2: buffers a fifth of MLX's Max-class default (bit-identical output).
+GPU_STEPS_M1M2 = {"MLX_MAX_OPS_PER_BUFFER": "10", "MLX_MAX_MB_PER_BUFFER": "10"}
+#: The short path after a kill: every Metal op in a command buffer of its own
+#: (the VAE decode's single graph included), still bit-identical output.
+GPU_STEPS_SHORT = {"MLX_MAX_OPS_PER_BUFFER": "1", "MLX_MAX_MB_PER_BUFFER": "1"}
+#: Closed vocabulary for render_*.watchdog_phase (docs/ANALYTICS.md).
+WATCHDOG_PHASES = ("encode", "load", "denoise", "decode")
+GPU_STEPS_NOTE = ("short GPU steps: macOS's GPU watchdog stopped this setting "
+                  "before on this Mac, so it renders in smaller pieces (a "
+                  "little slower)")
+
+
+def gpu_steps_m1m2() -> bool:
+    """Is this an M1/M2-class GPU (the watchdog generation)?"""
+    return _hw_chip_family() in _M1_M2_WATCHDOG_RISK_FAMILIES
+
+
+def metal_watchdog_key(params: dict | None) -> str:
+    """The setting a watchdog kill is remembered against. Closed fields only:
+    engine, mode, quality, canvas, frames - never a prompt or a path."""
+    p = params or {}
+    try:
+        w, h = int(p.get("width") or 0), int(p.get("height") or 0)
+        frames = int(p.get("frames") or 0)
+    except (TypeError, ValueError):
+        w = h = frames = 0
+    mode = str(p.get("mode") or "").strip().lower()
+    if not mode:
+        return ""
+    parts = [str(p.get("engine") or "ltx").strip().lower(), mode,
+             str(p.get("quality") or "").strip().lower(), f"{w}x{h}", str(frames)]
+    # Codex 4.17.5: Extend / Retake / Colorize / Control / Upscale take their
+    # geometry and length from a SOURCE CLIP and their own fields, not the
+    # form's width/height/frames - so the source (hashed: this file stays
+    # local, but it never needs the path) and the fields they consume are
+    # part of the setting, or one big Retake would pause every small one.
+    if mode in ("extend", "retake", "restore", "control", "upscale"):
+        src = str(p.get("video_path") or p.get("upscale_source_path")
+                  or p.get("restore_video_path") or p.get("control_video_path")
+                  or "")
+        parts.append(hashlib.sha1(src.encode("utf-8", "replace")).hexdigest()[:10])
+        for k in ("extend_frames", "extend_direction", "retake_start_sec",
+                  "retake_end_sec", "upscale"):
+            if p.get(k) not in (None, ""):
+                parts.append(f"{k}={p.get(k)}")
+    return "|".join(parts)
+
+
+def _metal_watchdog_load() -> dict:
+    """The store, reset when the running build differs from the one that
+    wrote it - an update is exactly when a refused setting deserves a try."""
+    try:
+        data = json.loads(METAL_WATCHDOG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict) or data.get("version") != running_version():
+        data = {"version": running_version(), "settings": {}}
+    if not isinstance(data.get("settings"), dict):
+        data["settings"] = {}
+    return data
+
+
+def _metal_watchdog_save(data: dict) -> None:
+    try:
+        atomic_write_text(METAL_WATCHDOG_FILE, json.dumps(data, indent=1))
+    except OSError:
+        pass
+
+
+def metal_watchdog_record_kill(key: str, *, short: bool, phase: str = "") -> dict:
+    """Count one watchdog kill of `key` (on short steps or not); the entry."""
+    if not key:
+        return {}
+    with _METAL_WATCHDOG_LOCK:
+        data = _metal_watchdog_load()
+        ent = dict(data["settings"].get(key) or {})
+        field = "short_kills" if short else "kills"
+        ent[field] = int(ent.get(field) or 0) + 1
+        ent["last_ts"] = int(time.time())
+        if short:
+            ent["short_last_ts"] = ent["last_ts"]
+        if phase:
+            ent["phase"] = phase
+        if phase == "encode":
+            ent["short_encode"] = True
+        data["settings"][key] = ent
+        _metal_watchdog_save(data)
+        return ent
+
+
+def metal_watchdog_wants_short(key: str) -> bool:
+    """Has macOS's watchdog killed this setting on this Mac (this build)?"""
+    if not key:
+        return False
+    with _METAL_WATCHDOG_LOCK:
+        ent = _metal_watchdog_load()["settings"].get(key) or {}
+    return int(ent.get("kills") or 0) + int(ent.get("short_kills") or 0) > 0
+
+
+def metal_watchdog_needs_short_encode(key: str) -> bool:
+    """Was this setting killed in prompt encoding (it re-runs with the shorter
+    Gemma encode as well as short steps)?"""
+    if not key:
+        return False
+    with _METAL_WATCHDOG_LOCK:
+        ent = _metal_watchdog_load()["settings"].get(key) or {}
+    return bool(ent.get("short_encode"))
+
+
+def metal_watchdog_refusal(key: str, now: float | None = None,
+                           mode: str | None = None) -> str | None:
+    """The refusal for a setting the watchdog killed even on short steps, for
+    METAL_WATCHDOG_REFUSE_SEC after that kill; else None."""
+    if not key:
+        return None
+    with _METAL_WATCHDOG_LOCK:
+        ent = _metal_watchdog_load()["settings"].get(key) or {}
+    if int(ent.get("short_kills") or 0) <= 0:
+        return None
+    last = int(ent.get("short_last_ts") or ent.get("last_ts") or 0)
+    if (now if now is not None else time.time()) - last > METAL_WATCHDOG_REFUSE_SEC:
+        return None
+    way = ("Press Retry smaller, or pick a lower quality or a shorter clip"
+           if str(mode or "t2v") in ("t2v", "i2v", "i2v_clean_audio", "a2v",
+                                     "keyframe", "upscale")
+           else "Try a shorter extension or section, or a shorter source clip")
+    return ("macOS's GPU watchdog stopped this exact render twice on this Mac - "
+            "the second time in short GPU steps - so it is not started again "
+            f"(it would stop the same way). {way}. This size is tried again "
+            "after the next update, or in 24 hours.")
 
 
 
@@ -16198,7 +16455,7 @@ def music_child_env(base: dict | None = None) -> dict:
     # its stdout). Pinokio's bundled binary is not on the default PATH, which
     # is the same trap that cost five installs their exports in 4.15.1 — so the
     # music child gets the resolved one prepended, exactly like the H3 spawn.
-    env["PATH"] = f"{FFMPEG_BIN}:{env.get('PATH', '')}"
+    env["PATH"] = media_tool_path(env.get("PATH", ""))
     return env
 
 
@@ -17371,22 +17628,45 @@ def _analytics_boot() -> None:
         _env_fault = engine_env_fault()
         _analytics_install_step(
             "engine_env", "failed" if _env_fault else "ok",
-            _analytics_error_class(_env_fault) if _env_fault else "")
+            _analytics_error_class(_env_fault) if _env_fault else "",
+            cause=engine_env_cause() if _env_fault else "")
         _analytics_install_step(
             "weights_check", "ok" if _analytics_weights_ready() else "failed")
         # ---- did the last Update actually land ---------------------------
         _pressed = str(get_settings().get("analytics_update_pressed") or "")
         if _pressed:
             _settings_set_internal(analytics_update_pressed="")
-            if _pressed != running_version():
-                _analytics_update_outcome("running_new", "ok", _pressed)
+            _landed, _from = update_pressed_landed(_pressed)
+            if _landed:
+                _analytics_update_outcome("running_new", "ok", _from)
             else:
                 # Pressed Update, came back on the same build. Either the pull
                 # failed or the app never actually restarted into a new one —
                 # both are the hole this event exists to measure.
-                _analytics_update_outcome("restart_pending", "failed", _pressed)
+                _analytics_update_outcome("restart_pending", "failed", _from)
     except Exception:
         pass
+
+
+def update_pressed_marker() -> str:
+    """What "Update was pressed" records: the running VERSION and, when known,
+    the build's SHA ("4.17.4@a69d7ed..."). Read back at the next boot by
+    update_pressed_landed()."""
+    sha = boot_build_stamp().get("sha") or ""
+    return f"{running_version()}@{sha}" if sha else running_version()
+
+
+def update_pressed_landed(marker: str) -> tuple[bool, str]:
+    """(did an update land since the marker was written, the from-version).
+
+    4.17.5: a different VERSION landed; so did a different build under the SAME
+    VERSION (a SHA change). The same VERSION and the same SHA did not. A marker
+    from 4.17.4 or earlier has no SHA and compares by VERSION alone."""
+    ver, _, sha = str(marker or "").partition("@")
+    if ver != running_version():
+        return True, ver
+    boot_sha = boot_build_stamp().get("sha") or ""
+    return bool(sha and boot_sha and sha != boot_sha), ver
 
 
 # Closed vocabularies. A value outside these never reaches the network: the
@@ -17400,7 +17680,8 @@ _UPDATE_STAGES = ("running_new", "restart_pending")
 _UPDATE_OUTCOMES = ("ok", "failed")
 
 
-def _analytics_install_step(step: str, outcome: str, error_class: str = "") -> None:
+def _analytics_install_step(step: str, outcome: str, error_class: str = "",
+                            *, cause: str = "") -> None:
     """One step of getting from "installed" to "rendered".
 
     AT MOST ONCE PER STEP PER INSTALL, and for `engine_env` once more each
@@ -17420,13 +17701,20 @@ def _analytics_install_step(step: str, outcome: str, error_class: str = "") -> N
             return
         seen = get_settings().get("analytics_install_steps")
         seen = dict(seen) if isinstance(seen, dict) else {}
-        if seen.get(step) == outcome:
+        # The answer is outcome AND cause: "failed (still installing)" turning
+        # into "failed (network)" is a change worth one more event.
+        answer = f"{outcome}:{cause}" if (outcome == "failed" and cause) else outcome
+        if seen.get(step) == answer:
             return
-        seen[step] = outcome
+        seen[step] = answer
         _settings_set_internal(analytics_install_steps=seen)
         props = {"step": step, "outcome": outcome, "version": running_version()}
         if error_class:
             props["error_class"] = error_class
+        # 4.17.5: WHY a failed step failed, one closed word (ENGINE_ENV_CAUSES)
+        # read from the installer's own record - never its output, no paths.
+        if outcome == "failed" and cause:
+            props["cause"] = cause if cause in ENGINE_ENV_CAUSES else "other"
         # SYS-16: "first_queue" vs "first_render" (render_completed's own
         # first_render prop) is the funnel this event exists to answer, and
         # the reviewer's own finding is that activation is LOWEST on the
@@ -17724,8 +18012,14 @@ _ANALYTICS_ERROR_CLASSES = (
     # `render_failed` event — it is the routing decision that sends the
     # event to `render_refused` instead. See _analytics_render_event.
     ("refused", tuple(n for _, ns in _ANALYTICS_REFUSAL_REASONS for n in ns)),
+    # 4.17.5: the SAME kill under its other name. macOS reports the watchdog
+    # as ImpactingInteractivity when the stalled buffer froze the display
+    # (#59; the WarmHelper regex already knew it) - fleet 4.17.2: 4 renders
+    # filed under `other` with exactly that line.
     ("metal_watchdog", ("kiogpucommandbuffercallbackerrortimeout",
-                        "caused gpu timeout error")),
+                        "caused gpu timeout error",
+                        "kiogpucommandbuffercallbackerrorimpactinginteractivity",
+                        "impacting interactivity")),
     # THE OTHER Metal command-buffer failure, and it is not the watchdog.
     # `kIOGPUCommandBufferCallbackErrorOutOfMemory` means the GPU ran out of
     # memory; the timeout above means one buffer took too long. Both print
@@ -17982,6 +18276,14 @@ def _analytics_render_event(job: dict) -> None:
             "source": _analytics_source(p, job),
             "audio_mode": _analytics_audio_mode(p, engine, mode),
         }
+        # 4.17.5: did this render run in short GPU steps (the Metal watchdog
+        # path), and did a watchdog kill get re-run inside the same job?
+        if job.get("gpu_steps") == "short":
+            props["gpu_steps"] = "short"
+        if job.get("watchdog_retry"):
+            props["watchdog_retry"] = True
+        if job.get("watchdog_phase") in WATCHDOG_PHASES:
+            props["watchdog_phase"] = job["watchdog_phase"]
         # wall_sec_bucket only when the wall clock is known — a None would
         # just pollute the percentile aggregation it exists to feed.
         wall = _analytics_wall_sec_bucket(job.get("elapsed_sec"))
@@ -20462,6 +20764,15 @@ class WarmHelper:
         self.gemma_max_length: int | None = None
         self._metal_timeout_seen = False
         self._past_prompt_encode = False
+        # 4.17.5 (the watchdog loop): short GPU steps for the rest of this boot
+        # once a run needed them, and which step size the live helper was
+        # spawned with (MLX reads the buffer caps once, at device creation).
+        self.gpu_short_session = False
+        self._gpu_short_wanted = False
+        self._spawned_gpu_short: bool | None = None
+        # The phase the helper was in at its last line - a watchdog kill is
+        # remembered with it ("encode" / "load" / "denoise" / "decode").
+        self._last_phase = ""
         # What the helper said on its way out. A helper that dies during
         # startup prints its traceback and exits, and the panel used to
         # report only the bookkeeping event — `helper failed to start:
@@ -20490,7 +20801,7 @@ class WarmHelper:
             if busy:
                 raise RuntimeError(f"Not started: {busy}. Press Retry then.")
             env = os.environ.copy()
-            env["PATH"] = f"{FFMPEG_BIN}:{env.get('PATH', '')}"
+            env["PATH"] = media_tool_path(env.get("PATH", ""))
             env["LTX_MODEL"] = base_model_dir()
             # The Q8 pack directory, stated rather than string-derived. The
             # helper's _upscaler_dir() otherwise guesses it by swapping the
@@ -20559,6 +20870,18 @@ class WarmHelper:
                     push(f"[gemma-fallback] encoding prompts at "
                          f"{self.gemma_max_length} tokens for the rest of this "
                          f"session (Metal GPU watchdog seen on this machine)")
+            # 4.17.5: Metal command-buffer size (see GPU_STEPS_M1M2). A value
+            # the user set in the environment is never overridden.
+            _short = bool(self._gpu_short_wanted)
+            _steps = (GPU_STEPS_SHORT if _short
+                      else GPU_STEPS_M1M2 if gpu_steps_m1m2() else {})
+            for _k, _v in _steps.items():
+                if not os.environ.get(_k):
+                    env[_k] = _v
+            self._spawned_gpu_short = _short
+            if _steps:
+                push(f"[gpu] {'short' if _short else 'M1/M2'} GPU steps: "
+                     + ", ".join(f"{k}={env[k]}" for k in _steps))
             push(f"Spawning warm helper (low_memory={HELPER_LOW_MEMORY}, idle_timeout={HELPER_IDLE_TIMEOUT}s)")
             self.proc = subprocess.Popen(
                 [str(HELPER_PYTHON), str(HELPER_SCRIPT)],
@@ -20881,6 +21204,17 @@ class WarmHelper:
             self._metal_timeout_seen = True
         if not self._past_prompt_encode and self._PAST_PROMPT_ENCODE_RX.search(line):
             self._past_prompt_encode = True
+        for _rx, _phase in self._PHASE_RX:
+            if _rx.search(line):
+                self._last_phase = _phase
+                break
+
+    _PHASE_RX = (
+        (re.compile(r"\[Decoding|step:decode|vae-decode", re.I), "decode"),
+        (re.compile(r"Denoising|step:denoise", re.I), "denoise"),
+        (re.compile(r"Loading transformer|step:get_pipe", re.I), "load"),
+        (re.compile(r"Encoding prompt|Loading text encoder", re.I), "encode"),
+    )
 
     def _gemma_fallback_applies(self) -> bool:
         """True when the run that just died is a retryable Gemma-encode
@@ -20898,33 +21232,105 @@ class WarmHelper:
                 and self.gemma_max_length is None
                 and not self.is_alive())
 
-    def run(self, job_spec: dict, timeout: float | None = None) -> dict:
-        """Run a job, with one automatic retry at a shorter Gemma prompt
-        encode if the macOS GPU watchdog killed this machine's encode.
+    def _set_gpu_steps(self, short: bool) -> None:
+        """Ask for short (or default) GPU steps for the next run. The caps are
+        read by MLX once per process, so a live helper spawned with the other
+        size is retired between jobs; _ensure spawns the right one."""
+        self._gpu_short_wanted = bool(short)
+        if (self._spawned_gpu_short is not None
+                and self._spawned_gpu_short != bool(short) and self.is_alive()):
+            with self.run_lock:
+                self.kill()
 
-        The retry is deliberately cheap and bounded: the timeout happens
-        before ANY sampling or output is written, the helper is already
-        dead (so _ensure respawns it with the shorter length), and the
-        fallback arms at most once per panel boot — every later job in the
-        session spawns pre-mitigated instead of crashing again.
+    def run(self, job_spec: dict, timeout: float | None = None) -> dict:
+        """Run a job; when macOS's GPU watchdog kills it, run it again once.
+
+        #44 (2026-08): a kill during Gemma prompt encoding re-runs at a shorter
+        padded length, armed once per boot. 4.17.5 generalises the retry to a
+        kill in ANY phase: the second run uses short GPU steps (GPU_STEPS_SHORT)
+        and the setting is remembered (metal_watchdog_*), so its next run
+        starts short and a kill on short steps refuses it for a day. The
+        helper is dead after a kill (SIGABRT), so nothing half-done collides.
         """
-        try:
-            return self._run_once(job_spec, timeout=timeout)
-        except RuntimeError:
-            if not self._gemma_fallback_applies():
-                raise
+        job = _thread_job()
+        params = (job or {}).get("params")
+        key = metal_watchdog_key(params) if job else ""
+        refusal = metal_watchdog_refusal(key, mode=(params or {}).get("mode"))
+        if refusal:
+            raise RenderRefused("hardware_tier", refusal)
+        if key and metal_watchdog_wants_short(key) and not self.gpu_short_session:
+            self.gpu_short_session = True
+            push(f"[gpu] {GPU_STEPS_NOTE[0].upper()}{GPU_STEPS_NOTE[1:]}.")
+        # A setting that was killed in prompt encoding also gets back the
+        # shorter Gemma encode it was saved with (Codex 4.17.5: a restart kept
+        # the short steps but lost the encode mitigation).
+        if (key and self.gemma_max_length is None
+                and metal_watchdog_needs_short_encode(key)):
             self.gemma_max_length = self.GEMMA_FALLBACK_MAX_LENGTH
-            push(f"[gemma-fallback] the macOS GPU watchdog killed prompt "
-                 f"encoding on this chip. Retrying this job once with Gemma "
-                 f"encoding at {self.gemma_max_length} tokens instead of 1024 "
-                 f"— nothing was rendered yet, so no work is lost.")
-        return self._run_once(job_spec, timeout=timeout)
+        short = bool(self.gpu_short_session)
+        if short and job is not None:
+            _gpu_steps_note(job)
+        # Each re-run must bring a mitigation the last run did not have: short
+        # steps, or (killed in prompt encoding) the shorter Gemma encode. So at
+        # most three runs, and only while something is left to try.
+        for _attempt in range(3):
+            self._set_gpu_steps(short)
+            try:
+                return self._run_once(job_spec, timeout=timeout)
+            except RuntimeError as exc:
+                watchdog = self._metal_timeout_seen and not self.is_alive()
+                if not watchdog:
+                    raise
+                gemma = self._gemma_fallback_applies()
+                can_retry = gemma or (bool(key) and not short)
+                if key:
+                    # Terminal (refuses the setting) only when nothing is left.
+                    metal_watchdog_record_kill(key, short=short and not gemma,
+                                               phase=self._last_phase)
+                # Which phase the GPU was in when macOS stopped it - the one
+                # fact the fleet has never had about this failure.
+                if job is not None and self._last_phase in WATCHDOG_PHASES:
+                    job["watchdog_phase"] = self._last_phase
+                with LOCK:
+                    cancelled = bool(job is not None
+                                     and job.get("cancel_requested"))
+                if cancelled or not can_retry:
+                    if short and key and not cancelled:
+                        # The store now refuses this setting for a day; say
+                        # so, with the way out.
+                        raise RuntimeError(
+                            f"{exc} This render already ran in short GPU steps, "
+                            f"so this size is not started again on this Mac for "
+                            f"24 hours - press Retry smaller, or pick a lower "
+                            f"quality or a shorter clip.") from exc
+                    raise
+                if gemma:
+                    self.gemma_max_length = self.GEMMA_FALLBACK_MAX_LENGTH
+                was_short = short
+                if key:
+                    self.gpu_short_session = True
+                    short = True
+                if job is not None:
+                    job["watchdog_retry"] = True
+                    if short:
+                        _gpu_steps_note(job)
+                push("[gpu] macOS's GPU watchdog stopped this render (one Metal "
+                     "step ran too long on this Mac"
+                     + (", during prompt encoding" if gemma else "")
+                     + "). Rendering it again"
+                     + (" in short GPU steps" if short and not was_short else "")
+                     + (f" with prompts encoded at {self.gemma_max_length} tokens"
+                        if gemma else "")
+                     + " - a little slower; this Mac keeps it for this size "
+                       "from now on.")
+        raise RuntimeError("unreachable: the watchdog retry loop ended")
 
     def _run_once(self, job_spec: dict, timeout: float | None = None) -> dict:
         # Per-run detector state — reset here so a watchdog kill seen on an
         # earlier job can't arm the fallback for an unrelated failure.
         self._metal_timeout_seen = False
         self._past_prompt_encode = False
+        self._last_phase = ""
         # Whole-run serialization so concurrent callers don't both park in
         # _read_until and grab each other's done/error events. See __init__
         # for why this is distinct from self.lock.
@@ -21122,6 +21528,18 @@ class WarmHelper:
         if proc is None or proc.poll() is not None:
             return None
         return proc.pid
+
+
+def _gpu_steps_note(job: dict) -> None:
+    """Mark a job that rendered on short GPU steps: the analytics prop and the
+    note the Queue row and Now card show (generation_clamp_notes)."""
+    job["gpu_steps"] = "short"
+    p = job.get("params")
+    if isinstance(p, dict):
+        notes = list(p.get("generation_clamp_notes") or [])
+        if GPU_STEPS_NOTE not in notes:
+            notes.append(GPU_STEPS_NOTE)
+        p["generation_clamp_notes"] = notes
 
 
 HELPER = WarmHelper()
@@ -21690,7 +22108,7 @@ def run_postprocess_tracked(cmd: list[str], label: str) -> tuple[str, str]:
         return _sb_film_job_ffmpeg(cmd, label, film_job)
     push(f"{label}: " + " ".join(shlex.quote(c) for c in cmd))
     env = os.environ.copy()
-    env["PATH"] = f"{FFMPEG_BIN}:{env.get('PATH', '')}"
+    env["PATH"] = media_tool_path(env.get("PATH", ""))
     proc = run_tracked_subprocess(cmd, pgid_key="mux_pgid", label=label,
                                   job=_thread_job(), env=env)
     stdout, stderr = proc.stdout, proc.stderr
@@ -22010,7 +22428,7 @@ def _sb_film_job_ffmpeg(cmd: list, label: str, job: dict,
     kill it mid-encode. Same return/raise shape as run_postprocess_tracked."""
     push(f"{label}: " + " ".join(shlex.quote(str(c)) for c in cmd))
     env = os.environ.copy()
-    env["PATH"] = f"{FFMPEG_BIN}:{env.get('PATH', '')}"
+    env["PATH"] = media_tool_path(env.get("PATH", ""))
     with _SB_FILM_JOB_LOCK:
         if job.get("cancel"):
             raise FilmRenderCanceled(f"{label}: canceled before it started")
@@ -29160,6 +29578,31 @@ def music_lora_unresolved(raw) -> list[str]:
     return bad
 
 
+def music_lora_foreign(raw) -> list[str]:
+    """One sentence per picked adapter that is not a YuE2 music LoRA.
+
+    4.17.5 (fleet): a video (LTX) LoRA copied into the music LoRA folder was
+    picked for a song, which then failed after the whole model load with
+    "unsupported tensor targets: diffusion_model...". Read from each file's
+    safetensors header (names only), so the pick is refused by name at the
+    queue - before any engine starts."""
+    try:
+        from scripts.pinokio.music_lora_fetch import (
+            music_adapter_problem, parse_field, resolve_in_pack)
+    except Exception:                                           # noqa: BLE001
+        return []
+    out = []
+    for identifier, _strength in parse_field(raw):
+        try:
+            path = resolve_in_pack(MUSIC_LORAS, identifier)
+        except (OSError, ValueError):
+            continue        # music_lora_unresolved names these
+        problem = music_adapter_problem(path)
+        if problem:
+            out.append(problem)
+    return out
+
+
 def _engine_would_be_h3(requested: str, mode: str) -> bool:
     """Would a job asking for this engine ACTUALLY render on H3?
 
@@ -29979,7 +30422,10 @@ def _a2v_separator_install_thread(trigger: str = "form") -> None:
                                       else "installed - Listen to the voice only is ready"))
     _analytics_separator_install(
         "failed" if error else "ok", f"panel_{trigger}", error_class,
-        ready=st["ready"], weights=st["weights"])
+        ready=st["ready"], weights=st["weights"],
+        cause=("timeout" if error_class == "timeout" else
+               str((_a2v_separator_record() or {}).get("cause") or ""))
+        if error else "")
     # This run wrote the outcome record itself; mark it reported so the next
     # boot does not count it twice.
     _rec = _a2v_separator_record()
@@ -30005,7 +30451,8 @@ def _a2v_separator_record() -> dict | None:
 
 
 def _analytics_separator_install(outcome: str, via: str, error_class: str = "",
-                                 *, ready: bool, weights: bool) -> None:
+                                 *, ready: bool, weights: bool,
+                                 cause: str = "") -> None:
     """One separator install, however it ran. Closed words only - never the
     installer's own output (paths), never a host or a byte count."""
     try:
@@ -30017,6 +30464,9 @@ def _analytics_separator_install(outcome: str, via: str, error_class: str = "",
         if outcome == "failed":
             props["error_class"] = (error_class if error_class in
                                     _SEPARATOR_INSTALL_ERRORS else "other")
+            # 4.17.5: why, in install_cause.sh's closed words (the record's).
+            if cause:
+                props["cause"] = cause if cause in ENGINE_ENV_CAUSES else "other"
         _analytics_capture("separator_install", props)
     except Exception:                                          # noqa: BLE001
         pass
@@ -30038,7 +30488,8 @@ def a2v_separator_boot() -> None:
             _analytics_separator_install(
                 str(rec.get("outcome") or ""), str(rec.get("via") or ""),
                 str(rec.get("error_class") or ""),
-                ready=st["ready"], weights=st["weights"])
+                ready=st["ready"], weights=st["weights"],
+                cause=str(rec.get("cause") or ""))
     except Exception:                                          # noqa: BLE001
         pass
     if (os.environ.get("PHOSPHENE_SEPARATOR_AUTOINSTALL") or "1").strip() == "0":
@@ -30153,6 +30604,117 @@ def a2v_requested_scale(params: dict):
     return raw
 
 
+# 4.17.5 (fleet): EMPTY INPUTS REACHED THE QUEUE. On 4.17.4 one install queued
+# Upscale and Control with source '' and Image mode with no picture (and once
+# mode "retain", which no surface offers) - each waited its turn and failed as a
+# red card. The form already refuses most of these, but /queue/add is also the
+# API, and a stale page or a script never runs the form's guards. So the queue
+# refuses them itself, before anything is queued, in the form's own words.
+#
+# Every mode make_job's video branch can produce. Music, image and train return
+# from make_job before this matters (their own branches validate them).
+QUEUEABLE_VIDEO_MODES = frozenset((
+    "t2v", "i2v", "i2v_clean_audio", "extend", "keyframe", "a2v", "retake",
+    "restore", "ingredients", "control", "upscale", "sharp_export",
+))
+_IMAGE_CONDITIONED_MODES = ("i2v", "i2v_clean_audio")
+INPUT_MISSING_IMAGE = ("Image mode needs a reference image — drop one into the "
+                       "Image slot, or switch to Text mode and render from the "
+                       "prompt alone.")
+INPUT_MISSING_UPSCALE = ("Pick the clip to fix first — choose it in the list, or "
+                         "press Upscale & Face Fix on a clip in Outputs.")
+INPUT_MISSING_CONTROL = ("Control needs a clip to follow — pick one in the Control "
+                         "video picker, or switch to Text mode.")
+INPUT_MISSING_AUDIO = ("Lip-sync needs a song or a voice recording — pick one in "
+                       "the Audio slot first.")
+
+
+def job_input_refusal(params: dict) -> str | None:
+    """Why this job can only fail for want of an input, or None.
+
+    For /queue/add and /queue/retry - NOT make_job, which internal chains also
+    call with a source the previous job is still writing. Same checks, same
+    words as run_job_inner's own (which stay as the backstop for queued jobs
+    whose file goes away while they wait)."""
+    p = params or {}
+    m = str(p.get("mode") or "t2v").strip().lower()
+    if m in ("music", "image", "train"):
+        return None
+    if m not in QUEUEABLE_VIDEO_MODES:
+        return (f"Unknown render mode {m!r} - nothing was queued. Pick a mode "
+                f"in the form (Text, Image, Lip-sync, Keyframes, Extend, "
+                f"Control, Upscale & Face Fix).")
+
+    def _path(*keys) -> str:
+        for k in keys:
+            v = str(p.get(k) or "").strip()
+            if v:
+                return v
+        return ""
+
+    def _exists(v: str) -> bool:
+        try:
+            return Path(v).exists()
+        except (OSError, ValueError):
+            return False
+
+    def _audio() -> str:
+        # make_job fills an unpicked Audio slot with AUDIO_DEFAULT, a demo
+        # file no installer ships: that is "nothing picked", not a lost file.
+        a = _path("audio")
+        return "" if (a == str(AUDIO_DEFAULT) and not _exists(a)) else a
+
+    if m in _IMAGE_CONDITIONED_MODES:
+        img = _path("image")
+        if not img:
+            return INPUT_MISSING_IMAGE
+        if not _exists(img):
+            return (f"The reference image is no longer on disk: {img}. It was "
+                    "moved, renamed or deleted after it was picked. Pick it "
+                    "again, or choose another image.")
+        if m == "i2v_clean_audio":
+            audio = _audio()
+            if not audio:
+                return INPUT_MISSING_AUDIO
+            if not _exists(audio):
+                return (f"audio file not found: {audio}. It was moved or deleted "
+                        "after it was picked - pick it again in the Audio slot.")
+    elif m == "upscale":
+        src = _path("upscale_source_path", "restore_video_path")
+        if not src:
+            return INPUT_MISSING_UPSCALE
+        if not _exists(src):
+            return (f"source clip for {FACE_FIX_NAME} not found: {src!r}. Pick "
+                    "a finished clip in the Outputs gallery (or paste a path).")
+    elif m == "control":
+        src = _path("control_video_path")
+        if not src:
+            return INPUT_MISSING_CONTROL
+        if not _exists(src):
+            return (f"control video not found: {src!r}. Pick a clip in the "
+                    "Control video picker (or paste a path) whose "
+                    "motion/structure should drive the render.")
+    elif m == "restore":
+        src = _path("restore_video_path")
+        if not src or not _exists(src):
+            return (f"source video for Colorize not found: {src!r}. Pick a B&W "
+                    "clip in the Colorize source picker (or paste a path).")
+    elif m in ("extend", "retake"):
+        src = _path("video_path")
+        if not src or not _exists(src):
+            what = "Extend" if m == "extend" else "Retake"
+            return (f"{what} needs the clip it continues - pick a finished clip "
+                    f"(source {src!r} is not on disk).")
+    elif m == "a2v":
+        audio = _audio()
+        if not audio:
+            return INPUT_MISSING_AUDIO
+        if not _exists(audio):
+            return (f"audio file not found: {audio}. It was moved or deleted "
+                    "after it was picked - pick it again in the Audio slot.")
+    return None
+
+
 def make_job(form: dict[str, list[str]] | dict[str, str], *,
              override_prompt: str | None = None) -> dict:
     def f(name: str, default: str = "") -> str:
@@ -30189,6 +30751,11 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
                 raise MusicRequestError(
                     "These picked LoRAs are not in the music LoRA folder, so the "
                     "song would be made without them: " + ", ".join(missing))
+            foreign = music_lora_foreign(form.get("music_loras"))
+            if foreign:
+                raise MusicRequestError(
+                    "; ".join(foreign) + ". Untick it in the LoRA list, then "
+                    "make the song again.")
             # A TRAINED VOICE IS TRAINED IN ONE DIALECT (M6-04). A `direct`
             # voice never saw a score in its prefix and the engine refuses a
             # score with `--mode off`; a `score` voice was trained with one.
@@ -34082,7 +34649,7 @@ def run_h3_job_inner(job: dict) -> None:
     env = os.environ.copy()
     # The runner pipes raw RGB into `ffmpeg` from PATH (minimax_h3_mlx.media);
     # Pinokio's bundled binary is not on the default PATH.
-    env["PATH"] = f"{FFMPEG_BIN}:{env.get('PATH', '')}"
+    env["PATH"] = media_tool_path(env.get("PATH", ""))
     env["PYTHONUNBUFFERED"] = "1"
     # FP16 VAE decode — the default (h3_vae_fp16_decode()). Passed as the runner's
     # own flag so the argv says what ran; a runner that predates the flag
@@ -38200,6 +38767,148 @@ def _push_job_done(job: dict) -> None:
         push(f"[push] skipped: {exc}")
 
 
+# --- "Update now" finishes like Pinokio's Update (beta, after 4.17.4) --------
+# THE HOLE. The panel's own "Update now" (/version/pull) was a git pull and a
+# restart. It never ran scripts/post_update.sh - the step Pinokio's Update runs
+# after its pull - so anything a release ADDS there (a package, a pin, a
+# weight) silently did not happen. 4.17.3 shipped the Lip-sync voice separator
+# that way, and a 16 GB Mac that pressed Update now got 3 refused Lip-sync jobs
+# a second after the new build came up (fleet, 2026-10-01). 4.17.4 heals that
+# one package at boot; this closes the class.
+#
+# After a pull that moved HEAD, the panel now runs post_update.sh itself, in
+# the background, with the environment Pinokio gives that script (release
+# skill section 1): Pinokio's own uv/conda on PATH (_music_install_env), the
+# kernel's hardcoded vars, and the keys Pinokio deletes deleted. The queue
+# holds while it runs (and the helper is stopped - the script reinstalls the
+# packages it has open); a pull during a render waits for that render. Restart
+# stays refused until it has finished, and a failure says why and points at
+# Pinokio's Update. post_update.sh is idempotent: on a warm install it is a
+# verify pass of a minute or two.
+POST_UPDATE_LOCK = threading.Lock()
+POST_UPDATE: dict = {"state": "idle", "active": False, "pending": False}
+POST_UPDATE_SCRIPT = "scripts/post_update.sh"
+POST_UPDATE_TIMEOUT_S = 3 * 3600
+#: What Pinokio 8.2.0's kernel exports into every shell it runs (release
+#: skill section 1). post_update.sh has only ever run under these.
+_PINOKIO_KERNEL_ENV = {"PYTORCH_ENABLE_MPS_FALLBACK": "1",
+                       "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1",
+                       "CONDA_SHORTCUTS": "0", "CMAKE_OBJECT_PATH_MAX": "1024"}
+
+
+def _post_update_env() -> dict:
+    """Pinokio's environment for post_update.sh, rebuilt from this process."""
+    env = _music_install_env()          # Pinokio's uv/conda on PATH, no venv
+    for k in list(env):
+        if (re.search(r"SSH|SSL", k) or k.startswith(("CUDA", "BLUEFAIRY_"))
+                or k in ("PYTHONPATH", "CMAKE_MAKE_PROGRAM", "CMAKE_GENERATOR")):
+            del env[k]
+    env.update(_PINOKIO_KERNEL_ENV)
+    return env
+
+
+def post_update_status() -> dict:
+    with POST_UPDATE_LOCK:
+        out = {k: v for k, v in POST_UPDATE.items() if k != "log"}
+        out["log"] = [l.replace(str(Path.home()), "~")
+                      for l in list(POST_UPDATE.get("log") or [])[-6:]]
+    return out
+
+
+def post_update_start(trigger: str = "update_now") -> tuple[int, dict]:
+    """Run post_update.sh in the background once the GPU is free."""
+    if not (ROOT / POST_UPDATE_SCRIPT).is_file():
+        return 200, {"ok": True, "nothing_to_do": True}
+    with POST_UPDATE_LOCK:
+        if POST_UPDATE.get("active") or POST_UPDATE.get("pending"):
+            return 409, {"error": "The update is already being finished.",
+                         "post_update": True}
+        POST_UPDATE.clear()
+        POST_UPDATE.update({"state": "waiting", "active": False, "pending": True,
+                            "trigger": trigger, "error": None,
+                            "started_ts": None, "finished_ts": None,
+                            "log": collections.deque(maxlen=80)})
+    threading.Thread(target=_post_update_thread, daemon=True,
+                     name="post-update").start()
+    return 202, {"ok": True, "started": True}
+
+
+def _post_update_thread() -> None:
+    # A render that is running keeps its GPU and its venv: wait it out. The
+    # queue already holds (_external_build_hold reads `pending`).
+    while True:
+        with LOCK:
+            busy = STATE.get("current") is not None
+        if not busy:
+            break
+        time.sleep(1.0)
+    # 4.17.5 (Codex): and hold the process-wide GPU gate for the whole run.
+    # Prompt Enhance and an inline image render take _GPU_LOCK without being
+    # the queue's current job: Enhance would have its helper killed under it
+    # (or respawn one mid-reinstall), and an image render would run against
+    # packages being replaced. Waiting for the gate waits them out; holding
+    # it refuses new ones ("busy") until the script is done.
+    _GPU_LOCK.acquire()
+    try:
+        _post_update_run()
+    finally:
+        _GPU_LOCK.release()
+
+
+def _post_update_run() -> None:
+    with POST_UPDATE_LOCK:
+        POST_UPDATE.update(state="running", active=True, pending=False,
+                           started_ts=time.time())
+    push("[update] finishing the update: running scripts/post_update.sh "
+         "(the step Pinokio's Update runs after its pull)")
+    try:
+        HELPER.kill()                   # it has the packages open
+    except Exception:                                          # noqa: BLE001
+        pass
+    head = _git_capture(["rev-parse", "HEAD"]) or ""
+    tail: list[str] = []
+    error = None
+    timer = None
+    try:
+        proc = subprocess.Popen(["bash", str(ROOT / POST_UPDATE_SCRIPT), str(ROOT)],
+                                cwd=str(ROOT), env=_post_update_env(),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                errors="replace", start_new_session=True)
+        timer = _kill_group_after(proc, POST_UPDATE_TIMEOUT_S)
+        for raw in proc.stdout:
+            for line in raw.replace("\r", "\n").splitlines():
+                line = line.rstrip()
+                if not line:
+                    continue
+                tail = (tail + [line])[-12:]
+                with POST_UPDATE_LOCK:
+                    POST_UPDATE["log"].append(line[:300])
+        rc = proc.wait(timeout=60)
+        if getattr(timer, "fired", False):
+            raise subprocess.TimeoutExpired("post_update.sh", POST_UPDATE_TIMEOUT_S)
+        if rc != 0:
+            what = next((l for l in tail if "PHOSPHENE UPDATE FAILED:" in l), "")
+            error = (what.split("PHOSPHENE UPDATE FAILED:", 1)[1].strip()
+                     if what else f"post_update.sh stopped (exit {rc})")
+    except subprocess.TimeoutExpired:
+        error = "the update step took longer than 3 hours"
+    except Exception as exc:                                     # noqa: BLE001
+        error = f"the update step could not run: {exc}"
+    finally:
+        if timer is not None:
+            timer.cancel()
+    with POST_UPDATE_LOCK:
+        POST_UPDATE.update(active=False, pending=False, finished_ts=time.time(),
+                           state="failed" if error else "done", error=error,
+                           head=head)
+    push("[update] " + (f"finishing the update FAILED: {error}. Use Pinokio's "
+                        f"Update (Stop, then Update) to finish it." if error else
+                        "update finished - restart to load the new version"))
+    with QUEUE_COND:
+        QUEUE_COND.notify_all()
+
+
 def _external_build_hold() -> str:
     """Why the worker must not start a job right now, or "".
 
@@ -38211,6 +38920,9 @@ def _external_build_hold() -> str:
     lock whose pid is gone (the build was killed past its trap) or that is
     older than four hours holds nothing: a stale file must never wedge the
     queue."""
+    with POST_UPDATE_LOCK:
+        if POST_UPDATE.get("pending") or POST_UPDATE.get("active"):
+            return "the update (installing what the new version needs)"
     lock = STATE_DIR / "h3_build.lock"
     try:
         raw = lock.read_text(encoding="utf-8")

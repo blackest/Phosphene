@@ -2847,6 +2847,15 @@ async function repairModel(key) {
 // offers nothing: a second installer into the same venv would race it.
 let _engineEnvWasBroken = false;
 function engineEnvBannerHtml(st) {
+  // /status.engine_env.cause (4.17.5) in the user's words. Server vocabulary:
+  // ENGINE_ENV_CAUSES in mlx_ltx_panel.py; "unknown" and "installing" say nothing.
+  const ENGINE_ENV_CAUSE_TEXT = {
+    network: 'The last install could not reach the package server - check the connection.',
+    timeout: 'The last install timed out downloading packages - check the connection.',
+    disk: 'The last install ran out of disk space - free some space first.',
+    uv_error: 'The last install could not resolve or build a package.',
+    python_missing: 'The engine Python stopped working - run Install from Pinokio to rebuild it (models kept).',
+  };
   if (!st || st.ok) return '';
   const rep = st.repair || {};
   const last = (rep.log || []).slice(-1)[0] || '';
@@ -2864,9 +2873,12 @@ function engineEnvBannerHtml(st) {
       + '<button class="btn btn-primary" data-action="repair-engine">Try again</button></span>'
       + pinokio;
   }
+  // 4.17.5: why the last install stopped, when its installer recorded it.
+  const why = ENGINE_ENV_CAUSE_TEXT[st.cause] || '';
   return '<span style="font-weight:700">The render engine did not finish installing</span>'
     + '<span style="opacity:.92">Its Python packages are missing from its environment, so '
-    + 'renders cannot start. Repair re-installs only those packages (a few minutes); '
+    + 'renders cannot start. ' + (why ? escapeHtml(why) + ' ' : '')
+    + 'Repair re-installs only those packages (a few minutes); '
     + 'every model is kept.</span>'
     + '<span style="margin-left:auto;display:flex;gap:8px">'
     + '<button class="btn btn-primary" data-action="repair-engine">Repair engine</button></span>'
@@ -2979,6 +2991,15 @@ function nowCardFailureActions(last, info) {
       `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
       `<span>Repair engine</span></button>` + dismiss;
   }
+  // 4.17.5: a size refused because macOS's GPU watchdog stopped it (even in
+  // short GPU steps) has one way forward - smaller. Retry as is would only be
+  // refused again.
+  if (refusedTier && smaller && action !== 'models') {
+    return `<button type="button" class="now-card-retry" data-action="retry-smaller" ` +
+      `title="Try again smaller — one quality rung down, a smaller canvas and about half the length">` +
+      `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
+      `<span>Retry smaller</span></button>` + dismiss;
+  }
   if (refusedTier && action !== 'models') return dismiss;
   return (action === 'models'
             ? `<button type="button" class="now-card-retry" onclick="openModelsModal()" ` +
@@ -3000,6 +3021,19 @@ function nowCardFailureActions(last, info) {
 }
 function friendlyJobError(raw, engine) {
   raw = raw || 'unknown error';
+  // 4.17.5: a size macOS's GPU watchdog stopped twice on this Mac (once in
+  // short GPU steps) is refused up front instead of failing again - smaller
+  // is the way forward, and the card offers exactly that.
+  if (/GPU watchdog stopped this exact render/i.test(raw)) {
+    return {
+      friendly: 'This size is paused on this Mac.',
+      hint: 'macOS stopped it twice, the second time in short GPU steps. Retry smaller '
+          + 'renders one quality rung down at about half the length.',
+      smaller: true,
+      details: raw,
+      docsAnchor: 'gpu-watchdog',
+    };
+  }
   // 4.17.4 (fleet: venv_broken, 18 installs in 30 days): the engine venv has
   // no engine packages - "Retry" fails the same way in one second, every time.
   // One gave up after three. Point at the one-click repair instead.
@@ -3058,7 +3092,9 @@ function friendlyJobError(raw, engine) {
     // the specific, common case on M1/M2-class GPUs; anything else that
     // aborts at the C level still gets the crashlog ask, just demoted.
     const isWatchdog = rawLower.includes('gpu watchdog') || rawLower.includes('gpu timeout')
-      || rawLower.includes('commandbuffercallbackerrortimeout');
+      || rawLower.includes('commandbuffercallbackerrortimeout')
+      || rawLower.includes('impacting interactivity')
+      || rawLower.includes('commandbuffercallbackerrorimpactinginteractivity');
     if (isWatchdog) {
       return {
         friendly: 'macOS stopped the render — this Mac ran out of GPU time.',

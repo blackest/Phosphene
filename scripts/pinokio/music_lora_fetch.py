@@ -49,6 +49,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re as _re
 import shutil
 import sys
 
@@ -267,6 +268,12 @@ def _entry(path: Path, root: Path, *, builtin: bool) -> dict:
         elif meta.get("dialect") == "score":
             bits.append("trained with a score — use Melody or Melody + chords")
         note = " · ".join(filter(None, [note] + bits))
+    # 4.17.5: a dropped-in file that is not a music adapter (a video LoRA, the
+    # fleet case) says so in the picker, and the queue refuses it by name.
+    problem = "" if builtin else music_adapter_problem(path)
+    if problem:
+        meta = {**meta, "problem": problem}
+        note = problem
     return {"id": str(path.relative_to(root)), "file": path.name, "name": label,
             "note": note, "builtin": builtin, "branch": branch,
             "bytes": path.stat().st_size,
@@ -289,6 +296,75 @@ def pack_adapters(root) -> list[dict]:
         found += [_entry(path, root, builtin=False)
                   for path in sorted(user.rglob("*.safetensors"))]
     return found
+
+
+# 4.17.5 (fleet): a YuE2 song failed after its whole model load with
+# "unsupported tensor targets: diffusion_model..." - a VIDEO (LTX) LoRA had been
+# copied into the music LoRA folder and picked. yue2_lora.read_adapter refuses
+# it correctly, but only once the engine is up. These read the file's
+# safetensors HEADER (its tensor names, no tensors) so the panel can refuse the
+# pick by name before the job runs, and the picker can say what it is.
+#
+# The target rule mirrors yue2_lora's (_PREFIXES + _TARGET_RE + IO_MODULES): a
+# music adapter names `layers.N.<self_attn|mlp|nar_self_attn|nar_mlp>.<proj>`
+# after an optional PEFT prefix, or the decoder's vae2llm/llm2vae companions.
+# test_music_lora_foreign.py holds the two definitions together.
+_MUSIC_KEY_PREFIXES = ("base_model.model.model.", "base_model.model.",
+                       "base_model.", "transformer.", "model.")
+_MUSIC_TARGET_RE = _re.compile(
+    r"^layers\.\d+\.(self_attn|mlp|nar_self_attn|nar_mlp)\."
+    r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)\.")
+_MUSIC_IO_RE = _re.compile(r"^(vae2llm|llm2vae)\.(weight|bias)$")
+#: Tensor-name prefixes that identify a VIDEO adapter (LTX / H3 DiT), named in
+#: the refusal so the user knows where the file belongs.
+_VIDEO_KEY_HINTS = ("diffusion_model.", "transformer_blocks.", "lora_unet_",
+                    "transformer.transformer_blocks.",
+                    "blocks.", "single_transformer_blocks.")
+_HEADER_MAX = 64 * 1024 * 1024
+
+
+def safetensors_keys(path) -> list[str] | None:
+    """Tensor names in a .safetensors file, from its header only; None when the
+    header cannot be read (a truncated or non-safetensors file)."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(8)
+            if len(raw) != 8:
+                return None
+            n = int.from_bytes(raw, "little")
+            if n <= 0 or n > _HEADER_MAX:
+                return None
+            header = json.loads(fh.read(n).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(header, dict):
+        return None
+    return [k for k in header if k != "__metadata__"]
+
+
+def music_adapter_problem(path) -> str:
+    """"" when `path` looks like a YuE2 adapter, else a sentence saying what it
+    is instead. Header-only; the engine still does the full check."""
+    p = Path(path)
+    keys = safetensors_keys(p)
+    if not keys:
+        # Unreadable or empty: not provably foreign - the engine's own
+        # read_adapter names that failure precisely; refuse only what is SURE.
+        return ""
+    for key in keys:
+        k = key
+        for prefix in _MUSIC_KEY_PREFIXES:
+            if k.startswith(prefix):
+                k = k[len(prefix):]
+                break
+        if _MUSIC_TARGET_RE.match(k) or _MUSIC_IO_RE.match(k):
+            return ""
+    if any(key.startswith(_VIDEO_KEY_HINTS) for key in keys):
+        return (f"{p.name} is a video LoRA (LTX / Hailuo H3), not a music "
+                f"voice - it cannot change a song. Move it to the video LoRA "
+                f"folder and pick a music LoRA here instead")
+    return (f"{p.name} is not a YuE2 music LoRA (none of its tensors target "
+            f"the music model)")
 
 
 def resolve_in_pack(root, identifier: str) -> Path:

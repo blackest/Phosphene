@@ -26,9 +26,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 HF_HOME = Path(tempfile.mkdtemp(prefix="phos-hf-"))
 STATE = Path(tempfile.mkdtemp(prefix="phos-partial-state-"))
+# 4.17.5: what this module changes in the process environment, so it can be
+# put back (tearDownModule). It used to stay pointed at a temp HF_HOME for
+# every test that ran after it in the same process - one of which then
+# downloaded an 810 MB LoRA into it, on every full run, never removed.
+_ENV_BEFORE = {k: os.environ.get(k) for k in
+               ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "LTX_STATE_DIR",
+                "HF_HUB_OFFLINE")}
 os.environ["HF_HOME"] = str(HF_HOME)
 os.environ.pop("HF_HUB_CACHE", None)
 os.environ.pop("HUGGINGFACE_HUB_CACHE", None)
+os.environ["HF_HUB_OFFLINE"] = "1"       # every repo here is a local fake
 os.environ["LTX_STATE_DIR"] = str(STATE)
 os.environ["PHOSPHENE_ANALYTICS_DISABLED"] = "1"
 os.environ["PHOSPHENE_DISABLE_VERSION_CHECK"] = "1"
@@ -38,6 +46,13 @@ sys.path.insert(0, str(ROOT))
 import image_engine  # noqa: E402
 
 REPO = "Qwen/Qwen-Image-Edit-2511"
+_FAKE_ROOTS: list[Path] = []
+
+
+def _tmp_root() -> Path:
+    root = Path(tempfile.mkdtemp(prefix="phos-hf-fake-"))
+    _FAKE_ROOTS.append(root)
+    return root
 
 
 def _fake_repo(root: Path, repo: str, *, partial: bool) -> Path:
@@ -57,7 +72,7 @@ def _fake_repo(root: Path, repo: str, *, partial: bool) -> Path:
 
 class PartialDownloadDetection(unittest.TestCase):
     def test_clean_repo_is_not_partial_and_repair_is_a_noop(self) -> None:
-        root = Path(tempfile.mkdtemp())
+        root = _tmp_root()
         repo_dir = _fake_repo(root, REPO, partial=False)
         env = {"HF_HOME": str(root)}
         self.assertIsNone(image_engine.hf_repo_partial_download(REPO, env))
@@ -65,7 +80,7 @@ class PartialDownloadDetection(unittest.TestCase):
         self.assertTrue((repo_dir / "snapshots").is_dir(), "a complete cache is left alone")
 
     def test_incomplete_blob_is_detected_and_repair_keeps_finished_blobs(self) -> None:
-        root = Path(tempfile.mkdtemp())
+        root = _tmp_root()
         repo_dir = _fake_repo(root, REPO, partial=True)
         env = {"HF_HOME": str(root)}
         info = image_engine.hf_repo_partial_download(REPO, env)
@@ -122,7 +137,7 @@ class LeftoversOfACompleteDownload(unittest.TestCase):
         image_engine._REPAIR_MEMO.clear()
 
     def _repo(self, name: str):
-        root = Path(tempfile.mkdtemp())
+        root = _tmp_root()
         return root, _fake_repo(root, name, partial=False)
 
     def test_incomplete_with_a_finished_twin_is_litter(self) -> None:
@@ -159,6 +174,17 @@ class LeftoversOfACompleteDownload(unittest.TestCase):
             image_engine.repair_partial_hf_download(name, env)
         self.assertIn("stuck", str(cm.exception))
         self.assertTrue(left.exists(), "a partial that may still be needed is never deleted")
+
+
+def tearDownModule() -> None:
+    import shutil
+    for k, v in _ENV_BEFORE.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    for d in (HF_HOME, STATE, *_FAKE_ROOTS):
+        shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

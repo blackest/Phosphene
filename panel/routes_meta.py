@@ -338,6 +338,14 @@ def post_star_click(h, path, qs, ctype) -> None:
     h._json({"ok": True}); return
 
 
+@post("/version/finish")
+def post_version_finish(h, path, qs, ctype) -> None:
+    # Re-run post_update.sh after a failed in-panel finish (the banner's
+    # "Try again"). Same background run, same refusals.
+    code, payload = P.post_update_start("retry")
+    h._json(payload, code); return
+
+
 @post("/restart")
 def post_restart(h, path, qs, ctype) -> None:
     # The "Restart to finish update" pill used to open an alert() that
@@ -352,6 +360,19 @@ def post_restart(h, path, qs, ctype) -> None:
     # That is exactly what a stale process needs. The queue and
     # settings live on disk, so nothing in flight is lost EXCEPT a
     # running render — which is why a busy panel refuses instead.
+    # The update is not finished until post_update.sh has run: restarting
+    # into new code before that is how a release's new package was skipped.
+    _pu = P.post_update_status()
+    if _pu.get("pending") or _pu.get("active"):
+        h._json({"ok": False, "post_update": True,
+                    "error": "Finishing the update first (installing what the "
+                             "new version needs) - restart becomes available "
+                             "when it is done."}, 409); return
+    if _pu.get("state") == "failed":
+        h._json({"ok": False, "post_update": True,
+                    "error": "The update did not finish: " + str(_pu.get("error"))
+                             + ". Use Pinokio's Update (Stop, then Update), "
+                             "or try again from the update banner."}, 409); return
     with P.LOCK:
         _busy = P.STATE.get("current") is not None
     if _busy:
@@ -420,8 +441,10 @@ def post_analytics_ui(h, path, qs, ctype) -> None:
             # means it didn't — which is the 23-of-139 hole that `app_updated`
             # alone can never show, because a failed update emits nothing.
             # One local string, overwritten each press, cleared on read.
+            # 4.17.5: "version@sha" - a build that moved without a VERSION
+            # bump is still an update that landed (read in the boot report).
             P._settings_set_internal(
-                analytics_update_pressed=P.running_version())
+                analytics_update_pressed=P.update_pressed_marker())
     elif event == "broadcast_seen":
         P._analytics_capture("broadcast_seen", {"version": P.running_version()})
     elif event == "feature_used":
@@ -597,6 +620,28 @@ def post_version_pull(h, path, qs, ctype) -> None:
         P._detect_local_install_state()
         post_sha = P._git_capture(["rev-parse", "HEAD"]) or ""
 
+        # 4.17.5 (fleet): NOTHING NEW IS NOT AN UPDATE. Two installs pressed
+        # "Update now" on 4.17.4 itself; the pull moved nothing, the panel
+        # still said "restart to finish", and the restart came back on the
+        # same build - reported as a failed update (update_outcome
+        # restart_pending 4.17.4 -> 4.17.4). When HEAD did not move and this
+        # process already runs what is on disk, there is nothing to restart:
+        # say so, and drop the "pressed Update" marker so the next boot does
+        # not count a no-op as a failure.
+        moved = bool(pre_sha and post_sha and pre_sha != post_sha)
+        if not moved and not P.get_version_state().get("stale_process"):
+            P._settings_set_internal(analytics_update_pressed="")
+            with P._VERSION_LOCK:
+                P._VERSION_STATE["pull_state"] = "current"
+                P._VERSION_STATE["pull_message"] = (
+                    "Already up to date - nothing to restart.")
+            try:
+                P._check_remote_once()
+            except Exception:
+                pass
+            h._json({"ok": True, "moved": False, "state": P.get_version_state()})
+            return
+
         # Did the pull touch anything that needs the heavier Pinokio
         # Update.js (pip reinstalls + patch reapply)? If so, flag it.
         deps_touched = False
@@ -639,6 +684,12 @@ def post_version_pull(h, path, qs, ctype) -> None:
             P._VERSION_STATE["pull_pulled_to_version"] = P._VERSION_STATE["local_version"]
             P._VERSION_STATE["pull_requires_full_update"] = deps_touched
 
+        # Finish the update the way Pinokio's Update does: post_update.sh,
+        # after every pull that moved HEAD (beta, after 4.17.4 - see
+        # post_update_start). Restart stays refused until it is done.
+        if pre_sha and post_sha and pre_sha != post_sha:
+            P.post_update_start("update_now")
+
         # Re-run the remote check so behind_by recalculates to 0
         # (normally) or to whatever new commits landed in the
         # window since we pulled.
@@ -647,7 +698,7 @@ def post_version_pull(h, path, qs, ctype) -> None:
         except Exception:
             pass
 
-        h._json({"ok": True, "state": P.get_version_state()})
+        h._json({"ok": True, "moved": moved, "state": P.get_version_state()})
     except P.subprocess.TimeoutExpired:
         with P._VERSION_LOCK:
             P._VERSION_STATE["pull_state"] = "error"

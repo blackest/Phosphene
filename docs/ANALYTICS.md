@@ -224,6 +224,9 @@ including image and training jobs.
 | `character_used` | bool | `true` | A cast character drove this render |
 | `audio_mode` | string | `"joint"` | `joint` / `none` (external audio replaces the generated track) / `a2v_dub` / `h3_native` |
 | `first_render` | bool | `true` | Present once per install, on its first successful render ever — the activation funnel without a join |
+| `gpu_steps` | string | `"short"` | 4.17.5 — present only when the render ran in **short GPU steps** (one Metal op per command buffer), the path a macOS GPU-watchdog kill switches a setting to. Closed vocabulary: `short`. Absent = default steps. Answers "does the short path stop the watchdog loop" |
+| `watchdog_retry` | bool | `true` | 4.17.5 — present only when a GPU-watchdog kill was re-run inside the same job (once, on short steps). On `render_completed` it means the retry saved the render |
+| `watchdog_phase` | string | `"load"` | 4.17.5 — present only when macOS's GPU watchdog stopped this job (on `render_completed`, the run that was then re-run): which phase the GPU was in, from the helper's own step lines. **Closed vocabulary**: `encode` (Gemma prompt encoding), `load` (the transformer loading), `denoise`, `decode` |
 | `source` | string | `"storyboard"` | v4.9.7 — which surface queued the job. **Closed vocabulary**: `form`, `batch`, `storyboard`, `characters`, `image_studio`, `retry`, `api`, `chain` (an Upscale ×2 queued automatically behind an H3 draft), `unknown`. Makes "how much of the rendering is Storyboard" a one-click breakdown |
 
 ### `render_failed`
@@ -314,15 +317,16 @@ said nothing, so *"they tried and it was broken"* and *"they looked and left"*
 were the same shape in the data. These events tell those apart.
 
 **At most one event per step per install, ever** — with one deliberate
-exception: `engine_env` reports again when its answer *changes*, because a
-broken environment that gets repaired is the most useful transition on this
-event. This is not a heartbeat and the panel still has none.
+exception: `engine_env` reports again when its answer *changes* (outcome, or
+from 4.17.5 the `cause` of a failure), because a broken environment that gets
+repaired is the most useful transition on this event. This is not a heartbeat and the panel still has none.
 
 | prop | type | example | why |
 |---|---|---|---|
 | `step` | string | `"engine_env"` | **Closed vocabulary**: `first_boot` (the panel came up), `engine_env` (its Python environment can run a render), `weights_check` (the base model is on disk), `first_queue` (a job reached the worker — someone pressed Render) |
 | `outcome` | string | `"failed"` | **Closed vocabulary**: `started`, `ok`, `failed`, `skipped` |
 | `error_class` | string | `"venv_broken"` | Only on `failed`, and only from the same closed taxonomy `render_failed` uses |
+| `cause` | string | `"network"` | 4.17.5 — only on a failed `engine_env`: WHY, one word. **Closed vocabulary**: `network` (a package server could not be reached), `timeout` (downloads timed out), `disk` (disk full), `uv_error` (the package tool could not resolve or build), `python_missing` (the venv's Python does not run), `installing` (Pinokio's Install was still writing the venv when the panel looked - reported again when it finishes), `other`, `unknown` (no installer record: an install that stopped before the engine step, or one older than 4.17.5). Read from the installer's own record (`ltx-2-mlx/env/.phosphene_engine_result.json`, written by `scripts/pinokio/ltx_engine_env.sh` in these words via `install_cause.sh`) - never from its output text |
 | `version` | string | `"4.16.0"` | The build that reported it |
 | `ram_gb` | int | `16` | SYS-16: lets `first_queue` (this event) be sliced the same way `render_completed`'s `first_render` already is — the reviewer's finding was that activation is LOWEST on the machines that struggle most (36 GB 53%, 8 GB 57%, 16 GB 63%), and answering "first_queue vs first_render, per tier" needed this on both events, not a join against `app_boot` by install_id |
 
@@ -344,6 +348,11 @@ emits nothing at all.
 The panel records the version you pressed Update *on* (one string, in local
 settings) and reads it on the next boot: a different version means it landed,
 the same version means it didn't. The marker is cleared when it is read.
+4.17.5: the marker also carries the build's SHA (`4.17.4@<sha>`), so a new
+build under the same VERSION counts as landed; and an in-panel Update whose
+pull moved nothing ("Already up to date") clears the marker instead of asking
+for a restart - the two false `restart_pending` failures on 4.17.4 were people
+pressing Update on the build they already ran.
 
 | prop | type | example | why |
 |---|---|---|---|
@@ -368,6 +377,7 @@ for a waiting job, or from the form's Install button) when they finish.
 | `outcome` | string | `"failed"` | **Closed vocabulary**: `ok`, `failed` |
 | `via` | string | `"update"` | **Closed vocabulary**: `install` (install.js), `update` (the Pinokio Update), `panel_boot` (the panel found it missing at start-up), `panel_job` (a voice-only job needed it), `panel_form` (the Lip-sync form's Install / Try again) |
 | `error_class` | string | `"pip_failed"` | Only on `failed`. **Closed vocabulary**: `no_venv`, `pip_failed`, `import_failed`, `weights_failed` (the package works, the 80 MB model did not download - it downloads on first use), `timeout`, `spawn_failed`, `other` |
+| `cause` | string | `"network"` | 4.17.5 — only on `failed`, when the installer recorded why: the same closed words as `install_step.cause` (`network`, `timeout`, `disk`, `uv_error`, `python_missing`, `other`). `a2v_stems_deps.sh` now retries a network/timeout package failure 3 times and the model download 4 times (resuming) before it reports one |
 | `ready` | bool | `true` | Whether a voice-only render can run now |
 | `weights` | bool | `false` | Whether the separator's model is on disk |
 | `version` | string | `"4.17.4"` | The build that reported it |

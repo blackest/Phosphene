@@ -51,6 +51,17 @@ fi
 
 LOGDIR="$(mktemp -d "${TMPDIR:-/tmp}/phosphene-gates.XXXXXX")"
 
+# HERMETIC, like conftest.py does for pytest (4.17.5): the unittest sweep does
+# not load conftest, and a full run used to leave an 810 MB Hugging Face
+# download in the system temp dir every time. Every gate gets its own TMPDIR
+# under LOGDIR (removed below, the logs kept) and an offline Hugging Face hub.
+GATE_TMP="$LOGDIR/tmp"
+mkdir -p "$GATE_TMP"
+export TMPDIR="$GATE_TMP/"
+export HF_HUB_OFFLINE=1
+export HF_HUB_DISABLE_TELEMETRY=1
+trap 'rm -rf "$GATE_TMP"' EXIT
+
 # Parallel arrays: gate name, result, log path.
 NAMES=()
 RESULTS=()

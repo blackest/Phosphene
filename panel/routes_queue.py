@@ -455,6 +455,21 @@ def post_queue_retry(h, path, qs, ctype) -> None:
                 p["frames"] = max(41, ((frames // 2) // 8) * 8 + 1)
         except (TypeError, ValueError):
             pass
+        # 4.17.5 (Codex): Extend renders `extend_frames` latents, not
+        # `frames` - halve what that pipeline actually consumes, or "smaller"
+        # re-ran the same workload.
+        if str(p.get("mode") or "") == "extend":
+            try:
+                ef = int(p.get("extend_frames") or 0)
+                if ef > 1:
+                    p["extend_frames"] = max(1, ef // 2)
+            except (TypeError, ValueError):
+                pass
+    # 4.17.5: a retry of a job whose input is gone (or was never there) can
+    # only fail again - say so now instead of after its turn in the queue.
+    refusal = P.job_input_refusal(new_job["params"])
+    if refusal:
+        h._json({"error": refusal, "code": "input_missing"}, 400); return
     with P.QUEUE_COND:
         P.STATE["queue"].append(new_job)
         P.QUEUE_COND.notify_all()
@@ -749,6 +764,12 @@ def post_run(h, path, qs, ctype) -> None:
         job = P.make_job(form)
     except P.CharacterRequestError as exc:
         h._json({"error": str(exc)}, 400); return
+    # 4.17.5: a job that can only fail for want of its input (Upscale or
+    # Control with no clip, Image with no picture, an unknown mode) is refused
+    # here, in the form's own words, instead of failing after its turn.
+    refusal = P.job_input_refusal(job.get("params") or {})
+    if refusal:
+        h._json({"error": refusal, "code": "input_missing"}, 400); return
     # 4.17 Codex EST-10: a follow-up that can never queue is refused NOW,
     # not discovered in the log after a long Extend render.
     refusal = P.extend_face_fix_refusal(job["params"])

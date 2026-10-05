@@ -42,8 +42,13 @@ def _argv(cfg) -> list:
     with tempfile.TemporaryDirectory() as tmp:
         ref = Path(tmp) / "ref.png"
         ref.write_bytes(b"x")
+        # 4.17.5: and nothing is DOWNLOADED. The Lightning LoRA is resolved
+        # through hf_hub_download - unmocked, every run of this file fetched
+        # the real 810 MB adapter into whatever HF_HOME the process had.
         with mock.patch.object(image_engine, "_resolve_mflux_bin", lambda c: "/nonexistent/mflux-generate-qwen-edit"), \
                 mock.patch.object(image_engine, "repair_partial_hf_download", lambda *a, **k: None), \
+                mock.patch("huggingface_hub.hf_hub_download",
+                           lambda repo_id, filename, **k: f"/fake-hf/{repo_id}/{filename}"), \
                 mock.patch("subprocess.Popen", popen):
             try:
                 image_engine._generate_mflux("a test", 1, 512, 512, Path(tmp), 1, cfg, refs=[str(ref)])
@@ -66,6 +71,8 @@ class LightningRunsWithoutCfg(unittest.TestCase):
         self.assertEqual(float(cmd[cmd.index("--guidance") + 1]), 1.0)
         self.assertEqual(cmd[cmd.index("--steps") + 1], "4")
         self.assertIn("--lora-paths", cmd)
+        self.assertTrue(cmd[cmd.index("--lora-paths") + 1].startswith("/fake-hf/"),
+                        "the adapter must come from the (mocked) resolver")
 
     def test_the_default_and_promoted_lightning_configs_send_guidance_one(self):
         self.assertEqual(_guidance(image_engine.ImageEngineConfig(

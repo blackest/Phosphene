@@ -38,11 +38,38 @@ set -uo pipefail
 APP_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SEP_HOME="${PHOSPHENE_SEPARATOR_HOME:-$APP_ROOT/mlx_models/demucs}"
 VIA="${PHOSPHENE_SEPARATOR_VIA:-install}"
+# 4.17.5: the record also carries WHY (install_cause.sh: network, timeout,
+# disk, uv_error, python_missing, other), read from this run's own output.
+# shellcheck source=install_cause.sh
+if [ -f "$APP_ROOT/scripts/pinokio/install_cause.sh" ]; then
+  . "$APP_ROOT/scripts/pinokio/install_cause.sh"
+else
+  install_cause() { echo other; }
+fi
+LOG="$(mktemp -t phos_separator)" || LOG=/dev/null
+trap '[ -f "$LOG" ] && rm -f "$LOG"' EXIT
+# Raw output to $LOG (install_cause reads it); the screen gets it DEFUSED.
+# Pinokio stops Install/Update on any /error:/i or /errno /i line, and an
+# attempt that is about to be retried must not end the whole run (the same
+# rule ltx_engine_env.sh follows).
+defuse() { tee -a "$LOG" | sed -u -e 's/[Ee][Rr][Rr][Oo][Rr]:/problem -/g' -e 's/[Ee]rrno /errno-/g'; }
 record() {
   mkdir -p "$SEP_HOME" 2>/dev/null || return 0
-  printf '{"outcome":"%s","error_class":"%s","via":"%s","ts":%s}\n' \
-    "$1" "$2" "$VIA" "$(date +%s)" > "$SEP_HOME/last_install.json" 2>/dev/null
+  local cause=""
+  [ "$1" = failed ] && cause="${3:-$(install_cause "$LOG")}"
+  printf '{"outcome":"%s","error_class":"%s","cause":"%s","via":"%s","ts":%s}\n' \
+    "$1" "$2" "$cause" "$VIA" "$(date +%s)" > "$SEP_HOME/last_install.json" 2>/dev/null
   return 0
+}
+# The plain sentence the panel shows on its card (the LAST line printed).
+say_why() {
+  case "$(install_cause "$LOG")" in
+    network)  echo 'vocal separation: the download server could not be reached - check the connection, then Try again' >&2 ;;
+    timeout)  echo 'vocal separation: the download kept timing out - check the connection, then Try again' >&2 ;;
+    disk)     echo 'vocal separation: the disk is full - free some space, then Try again' >&2 ;;
+    uv_error) echo 'vocal separation: the package installer could not resolve demucs with the torch on this Mac' >&2 ;;
+    *)        echo "vocal separation: $1" >&2 ;;
+  esac
 }
 
 MLX_CHECKOUT="$(cd "${1:?ltx-2-mlx checkout required}" && pwd)" \
@@ -57,7 +84,7 @@ for cand in "$MLX_CHECKOUT/env" "$MLX_CHECKOUT/.venv"; do
 done
 if [ -z "$VENV" ]; then
   echo "no engine venv under $MLX_CHECKOUT - run the engine install first" >&2
-  record failed no_venv
+  record failed no_venv python_missing
   exit 1
 fi
 PY="$VENV/bin/python3.11"
@@ -85,19 +112,31 @@ for name in ("torch", "numpy"):
         pass
 PYPINS
   echo "keeping: $(tr '\n' ' ' < "$PINS")"
-  if command -v uv >/dev/null 2>&1; then
-    uv pip install --python "$PY" -c "$PINS" 'demucs==4.0.1'
-  else
-    "$PY" -m pip install -c "$PINS" 'demucs==4.0.1'
-  fi
-  rc=$?
+  # 4.17.5: up to 3 attempts - but only a network or timeout failure is worth
+  # repeating; a resolver conflict or a full disk fails the same way again.
+  n=1
+  while :; do
+    if command -v uv >/dev/null 2>&1; then
+      uv pip install --python "$PY" -c "$PINS" 'demucs==4.0.1' 2>&1 | defuse
+      rc=$?
+    else
+      "$PY" -m pip install -c "$PINS" 'demucs==4.0.1' 2>&1 | defuse
+      rc=$?
+    fi
+    [ "$rc" -eq 0 ] && break
+    case "$(install_cause "$LOG")" in network|timeout) ;; *) break ;; esac
+    [ "$n" -ge 3 ] && break
+    echo "vocal separation: attempt $n did not finish - retrying in $((n * ${PHOSPHENE_SEPARATOR_RETRY_WAIT:-10})) s"
+    sleep $((n * ${PHOSPHENE_SEPARATOR_RETRY_WAIT:-10}))
+    n=$((n + 1))
+  done
   rm -f "$PINS"
-  if [ $rc -ne 0 ]; then
-    echo 'vocal separation: package install failed' >&2
+  if [ "$rc" -ne 0 ]; then
     record failed pip_failed
+    say_why 'package install failed'
     exit 1
   fi
-  if ! "$PY" -c "$PROBE"; then
+  if ! "$PY" -c "$PROBE" 2>&1 | defuse; then
     echo 'vocal separation: installed but does not import' >&2
     record failed import_failed
     exit 1
@@ -106,10 +145,12 @@ fi
 
 # Fetch the weights now, so the first lip-sync render does not stop to
 # download them. Prove the runner loads the model, not just that pip ran.
-if ! "$PY" "$RUNNER" --prefetch; then
-  echo 'vocal separation: the model did not load (network?)' >&2
-  echo 'It will download on first use instead.' >&2
+# The runner resumes a broken download and retries it (4.17.5); a failure
+# here has already been tried four times.
+if ! "$PY" "$RUNNER" --prefetch 2>&1 | defuse; then
   record failed weights_failed
+  echo 'It will download on first use instead.' >&2
+  say_why 'the model did not load'
   exit 1
 fi
 record ok ""

@@ -118,8 +118,12 @@ def test_voice_only_off_and_explicit_stems_are_untouched(song, tmp_path):
     sep.assert_not_called()
 
 
-def test_queue_add_refuses_voice_only_when_the_separator_is_missing():
-    form = {"mode": ["a2v"], "prompt": ["a singer"], "audio": ["/x/song.wav"],
+def test_queue_add_refuses_voice_only_when_the_separator_is_missing(tmp_path):
+    # A song that EXISTS: 4.17.5 refuses a missing one first (input_missing),
+    # and this test is about the separator.
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"RIFF")
+    form = {"mode": ["a2v"], "prompt": ["a singer"], "audio": [str(song)],
             "audio_stem_auto": ["on"]}
     h = _H(form)
     before = len(P.STATE["queue"])

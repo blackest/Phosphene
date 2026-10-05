@@ -480,6 +480,8 @@ const mk = () => ({ hidden: false, disabled: false, textContent: '', classList: 
 const els = { updateBanner: mk(), ubStar: mk(), ubTitle: mk(), ubSub: mk(), ubUpdate: mk(), ubLater: mk(), versionPill: mk() };
 global.document = { getElementById: id => els[id] || null };
 global._uiEvent = () => {};
+// health.js's module-level state (bc09bf3 reads it in _ubRestartState).
+global._versionState = null;
 const toasts = [];
 global.phosToast = (t) => toasts.push(t);
 let reloaded = false;

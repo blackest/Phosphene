@@ -41,7 +41,28 @@ APP_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 MLX="${1:-$APP_ROOT/ltx-2-mlx}"
 cd "$MLX" 2>/dev/null || { echo "FATAL error: no engine checkout at $MLX - run Install"; exit 1; }
 PY=env/bin/python
+
+# OUTCOME RECORD (4.17.5). Every finished run writes env/.phosphene_engine_result
+# .json: {"outcome","cause","ts"} - closed words only (install_cause.sh), no
+# paths. The panel puts `cause` on the install_step engine_env event and in the
+# Repair bar, so a failed fresh install says network / disk / uv / Python /
+# timeout instead of only "venv_broken". Written only when env/ exists.
+# shellcheck source=install_cause.sh
+if [ -f "$APP_ROOT/scripts/pinokio/install_cause.sh" ]; then
+  . "$APP_ROOT/scripts/pinokio/install_cause.sh"
+else
+  install_cause() { echo other; }
+fi
+RESULT=env/.phosphene_engine_result.json
+record() {
+  [ -d env ] || return 0
+  printf '{"outcome":"%s","cause":"%s","ts":%s}\n' "$1" "$2" "$(date +%s)" \
+    > "$RESULT" 2>/dev/null
+  return 0
+}
+
 if ! "$PY" -c 'import sys' >/dev/null 2>&1; then
+  record failed python_missing
   echo 'FATAL error: the engine venv has no working Python - run Install (it rebuilds the venv, models kept)'
   exit 1
 fi
@@ -69,11 +90,15 @@ if ! take_lock; then
 fi
 release_lock() {
   [ "$(sed -n 1p "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -f "$LOCK/pid" && rmdir "$LOCK"
+  [ -f "${LOG:-}" ] && rm -f "$LOG"
+  return 0
 }
 trap release_lock EXIT
 
-# uv's own failure lines, defused for Pinokio's matcher (see above).
-defuse() { sed -u -e 's/[Ee][Rr][Rr][Oo][Rr]:/problem -/g' -e 's/[Ee]rrno /errno-/g'; }
+# uv's own failure lines, defused for Pinokio's matcher (see above). The raw
+# text goes to $LOG first - install_cause reads it after a failed run.
+LOG="$(mktemp -t phos_engine_env)" || LOG=/dev/null
+defuse() { tee -a "$LOG" | sed -u -e 's/[Ee][Rr][Rr][Oo][Rr]:/problem -/g' -e 's/[Ee]rrno /errno-/g'; }
 
 attempt() {
   uv pip install --python env/bin/python 'mlx==0.31.1' 'mlx-lm==0.31.1' \
@@ -98,6 +123,7 @@ n=1
 while :; do
   echo "--- attempt $n of 3 ---"
   if attempt; then
+    record ok ""
     echo 'engine environment ready - ltx_core_mlx, ltx_pipelines_mlx and mlx import'
     exit 0
   fi
@@ -107,8 +133,18 @@ while :; do
   sleep "$wait_s"
   n=$(( n + 1 ))
 done
-echo 'FATAL error: the engine environment did not install after 3 attempts.'
-echo 'Check the network, then run Install again (or press Repair engine in the panel).'
+CAUSE="$(install_cause "$LOG")"
+record failed "$CAUSE"
+case "$CAUSE" in
+  disk)     WHY='the disk is full - free some space' ;;
+  timeout)  WHY='downloads kept timing out - check the connection' ;;
+  network)  WHY='the package server could not be reached - check the network' ;;
+  uv_error) WHY='the package installer could not resolve or build a package' ;;
+  python_missing) WHY='the engine venv Python stopped working' ;;
+  *)        WHY='see the lines above' ;;
+esac
+echo "FATAL error: the engine environment did not install after 3 attempts ($CAUSE: $WHY)."
+echo 'Run Install again - it resumes, nothing is downloaded twice - or press Repair engine in the panel.'
 echo 'Nothing was deleted; every model is kept.'
 exit 1
 

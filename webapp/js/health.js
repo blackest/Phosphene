@@ -338,7 +338,30 @@ function _ubRestartState(newVersion, requiresFullUpdate) {
   // reinstall them (that needs Pinokio's own Update, which reinstalls
   // the venv) -- that's the one case still asking for a manual step,
   // and it says exactly why.
-  if (requiresFullUpdate) {
+  // Beta, after 4.17.4: the pull is followed by post_update.sh, run by the
+  // panel itself (the step Pinokio's Update runs). Until it is done the
+  // banner says so and Restart waits; a failure names why.
+  const pu = ((_versionState || {}).post_update) || {};
+  if (pu.pending || pu.active || pu.state === 'failed') {
+    if (title) title.textContent = pu.state === 'failed'
+      ? 'The update did not finish'
+      : `Updated to ${newVersion} \u2014 finishing the update\u2026`;
+    if (sub) sub.textContent = pu.state === 'failed'
+      ? (pu.error || 'post_update.sh failed') + ' \u2014 use Pinokio\u2019s Update (Stop, then Update), or try again.'
+      : 'Installing what the new version needs (the same step Pinokio\u2019s Update runs). '
+        + 'Restart becomes available when it finishes. ' + ((pu.log || []).slice(-1)[0] || '');
+    if (go) {
+      go.hidden = pu.state !== 'failed';
+      go.disabled = false;
+      go.textContent = 'Try again';
+      go.onclick = async () => {
+        go.disabled = true;
+        try { await fetch('/version/finish', { method: 'POST' }); } catch (e) {}
+        _ubFollowPostUpdate(newVersion);
+      };
+    }
+    if (pu.state !== 'failed') _ubFollowPostUpdate(newVersion);
+  } else if (requiresFullUpdate && !pu.state) {
     if (sub) sub.textContent = 'This update touched Python dependencies, so use Pinokio\u2019s Update button (not just Stop and Start) so they reinstall.';
     if (go) go.hidden = true;
   } else {
@@ -366,6 +389,21 @@ function _ubRestartState(newVersion, requiresFullUpdate) {
   if (later) { later.textContent = 'Dismiss'; }
   el.classList.add('ub-done');
   return true;
+}
+
+// Poll /version while post_update.sh runs; repaint the banner as it moves,
+// and hand over to the Restart now state when it is done.
+let _ubPostUpdateTimer = null;
+function _ubFollowPostUpdate(newVersion) {
+  clearTimeout(_ubPostUpdateTimer);
+  _ubPostUpdateTimer = setTimeout(async () => {
+    try {
+      const r = await fetch('/version', { cache: 'no-store' });
+      if (r.ok) _versionState = await r.json();
+    } catch (e) { /* keep polling */ }
+    const pu = ((_versionState || {}).post_update) || {};
+    _ubRestartState(newVersion, !!((_versionState || {}).pull_requires_full_update) && !pu.state);
+  }, 2000);
 }
 
 async function _ubSaveSetting(patch) {
@@ -586,7 +624,14 @@ async function panelRestart() {
 async function versionPillClick() {
   if (_versionRestartPending) {
     const s = _versionState || {};
-    if (s.pull_requires_full_update) {
+    const _pu = s.post_update || {};
+    if (_pu.pending || _pu.active || _pu.state === 'failed') {
+      phosToast(_pu.state === 'failed'
+        ? 'The update did not finish: ' + (_pu.error || '') + ' Use Pinokio\u2019s Update.'
+        : 'Finishing the update first \u2014 restart becomes available when it is done.', 'warn');
+      return;
+    }
+    if (s.pull_requires_full_update && !_pu.state) {
       // Genuinely can't self-restart into this one -- dependencies /
       // patches changed, and only Pinokio's own Update reinstalls those.
       alert("Pulled. Because this update touched Python deps / patches, use Pinokio's Update button (it reinstalls + reapplies patches). After that click Start.");
@@ -709,11 +754,29 @@ async function versionDoPull(opts) {
             `cases where you have local changes that block a fast-forward.`);
       return;
     }
+    // 4.17.5: a pull that moved nothing is not an update - no restart, no
+    // "Updated to" banner (the restart came back on the same build and was
+    // counted as a failed update). A stale process still gets its own pill.
+    if (data.moved === false) {
+      pill.classList.remove('pill-busy');
+      renderVersionPill();
+      const go = document.getElementById('ubUpdate');
+      if (go) { go.disabled = false; go.textContent = 'Update now'; }
+      try { _ubRender(_versionState); } catch (e) {}
+      if (typeof phosToast === 'function') {
+        phosToast('Already up to date - nothing to restart.', { kind: 'success' });
+      }
+      return;
+    }
     _versionRestartPending = true;
     pill.classList.remove('pill-busy');
     renderVersionPill();
     const newVersion = (data.state && (data.state.pull_pulled_to_version || data.state.pull_pulled_to_short)) || 'new version';
-    const fullUpdateNote = data.state && data.state.pull_requires_full_update
+    const _puNow = (data.state && data.state.post_update) || {};
+    const fullUpdateNote = (_puNow.pending || _puNow.active)
+      ? `\n\nPhosphene is now finishing the update in the background (the same ` +
+        `step Pinokio's Update runs). Restart once the banner says it is done.`
+      : data.state && data.state.pull_requires_full_update
       ? `\n\n⚠ This update touched Python dependencies / patches. Use ` +
         `Pinokio's Update button (not just Stop+Start) so deps reinstall.`
       : '';

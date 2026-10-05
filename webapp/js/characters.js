@@ -210,7 +210,7 @@ function musicLoraRender(music) {
     const branch = a.branch === 'nar' ? 'sound' : 'writing';
     return `<div class="music-lora-item${state.on ? ' active' : ''}" data-id="${charactersEscapeAttr(a.id)}">
       <label class="music-lora-head">
-        <input type="checkbox" ${state.on ? 'checked' : ''} onchange="musicLoraToggled(this)">
+        <input type="checkbox" ${state.on && !a.problem ? 'checked' : ''} ${a.problem ? 'disabled' : ''} onchange="musicLoraToggled(this)">
         <span class="music-lora-name">${charactersEscapeHtml(a.name)}</span>
         <span class="music-lora-branch">${branch}</span>
       </label>
