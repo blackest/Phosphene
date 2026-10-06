@@ -1604,6 +1604,31 @@ function renderCivitaiGrid(items, append) {
   grid.appendChild(frag);
 }
 
+// 4.18.0: what the Install button says while a CivitAI file downloads —
+// the percentage and the megabytes, or just the megabytes when the server
+// sent no length. Pure, so it is tested by running it.
+function civitaiProgressLabel(st) {
+  const mb = (n) => Math.round((Number(n) || 0) / (1024 * 1024));
+  if (!st || !st.ok) return 'Downloading…';
+  if (st.state === 'cancelled') return 'Cancelling…';
+  if (st.state === 'installing') return 'Installing…';
+  if (st.total > 0) {
+    const pct = Math.max(0, Math.min(100, Math.floor(100 * st.bytes / st.total)));
+    return `Downloading ${pct}% · ${mb(st.bytes)} of ${mb(st.total)} MB`;
+  }
+  return st.bytes > 0 ? `Downloading · ${mb(st.bytes)} MB` : 'Downloading…';
+}
+
+function _civitaiToken() {
+  try {
+    const a = new Uint8Array(12);
+    crypto.getRandomValues(a);
+    return 'dl' + Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
+  } catch (e) {
+    return 'dl' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  }
+}
+
 async function civitaiInstall(btn, item) {
   btn.disabled = true;
   const origLabel = btn.textContent;
@@ -1617,6 +1642,46 @@ async function civitaiInstall(btn, item) {
     fd.set('download_url', item.download_url);
   }
   fd.set('meta', JSON.stringify(item));
+  // 4.18.0: a CivitAI download shows its progress on the button and can be
+  // cancelled from a button beside it (Hugging Face downloads cannot be
+  // stopped part-way, so they keep the plain label).
+  let token = '', pollTimer = null, cancelBtn = null;
+  if (!fromHf) {
+    token = _civitaiToken();
+    fd.set('token', token);
+    cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'ghost-btn civitai-cancel-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.title = 'Stop this download — nothing half-downloaded is kept';
+    cancelBtn.addEventListener('click', async () => {
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = 'Cancelling…';
+      let ok = false;
+      try {
+        const r = await fetch('/civitai/download/cancel', { method: 'POST', body: new URLSearchParams({ token }) });
+        ok = !!(await r.json()).ok;
+      } catch (e) {}
+      // Refused = it already arrived and is being put in place (or just
+      // finished): say so instead of a "Cancelling…" that never happens.
+      if (!ok && cancelBtn.isConnected) cancelBtn.textContent = 'Too late — finishing';
+    });
+    btn.insertAdjacentElement('afterend', cancelBtn);
+    const tick = async () => {
+      try {
+        const r = await fetch('/civitai/download/state?token=' + encodeURIComponent(token));
+        const st = await r.json();
+        if (st && st.ok && token) btn.textContent = civitaiProgressLabel(st);
+      } catch (e) {}
+      if (token) pollTimer = setTimeout(tick, 700);
+    };
+    pollTimer = setTimeout(tick, 400);
+  }
+  const stopProgress = () => {
+    token = '';
+    if (pollTimer) clearTimeout(pollTimer);
+    if (cancelBtn) cancelBtn.remove();
+  };
   try {
     const r = await fetch(fromHf ? '/hf/loras/download' : '/civitai/download', {
       method: 'POST',
@@ -1624,6 +1689,15 @@ async function civitaiInstall(btn, item) {
       body: new URLSearchParams(fd),
     });
     const data = await r.json();
+    stopProgress();
+    if (data && data.cancelled) {
+      const status = document.getElementById('civitaiStatus');
+      status.textContent = 'Download cancelled — nothing was kept.';
+      status.className = 'civitai-status-line';
+      btn.disabled = false;
+      btn.textContent = origLabel;
+      return;
+    }
     if (!r.ok || !data.ok) {
       const status = document.getElementById('civitaiStatus');
       status.textContent = `Download failed: ${data.error || 'HTTP ' + r.status}`;
@@ -1683,6 +1757,7 @@ async function civitaiInstall(btn, item) {
     const det = document.getElementById('lorasDetails');
     if (det) det.open = true;
   } catch (e) {
+    stopProgress();
     document.getElementById('civitaiStatus').textContent = 'Network error: ' + (e.message || e);
     document.getElementById('civitaiStatus').className = 'civitai-status-line err';
     btn.disabled = false;
@@ -1951,7 +2026,7 @@ async function cancelDownload() {
 // Inline handlers in the markup and the other files resolve these through
 // the global scope; everything NOT listed here is private to this module.
 Object.assign(globalThis, {
-  civitaiSetSource, civitaiSourceRowSync, civitaiSetKind,
+  civitaiSetSource, civitaiSourceRowSync, civitaiSetKind, civitaiProgressLabel,
   normalizeLivePreview, _liveStageMediaHeld, _showLiveReturnChip, _hideLiveStageChrome,
   _restoreSelectedOutputAfterLive, _handoffLiveStageToOutput, returnToLiveRender, _renderLiveStageFrame,
   renderLiveStage, renderNowPreview, stopEarly, markNoVoiceTouched,

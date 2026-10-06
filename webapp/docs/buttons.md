@@ -24,6 +24,8 @@ The buttons that show a picture instead of a word. Hover any of them in the pane
 | **Extend** · **To film** · **Animate** | use the selected output as the start of something new |
 | the crossed-out eye (red) | hides this output from the gallery — the file is not deleted |
 | **Expand** | full screen ([[sc:outputs.expand]]; Esc closes it) |
+| **Play all** (Outputs header, and the bar under an expanded output) | plays the gallery full size: every clip once, then the next; each photo for 1–10 s (**Photos stay**); a song to its end. The bar fades while it plays — move the mouse to bring it back. ← → step, [[sc:outputs.playall]] pauses, swipe on a touch screen |
+| **Use this audio for…** (an audio output) | sends it to **Lip-sync**, **Music video**, **Soundtrack for a video** (image-to-video with your audio) or **Cover it** — the form opens with the file in place; nothing renders until Generate |
 
 ## Output cards {#cards}
 
@@ -31,6 +33,7 @@ The buttons that show a picture instead of a word. Hover any of them in the pane
 |---|---|
 | **ⓘ** | how this output was made — prompt, engine, quality, seed, LoRAs |
 | **Upscale & Face Fix** (on a video card, on hover) | queues the face-safe 2× of that clip — same as the player button |
+| **Use…** (on an audio card, on hover) | the same menu as **Use this audio for…** |
 | [[icon:ph-trash-simple]] | moves the file to the macOS Trash, after asking ([[sc:outputs.trash]] on the selected output) |
 | [[icon:ph-folder-simple]] (Outputs header) | reveals the outputs folder in Finder |
 

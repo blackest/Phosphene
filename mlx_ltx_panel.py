@@ -4409,6 +4409,115 @@ def list_user_loras() -> list[dict]:
     return out
 
 
+# ---- LoRA notes for Enhance (4.18.0) -----------------------------------------
+# Enhance used to know only the trigger words the user had already typed (it
+# preserved their case) and nothing else about the LoRAs on the render: a
+# trigger the user forgot stayed forgotten, and the creator's notes (or the
+# guide the planner wrote, /loras/guide) never reached the prompt helper. Now
+# the selected LoRAs' notes ride along as bounded, clearly fenced REFERENCE
+# text, and a LoRA whose trigger word is missing from the result gets it back.
+ENHANCE_LORA_MAX = 4            # adapters described to the prompt helper
+ENHANCE_LORA_NOTE_CHARS = 360   # per adapter — a creator page can run for pages
+ENHANCE_LORA_TRIGGERS = 6       # trigger words listed per adapter
+ENHANCE_LORA_TRIGGER_CHARS = 60
+
+
+def _enhance_note_text(raw, limit: int = ENHANCE_LORA_NOTE_CHARS) -> str:
+    """A creator's description or a guide → one plain, bounded line. HTML,
+    links and runs of whitespace go; a long note is cut at a word.
+
+    Creator text is untrusted: it is DECODED FIRST (so `&lt;end_of_turn&gt;`
+    cannot slip past as an entity) and then every tag-shaped run, every
+    remaining angle bracket and every brace goes — that removes model turn
+    tokens (`<start_of_turn>`), HTML, and the `<<<` / `>>>` fences the helper
+    wraps the notes in, so a note cannot close its own fence (Codex 4.18.0)."""
+    s = str(raw or "")
+    for _ in range(2):                       # double-encoded entities too
+        s = html.unescape(s)
+    s = re.sub(r"<[^>]*>", " ", s)
+    s = re.sub(r"[<>{}\[\]`]", " ", s)
+    s = re.sub(r"https?://\S+", " ", s)
+    s = re.sub(r"(?i)lora\s+notes", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > limit:
+        cut = s[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:")
+        s = (cut or s[:limit]) + "…"
+    return s
+
+
+def _enhance_trigger(raw) -> str:
+    t = _enhance_note_text(raw, 10 * ENHANCE_LORA_TRIGGER_CHARS).strip(",.;:").strip()
+    return t if 0 < len(t) <= ENHANCE_LORA_TRIGGER_CHARS else ""
+
+
+def lora_enhance_context(paths) -> list[dict]:
+    """The selected LoRAs as Enhance should see them: name, trigger words and
+    one note (the written guide first, else the creator's description).
+
+    Only files the LoRA library lists are read — a path the browser made up
+    finds nothing — and at most ENHANCE_LORA_MAX are described."""
+    if not isinstance(paths, (list, tuple)):
+        return []
+    want = []
+    for p in paths:
+        p = str(p.get("path") if isinstance(p, dict) else p or "").strip()
+        if p and p not in want:
+            want.append(p)
+    if not want:
+        return []
+    try:
+        rows = {r.get("path"): r for r in list_user_loras()}
+    except Exception:                                          # noqa: BLE001
+        return []
+    out: list[dict] = []
+    for p in want:
+        r = rows.get(p)
+        if not r:
+            continue
+        triggers = []
+        for t in r.get("trigger_words") or []:
+            t = _enhance_trigger(t)
+            if t and t not in triggers:
+                triggers.append(t)
+        guide = _enhance_note_text(r.get("guide"))
+        note = guide or _enhance_note_text(r.get("description"))
+        out.append({
+            "name": _enhance_note_text(r.get("name") or Path(p).stem, 80),
+            "triggers": triggers[:ENHANCE_LORA_TRIGGERS],
+            "note": note,
+            "note_source": "guide" if guide else ("creator" if note else ""),
+        })
+        if len(out) >= ENHANCE_LORA_MAX:
+            break
+    return out
+
+
+def _has_phrase(text: str, phrase: str) -> bool:
+    return re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text or "",
+                     re.IGNORECASE) is not None
+
+
+def ensure_lora_triggers(text: str, ctx: list[dict]) -> tuple[str, list[str]]:
+    """Put back the trigger word of any LoRA the enhanced prompt never names.
+
+    A LoRA counts as named when ANY of its trigger words is in the text (whole
+    words, any case — the case-exact restore is the helper's job). For one that
+    is not, its FIRST trigger word goes at the front, which is where LTX
+    character and style LoRAs are trained to see it. LoRAs with no trigger word
+    are left alone: a style-only adapter needs nothing in the prompt."""
+    missing: list[str] = []
+    for c in ctx or []:
+        trig = [t for t in (c.get("triggers") or []) if t]
+        if not trig or any(_has_phrase(text, t) for t in trig):
+            continue
+        if trig[0] not in missing:
+            missing.append(trig[0])
+    if not missing:
+        return text, []
+    body = (text or "").strip()
+    return (", ".join(missing) + (", " + body if body else "")), missing
+
+
 def _lora_artifact_negative_prompt(loras: list[dict]) -> str:
     """Collect sidecar-defined artifact Avoid terms for active LoRAs.
 
@@ -8165,7 +8274,93 @@ def _hf_lora_download(repo_id: str, filename: str, meta: dict) -> dict:
             "layout": layout_info.get("layout"), "converted": bool(layout_info.get("converted"))}
 
 
-def _civitai_download(download_url: str, meta: dict) -> dict:
+# ---- CivitAI download progress + cancel (4.18.0) ------------------------------
+# The browser's Install button used to say "Downloading…" for the whole of a
+# 300 MB-2 GB download with no number and no way out. The download still runs
+# inside its own POST (the server is threaded); the browser names it with a
+# random token, polls GET /civitai/download/state for bytes, and can POST
+# /civitai/download/cancel. A cancel stops the stream at the next chunk and
+# the existing .partial cleanup removes what had arrived — nothing half-
+# downloaded is ever registered as a LoRA.
+CIVITAI_DL: dict[str, dict] = {}
+CIVITAI_DL_LOCK = threading.Lock()
+_CIVITAI_DL_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+class CivitaiDownloadCancelled(RuntimeError):
+    """The person pressed Cancel; the partial file is already gone."""
+
+
+def civitai_dl_token(raw) -> str:
+    t = str(raw or "").strip()
+    return t if _CIVITAI_DL_TOKEN_RE.match(t) else ""
+
+
+def civitai_dl_begin(token: str, name: str) -> None:
+    if not token:
+        return
+    with CIVITAI_DL_LOCK:
+        # A crashed tab never polls its entry away; keep the table small.
+        if len(CIVITAI_DL) > 32:
+            for k in list(CIVITAI_DL)[:-16]:
+                CIVITAI_DL.pop(k, None)
+        CIVITAI_DL[token] = {"state": "running", "bytes": 0, "total": 0,
+                             "name": str(name or "")[:120], "cancel": False}
+
+
+def civitai_dl_state(token: str) -> dict | None:
+    with CIVITAI_DL_LOCK:
+        e = CIVITAI_DL.get(token)
+        return dict(e) if e else None
+
+
+def civitai_dl_cancel(token: str) -> bool:
+    """True when the download will stop. False once it has passed the commit
+    point (every byte arrived, the file is being put in place) — a Cancel
+    then would answer "cancelled" for a LoRA that still installs."""
+    with CIVITAI_DL_LOCK:
+        e = CIVITAI_DL.get(token)
+        if not e or e.get("state") != "running":
+            return False
+        e["cancel"] = True
+        return True
+
+
+def _civitai_dl_commit(token: str) -> None:
+    """The commit point: honour a Cancel that arrived after the last chunk,
+    else close the door on any later one (state -> "installing")."""
+    if not token:
+        return
+    with CIVITAI_DL_LOCK:
+        e = CIVITAI_DL.get(token)
+        if not e:
+            return
+        if e.get("cancel"):
+            e["state"] = "cancelled"
+            raise CivitaiDownloadCancelled("Download cancelled — nothing was kept.")
+        e["state"] = "installing"
+
+
+def civitai_dl_end(token: str) -> None:
+    with CIVITAI_DL_LOCK:
+        CIVITAI_DL.pop(token, None)
+
+
+def _civitai_dl_tick(token: str, written: int, total: int) -> None:
+    """Record progress; raise when the person asked to stop."""
+    if not token:
+        return
+    with CIVITAI_DL_LOCK:
+        e = CIVITAI_DL.get(token)
+        if not e:
+            return
+        e["bytes"], e["total"] = int(written), int(total or 0)
+        if e.get("cancel"):
+            e["state"] = "cancelled"
+            raise CivitaiDownloadCancelled("Download cancelled — nothing was kept.")
+
+
+def _civitai_download(download_url: str, meta: dict, token: str = "") -> dict:
     """Download a CivitAI .safetensors into the right LoRA dir for its base
     model and write a sidecar JSON. Returns
     { name, path, sidecar_path, size_bytes, lane }.
@@ -8258,6 +8453,7 @@ def _civitai_download(download_url: str, meta: dict) -> dict:
             raise
         with resp_ctx as resp:
             total = int(resp.headers.get("Content-Length") or 0)
+            _civitai_dl_tick(token, 0, total)
             with tmp.open("wb") as fh:
                 while True:
                     chunk = resp.read(1024 * 256)
@@ -8265,6 +8461,7 @@ def _civitai_download(download_url: str, meta: dict) -> dict:
                         break
                     fh.write(chunk)
                     bytes_written += len(chunk)
+                    _civitai_dl_tick(token, bytes_written, total)
                     now = time.time()
                     if now - last_log > 1.0:
                         if total:
@@ -8275,7 +8472,13 @@ def _civitai_download(download_url: str, meta: dict) -> dict:
                         else:
                             push(f"[civitai] {bytes_written // (1024*1024)} MB")
                         last_log = now
+        _civitai_dl_commit(token)
         os.replace(tmp, target)
+    except CivitaiDownloadCancelled:
+        try: tmp.unlink()
+        except OSError: pass
+        push(f"[civitai] cancelled {meta.get('name') or safe_fname} — partial file removed")
+        raise
     except Exception:
         try: tmp.unlink()
         except OSError: pass

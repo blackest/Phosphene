@@ -84,6 +84,8 @@ const SHORTCUTS = [
     label: 'Previous / next output — wraps at the ends, works in the expanded player too' },
   { id: 'outputs.expand', scope: 'outputs', combos: ['f'], owner: 'queue.js',
     label: 'Expand the selected output to full screen (Esc closes it)' },
+  { id: 'outputs.playall', scope: 'outputs', combos: ['p'], owner: 'queue.js',
+    label: 'In the expanded player: Play all — every clip once, each photo for a few seconds — or pause it' },
   { id: 'outputs.trash', scope: 'outputs', combos: ['mod+backspace'], owner: 'shortcuts.js',
     label: 'Move the selected output to the Trash — asks first, like the trash button on the card',
     run: () => shortcutTrashOutput() },

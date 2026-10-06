@@ -263,6 +263,18 @@ function setH3LoraSlot(slot) {
   renderH3LoraSlot();
 }
 
+// 4.18.0: the LTX-lane LoRAs Enhance should know about — the same lane rule
+// _serializeLoras applies to the submit (an H3 adapter is never described to
+// LTX's prompt helper). Enhance is LTX-only, Lip-sync is LTX, so the LTX lane
+// is the only one asked for today. Paths only: the panel reads names, trigger
+// words and notes from the library itself (lora_enhance_context).
+function enhanceLoraPaths() {
+  const active = Array.isArray(globalThis._activeLoras) ? globalThis._activeLoras : [];
+  const known = Array.isArray(globalThis._knownUserLoras) ? globalThis._knownUserLoras : [];
+  const laneOf = (p) => { const u = known.find(x => x.path === p); return (u && u.lane) || 'ltx'; };
+  return active.filter(l => l && l.path && laneOf(l.path) !== 'h3').map(l => l.path);
+}
+
 function _serializeLoras() {
   // What the helper actually needs is path + strength. Keep the rest in
   // the in-memory list for UI rendering, drop it on the wire. Summary
@@ -1481,7 +1493,7 @@ function renderCharacterStrip() {
 Object.assign(globalThis, {
   checkLoraUpdates, updateLora, writeLoraGuide,
   _currentLoraModeFilter, _syncLoraPickerForEngine, importH3Lora, renderH3LoraSlot,
-  setH3LoraSlot, _serializeLoras, addLoraToActive, populateIngredientCharLoras,
+  setH3LoraSlot, _serializeLoras, enhanceLoraPaths, addLoraToActive, populateIngredientCharLoras,
   onIngredientCharChange, onIngredientCharStrength, refreshLoras, _loraGenerationCompatible,
   renderLorasList, appendTriggerToPrompt, _updateCharsPickerVisibility, refreshManualCharacters,
   _renderManualCharactersList, _renderCharsAppliedNote, renderCharacterStrip,

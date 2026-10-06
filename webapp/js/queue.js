@@ -1179,6 +1179,10 @@ async function enhancePrompt() {
     if (charIdEl && charIdEl.value) preserveTokens.push(charIdEl.value);
     const fd = new URLSearchParams({ prompt: original, mode });
     if (preserveTokens.length) fd.set('preserve_tokens', JSON.stringify(preserveTokens));
+    // 4.18.0: the selected LoRAs, so Enhance can read their notes and put a
+    // forgotten trigger word back (the panel looks the paths up itself).
+    const loraPaths = (typeof enhanceLoraPaths === 'function') ? enhanceLoraPaths() : [];
+    if (loraPaths.length) fd.set('loras', JSON.stringify(loraPaths));
     // VC-13: the language-hint toggle, when it's showing (a non-Latin
     // prompt). Absent/checked = translate (unchanged default behaviour).
     const translateEl = document.getElementById('translateToEnglish');
@@ -1199,7 +1203,24 @@ async function enhancePrompt() {
     phosToast(res.error, { kind: 'danger', duration: 8000 });
     return;
   }
-  showEnhancePanel(res.original, res.enhanced, !!res.translated);
+  showEnhancePanel(res.original, res.enhanced, !!res.translated, enhanceLoraNote(res));
+}
+
+// 4.18.0: one line under the Enhance result saying what the LoRAs changed —
+// whose notes the prompt helper read and which trigger words it put back.
+// Empty when no LoRA was involved. Pure, so it is tested by running it.
+function enhanceLoraNote(res) {
+  if (!res) return '';
+  const used = Array.isArray(res.lora_notes_used) ? res.lora_notes_used.filter(Boolean) : [];
+  const added = Array.isArray(res.lora_triggers_added) ? res.lora_triggers_added.filter(Boolean) : [];
+  const parts = [];
+  if (used.length === 1) parts.push('Used the notes of the LoRA ' + used[0] + '.');
+  else if (used.length > 1) parts.push('Used the notes of ' + used.length + ' LoRAs (' + used.join(', ') + ').');
+  if (added.length) {
+    parts.push((added.length === 1 ? 'Added its trigger word: ' : 'Added the trigger words: ')
+      + added.map(t => '\u201c' + t + '\u201d').join(', ') + '.');
+  }
+  return parts.join(' ');
 }
 
 // VC-13: a light, reliable "not Latin script" signal — mirrors
@@ -1219,11 +1240,12 @@ function updateLangHint() {
 // the old native confirm() (no edit, no diff, no undo, and it broke ⌘Z by
 // overwriting the textarea programmatically). Two states in one panel:
 // "review" shows the fresh result; "applied" (after Accept) offers Undo.
-function showEnhancePanel(original, enhanced, translated) {
+function showEnhancePanel(original, enhanced, translated, loraNote) {
   const panel = document.getElementById('enhancePanel');
   if (!panel) return;
   panel.dataset.original = original;
   panel.dataset.enhanced = enhanced;
+  panel.dataset.loraNote = loraNote || '';
   // VC-13: "Enhance states that it translated" — set once, up front, not
   // buried behind Accept, so it's visible while still reviewing.
   panel.dataset.translated = translated ? '1' : '';
@@ -1232,7 +1254,8 @@ function showEnhancePanel(original, enhanced, translated) {
   document.getElementById('enhanceAcceptBtn').hidden = false;
   document.getElementById('enhanceKeepBtn').hidden = false;
   document.getElementById('enhanceUndoBtn').hidden = true;
-  document.getElementById('enhancePanelNote').textContent = translated ? 'Translated to English.' : '';
+  document.getElementById('enhancePanelNote').textContent =
+    [translated ? 'Translated to English.' : '', loraNote || ''].filter(Boolean).join(' ');
   panel.hidden = false;
 }
 function _setPromptValue(text) {
@@ -1249,7 +1272,8 @@ function acceptEnhance() {
   document.getElementById('enhanceKeepBtn').hidden = true;
   document.getElementById('enhanceUndoBtn').hidden = false;
   document.getElementById('enhancePanelNote').textContent =
-    (panel.dataset.translated ? 'Translated to English. ' : '') + 'Applied.';
+    (panel.dataset.translated ? 'Translated to English. ' : '')
+    + (panel.dataset.loraNote ? panel.dataset.loraNote + ' ' : '') + 'Applied.';
 }
 function undoEnhance() {
   const panel = document.getElementById('enhancePanel');
@@ -4912,7 +4936,7 @@ function renderCarousel() {
         <div class="card-chrome">
           ${remakeChip}
           ${animateChip}
-          ${isAudio ? `<button class="card-action card-action-photo" type="button" title="Load this track into Music video (does not auto-submit)" onclick="event.stopPropagation();useTrackInA2V(${pathAttr})">Music video</button>` : ''}
+          ${isAudio ? `<button class="card-action card-action-photo" type="button" aria-haspopup="menu" title="Use this audio for Lip-sync, a Music video, a video soundtrack or a cover (nothing renders until you press Generate)" onclick="event.stopPropagation();openAudioUseMenu(event, ${pathAttr})">Use…</button>` : ''}
           <button class="card-action card-action-danger" type="button" title="Move this file to the Trash — asks first"
                   onclick="event.stopPropagation(); deleteOutput(${pathAttr})"><svg class="ph" aria-hidden="true"><use href="#ph-trash-simple"/></svg></button>
         </div>
@@ -5243,9 +5267,11 @@ function selectOutput(path, options) {
     const openLink = (o && o.engine === 'music')
       ? `<button type="button" class="ghost-btn player-audio-open" onclick="openSongInAudioTab(${pathAttr})">Open in Audio tab</button>`
       : '';
+    // 4.18.0: the same "Use this audio for…" menu as the card's Use… chip.
+    const useBtn = `<button type="button" class="ghost-btn player-audio-use" aria-haspopup="menu" onclick="openAudioUseMenu(event, ${pathAttr})">Use this audio for…</button>`;
     wrap.innerHTML = `<div class="player-audio-inline">`
       + `<audio class="train-voice-audio" controls preload="metadata"${autoplay ? ' autoplay' : ''} src="${escapeHtml(playerSrc)}"></audio>`
-      + openLink + `</div>`;
+      + `<div class="player-audio-btns">` + useBtn + openLink + `</div></div>`;
   } else if (isPhoto) {
     wrap.innerHTML = `<img src="${escapeHtml(playerSrc)}" alt="${o ? escapeHtml(o.name) : ''}">`;
   } else if (liveBackdrop) {
@@ -5457,9 +5483,344 @@ function fitPlayerActions() {
   surface.style.setProperty('--po-actions-w', Math.ceil(bar.getBoundingClientRect().width) + 'px');
 }
 
+// ---- "Use this audio for…" (4.18.0) -------------------------------------
+// Any audio in Outputs — a song, a voice line, a sound you uploaded — can go
+// straight to the place that takes audio, instead of being found again in
+// Finder and dropped by hand. Each target fills its slot exactly the way a
+// drop would and opens that form; nothing renders until Generate is pressed.
+// The list is a pure function of the output and the engine probes, so what
+// the menu offers (and why something is greyed out) is tested by running it.
+function audioUseTargets(o, probes) {
+  const music = (probes && probes.music) || {};
+  const cover = { id: 'cover', label: 'Cover it', sub: 'Music Studio reads the tune and sings it fresh' };
+  if (music.capable === false) {
+    cover.disabled = true;
+    cover.why = 'The music engine needs more memory than this Mac has.';
+  } else if (!music.available) {
+    cover.sub = 'needs the music engine — opens its install card';
+  }
+  return [
+    { id: 'lipsync', label: 'Lip-sync', sub: 'a face in your picture talks or sings to it' },
+    { id: 'musicvideo', label: 'Music video', sub: 'your pictures, planned and cut to it' },
+    { id: 'soundtrack', label: 'Soundtrack for a video', sub: 'image-to-video, with this as its sound' },
+    cover,
+  ];
+}
+
+function audioUseApply(path, target) {
+  closeAudioUseMenu();
+  const o = findOutputByPath(path);
+  if (target === 'lipsync') {
+    if (typeof audioStudioUseAudio !== 'function') return;
+    audioStudioUseAudio(path, o ? o.clip_sec : null, o ? o.url : '');
+    phosToast('Audio loaded into Lip-sync — add a picture of the face, then Generate.', { kind: 'success' });
+  } else if (target === 'musicvideo') {
+    if (typeof useTrackInA2V === 'function') useTrackInA2V(path);
+  } else if (target === 'soundtrack') {
+    useAudioAsSoundtrack(path);
+  } else if (target === 'cover') {
+    const music = (window._ENGINE_PROBES && window._ENGINE_PROBES.music) || {};
+    if (music.capable === false) return;
+    if (!music.available) {
+      if (typeof openMusicInstallCard === 'function') openMusicInstallCard();
+      return;
+    }
+    if (typeof workflowSwitch === 'function') workflowSwitch('audio');
+    if (typeof musicCoverFromSong === 'function') musicCoverFromSong({ path });
+    const det = document.getElementById('musicCoverDetails');
+    if (det) det.open = true;
+    phosToast('Loaded as the source song in Cover a song — write a style, then Compose.', { kind: 'success' });
+  }
+}
+
+// The Video tab's image-to-video form with "Use external audio file" picked
+// and this file in its Audio slot. LTX only (Hailuo H3 makes its own sound),
+// so an H3 form switches to LTX first and says so.
+function useAudioAsSoundtrack(path) {
+  if (typeof workflowSwitch === 'function') workflowSwitch('manual');
+  let switched = false;
+  if (typeof currentEngine === 'function' && currentEngine() !== 'ltx' && typeof setEngine === 'function') {
+    setEngine('ltx');
+    switched = true;
+  }
+  if (typeof setMode === 'function') setMode('i2v');
+  const sel = document.getElementById('i2vMode');
+  if (sel) {
+    sel.value = 'i2v_clean_audio';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  i2vAudioSet(path);
+  const det = document.getElementById('customizeDetails');
+  if (det) det.open = true;
+  const sec = document.getElementById('i2vAudioModeSection');
+  if (sec) requestAnimationFrame(() => sec.scrollIntoView({ block: 'center', behavior: 'smooth' }));
+  phosToast((switched ? 'Switched to LTX (Hailuo H3 makes its own sound). ' : '')
+    + 'Soundtrack loaded — pick the picture to animate, then Generate.', { kind: 'success', duration: 6000 });
+}
+
+function openAudioUseMenu(ev, path) {
+  const menu = document.getElementById('audioUseMenu');
+  if (!menu || !path) return;
+  const o = findOutputByPath(path);
+  const attr = JSON.stringify(path).replace(/"/g, '&quot;');
+  const items = audioUseTargets(o, window._ENGINE_PROBES || {});
+  menu.innerHTML = '<div class="song-menu-head">Use this audio for…</div>' + items.map(t =>
+    `<button type="button" role="menuitem" class="song-menu-item" data-target="${t.id}"`
+    + (t.disabled ? ` disabled title="${escapeHtml(t.why || '')}"` : ` onclick="audioUseApply(${attr}, '${t.id}')"`)
+    + `>${escapeHtml(t.label)}<span class="sub">${escapeHtml(t.disabled ? (t.why || t.sub) : t.sub)}</span></button>`
+  ).join('');
+  menu.hidden = false;
+  const anchor = (ev && ev.currentTarget && ev.currentTarget.getBoundingClientRect)
+    ? ev.currentTarget.getBoundingClientRect() : { left: 8, right: 268, top: 8, bottom: 8 };
+  const w = menu.offsetWidth || 260;
+  const h = menu.offsetHeight || 220;
+  menu.style.left = `${Math.max(8, Math.min(window.innerWidth - w - 8, anchor.left))}px`;
+  const below = anchor.bottom + 6;
+  menu.style.top = `${(below + h > window.innerHeight - 8) ? Math.max(8, anchor.top - h - 6) : below}px`;
+  const first = menu.querySelector('.song-menu-item:not([disabled])');
+  if (first) first.focus({ preventScroll: true });
+  setTimeout(() => document.addEventListener('click', _audioUseMenuOutside, true), 0);
+}
+function _audioUseMenuOutside(e) {
+  const menu = document.getElementById('audioUseMenu');
+  if (menu && menu.contains(e.target)) return;
+  closeAudioUseMenu();
+}
+function closeAudioUseMenu() {
+  const menu = document.getElementById('audioUseMenu');
+  if (menu) menu.hidden = true;
+  document.removeEventListener('click', _audioUseMenuOutside, true);
+}
+document.addEventListener('keydown', (e) => {
+  const menu = document.getElementById('audioUseMenu');
+  if (!menu || menu.hidden) return;
+  if (e.key === 'Escape') { closeAudioUseMenu(); e.preventDefault(); e.stopPropagation(); return; }
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    const btns = [...menu.querySelectorAll('.song-menu-item:not([disabled])')];
+    if (!btns.length) return;
+    const i = btns.indexOf(document.activeElement);
+    const n = e.key === 'ArrowDown' ? (i + 1) % btns.length : (i <= 0 ? btns.length - 1 : i - 1);
+    btns[n].focus();
+    e.preventDefault(); e.stopPropagation();
+  }
+}, true);
+
 // Expand lightbox — full-viewport viewer for the active output. Reuses
 // the active entry's URL / kind detection so a single button works for
 // both image and video. Closed by Esc, backdrop click, or the × button.
+//
+// 4.18.0 — PLAY ALL. The lightbox is also a viewer that plays the gallery by
+// itself: every clip plays once and hands over to the next, a photo stays for
+// the chosen 1–10 s, a song plays to its end. The bar at the bottom has
+// previous / play all / next, "n of N", the photo time and full screen; while
+// it plays and the mouse rests, the bar, the name and the close button fade
+// out, and come back on any move, tap or key. Swipe left/right steps on a
+// touch screen, swipe up goes to the next one. The order is the gallery's own
+// (filteredMainOutputs: the filter chips and the search apply) and it wraps
+// at the end, the same as ← / →.
+const LB = { playing: false, timer: null, idleTimer: null, imageSec: 3, touch: null };
+const LB_IDLE_MS = 2500;
+const LB_IMAGE_SEC_KEY = 'phos.lightbox.imageSec';
+try {
+  const _v = Number(localStorage.getItem(LB_IMAGE_SEC_KEY));
+  if (_v >= 1 && _v <= 10) LB.imageSec = Math.round(_v);
+} catch (e) {}
+
+function lbIsOpen() {
+  const lb = document.getElementById('expandLightbox');
+  return !!(lb && lb.style.display === 'flex');
+}
+
+// Where the viewer is in the gallery, and where a step lands. Pure: the list,
+// the current path and a direction in, an index out, wrapping both ways.
+function lbStepIndex(list, path, dir) {
+  const n = Array.isArray(list) ? list.length : 0;
+  if (!n) return -1;
+  const i = list.findIndex(o => o && o.path === path);
+  if (i < 0) return dir < 0 ? n - 1 : 0;
+  return ((i + (dir < 0 ? -1 : 1)) % n + n) % n;
+}
+
+function lbCountLabel(list, path) {
+  const n = Array.isArray(list) ? list.length : 0;
+  const i = n ? list.findIndex(o => o && o.path === path) : -1;
+  return (n && i >= 0) ? `${i + 1} of ${n}` : '';
+}
+
+function _lbList() {
+  return (typeof filteredMainOutputs === 'function') ? filteredMainOutputs() : [];
+}
+
+function lbStep(dir) {
+  const list = _lbList();
+  const idx = lbStepIndex(list, activePath, dir);
+  if (idx < 0) return;
+  const next = list[idx];
+  // autoplay:false — the stage behind the lightbox must not start playing
+  // the same clip a second time (two soundtracks at once).
+  if (next && typeof selectOutput === 'function') selectOutput(next.path, { autoplay: false });
+  if (lbIsOpen()) openExpandLightbox();
+}
+
+function _lbClearTimer() {
+  if (LB.timer) { clearTimeout(LB.timer); LB.timer = null; }
+  const bar = document.getElementById('expandProgress');
+  if (bar) { bar.classList.remove('is-running'); bar.hidden = true; }
+}
+
+// One thing on screen, playing: a photo gets a timer (with a thin progress
+// line so the wait is visible), a clip or a song hands over on `ended`.
+function _lbArm(media, isPhoto) {
+  _lbClearTimer();
+  if (!LB.playing) return;
+  if (isPhoto || !media) {
+    const bar = document.getElementById('expandProgress');
+    if (bar) {
+      bar.hidden = false;
+      bar.style.setProperty('--lb-dur', LB.imageSec + 's');
+      bar.classList.remove('is-running');
+      void bar.offsetWidth;            // restart the CSS animation
+      bar.classList.add('is-running');
+    }
+    LB.timer = setTimeout(() => { if (LB.playing && lbIsOpen()) lbStep(1); }, LB.imageSec * 1000);
+    return;
+  }
+  const p = media.play();
+  if (p && p.catch) {
+    p.catch(() => {
+      // A browser that refuses sound without a fresh click still plays muted.
+      media.muted = true;
+      const q = media.play();
+      if (q && q.catch) q.catch(() => {});
+    });
+  }
+}
+
+function lbSyncBar() {
+  const btn = document.getElementById('expandPlayBtn');
+  if (btn) {
+    btn.setAttribute('aria-pressed', LB.playing ? 'true' : 'false');
+    btn.classList.toggle('is-on', LB.playing);
+    const use = btn.querySelector('use');
+    if (use) use.setAttribute('href', LB.playing ? '#ph-pause-fill' : '#ph-play-fill');
+    const lbl = document.getElementById('expandPlayLabel');
+    if (lbl) lbl.textContent = LB.playing ? 'Pause' : 'Play all';
+    btn.title = (LB.playing ? 'Pause — stay on this one' : 'Play all — each clip plays once, then the next')
+      + ' (P)';
+  }
+  const cnt = document.getElementById('expandCount');
+  if (cnt) cnt.textContent = lbCountLabel(_lbList(), activePath);
+  const sel = document.getElementById('expandImageSec');
+  if (sel && String(sel.value) !== String(LB.imageSec)) sel.value = String(LB.imageSec);
+  const fs = document.getElementById('expandFsBtn');
+  if (fs) {
+    const on = !!document.fullscreenElement;
+    fs.setAttribute('aria-pressed', on ? 'true' : 'false');
+    fs.title = on ? 'Leave full screen' : 'Full screen';
+  }
+}
+
+function lbSetPlaying(on) {
+  LB.playing = !!on;
+  const lb = document.getElementById('expandLightbox');
+  if (lb) lb.classList.toggle('is-playing', LB.playing);
+  if (!LB.playing) {
+    _lbClearTimer();
+    _lbWake();
+  } else {
+    const o = findOutputByPath(activePath);
+    const media = document.querySelector('#expandStage video, #expandStage audio');
+    // A clip that already finished starts the run by moving on.
+    if (media && media.ended) { lbStep(1); }
+    else _lbArm(media, outputKind(o) === 'image');
+    _lbWake();
+  }
+  lbSyncBar();
+}
+
+function lbTogglePlayAll() { lbSetPlaying(!LB.playing); }
+
+function lbSetImageSec(v) {
+  const x = Number(v);
+  const n = Number.isFinite(x) ? Math.max(1, Math.min(10, Math.round(x))) : 3;
+  LB.imageSec = n;
+  try { localStorage.setItem(LB_IMAGE_SEC_KEY, String(n)); } catch (e) {}
+  const o = findOutputByPath(activePath);
+  if (LB.playing && outputKind(o) === 'image') _lbArm(null, true);
+  lbSyncBar();
+}
+
+// The Outputs header's "Play all": the gallery, from the selected output (or
+// the first one), in the lightbox, playing.
+function lbPlayAll() {
+  const list = _lbList();
+  if (!list.length) { phosToast('Nothing in Outputs to play yet.', { kind: 'warning' }); return; }
+  if (!activePath || !list.some(o => o.path === activePath)) {
+    if (typeof selectOutput === 'function') selectOutput(list[0].path, { autoplay: false });
+  }
+  LB.playing = true;
+  openExpandLightbox();
+}
+
+function lbToggleFullscreen() {
+  const lb = document.getElementById('expandLightbox');
+  if (!lb) return;
+  try {
+    if (document.fullscreenElement) {
+      const p = document.exitFullscreen();
+      if (p && p.catch) p.catch(() => {});
+    } else if (lb.requestFullscreen) {
+      const p = lb.requestFullscreen();
+      if (p && p.catch) p.catch(() => {
+        phosToast('This window does not allow full screen — the viewer already fills it.', { kind: 'warning' });
+      });
+    }
+  } catch (e) {}
+}
+document.addEventListener('fullscreenchange', () => { if (lbIsOpen()) lbSyncBar(); });
+
+// Controls fade while the gallery plays and nothing moves (CSS: .is-idle).
+function _lbWake() {
+  const lb = document.getElementById('expandLightbox');
+  if (!lb) return;
+  lb.classList.remove('is-idle');
+  if (LB.idleTimer) clearTimeout(LB.idleTimer);
+  LB.idleTimer = null;
+  if (!LB.playing) return;
+  LB.idleTimer = setTimeout(() => {
+    // Never hide the bar from someone using it.
+    const bar = document.getElementById('expandBar');
+    if (LB.playing && lbIsOpen() && !(bar && bar.matches(':hover, :focus-within'))) lb.classList.add('is-idle');
+  }, LB_IDLE_MS);
+}
+
+// Swipe on a touch screen: a horizontal swipe steps, an upward one goes next.
+// Pure classifier so it is tested by running it.
+function lbSwipeDir(dx, dy) {
+  const ax = Math.abs(dx), ay = Math.abs(dy);
+  if (ax < 50 && ay < 60) return 0;
+  if (ax >= ay) return dx < 0 ? 1 : -1;
+  return dy < 0 ? 1 : 0;
+}
+
+(function _wireLightboxPointer() {
+  const lb = document.getElementById('expandLightbox');
+  if (!lb) return;
+  ['mousemove', 'pointerdown', 'wheel'].forEach(t => lb.addEventListener(t, _lbWake, { passive: true }));
+  lb.addEventListener('touchstart', (e) => {
+    _lbWake();
+    const t = e.changedTouches && e.changedTouches[0];
+    LB.touch = t ? { x: t.clientX, y: t.clientY } : null;
+  }, { passive: true });
+  lb.addEventListener('touchend', (e) => {
+    const t = e.changedTouches && e.changedTouches[0];
+    if (!LB.touch || !t) return;
+    const dir = lbSwipeDir(t.clientX - LB.touch.x, t.clientY - LB.touch.y);
+    LB.touch = null;
+    if (dir) lbStep(dir);
+  }, { passive: true });
+})();
+
 function openExpandLightbox() {
   if (!activePath) return;
   const o = findOutputByPath(activePath);
@@ -5470,14 +5831,29 @@ function openExpandLightbox() {
   if (!lb || !stage) return;
   const isPhoto = outputKind(o) === 'image';
   const isAudio = outputKind(o) === 'audio';
+  // Everything behind — the stage player, the Music Studio bar, a card's own
+  // little audio player — is paused, so the viewer is the only thing making
+  // sound (Codex 4.18.0: the music bar used to keep playing under Play all).
+  document.querySelectorAll('video, audio').forEach(m => {
+    if (stage.contains(m)) return;
+    try { m.pause(); } catch (e) {}
+  });
+  _lbClearTimer();
   // Build the media element fresh each time so the previous selection's
   // <video> stops decoding immediately.
   stage.innerHTML = isAudio
-    ? `<audio class="train-voice-audio" src="${escapeHtml(o.url)}" controls autoplay></audio>`
+    ? `<div class="expand-audio"><span class="expand-audio-note" aria-hidden="true">♪</span><audio class="train-voice-audio" src="${escapeHtml(o.url)}" controls autoplay></audio></div>`
     : isPhoto
     ? `<img src="${o.url}" alt="${escapeHtml(o.name)}">`
-    : `<video src="${o.url}" controls autoplay></video>`;
+    : `<video src="${o.url}" controls autoplay playsinline></video>`;
+  const media = stage.querySelector('video, audio');
   _wireStageMutePersistence(stage.querySelector('video'));
+  if (media) {
+    media.addEventListener('ended', () => { if (LB.playing && lbIsOpen() && media.isConnected) lbStep(1); });
+    media.addEventListener('error', () => {
+      if (LB.playing && lbIsOpen() && media.isConnected) LB.timer = setTimeout(() => lbStep(1), 1000);
+    });
+  }
   if (meta) {
     const sizeLbl = `${o.size_mb.toFixed(1)} MB`;
     meta.textContent = `${o.name} · ${sizeLbl}`;
@@ -5494,14 +5870,25 @@ function openExpandLightbox() {
     ` : '';
   }
   lb.style.display = 'flex';
+  lb.classList.toggle('is-playing', LB.playing);
+  if (LB.playing) _lbArm(media, isPhoto);
+  _lbWake();
+  lbSyncBar();
 }
 
 function closeExpandLightbox() {
   const lb = document.getElementById('expandLightbox');
   const stage = document.getElementById('expandStage');
   if (!lb) return;
+  LB.playing = false;
+  _lbClearTimer();
+  if (LB.idleTimer) { clearTimeout(LB.idleTimer); LB.idleTimer = null; }
+  lb.classList.remove('is-playing', 'is-idle');
   if (stage) stage.innerHTML = '';  // stops video playback
   lb.style.display = 'none';
+  if (document.fullscreenElement === lb) {
+    try { const p = document.exitFullscreen(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+  }
 }
 
 // Esc + F shortcuts for the expand lightbox. Bound once at module init.
@@ -5512,7 +5899,8 @@ function closeExpandLightbox() {
     const isOpen = lb.style.display === 'flex';
     // Don't steal keystrokes from inputs/textareas.
     const tag = (e.target && e.target.tagName) || '';
-    const inField = tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable);
+    const inField = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target && e.target.isContentEditable);
+    if (isOpen) _lbWake();
     // F and the arrows are the GALLERY's only while the gallery is the thing
     // on screen: in the Editor they are the playhead's (and F opened a hidden
     // output over the timeline), and with ⌘ / ⌃ / ⌥ held they are somebody
@@ -5525,22 +5913,23 @@ function closeExpandLightbox() {
     } else if ((e.key === 'f' || e.key === 'F') && !isOpen && !inField && activePath) {
       openExpandLightbox();
       e.preventDefault();
+    } else if ((e.key === 'p' || e.key === 'P') && isOpen && !inField) {
+      // 4.18.0: P plays the gallery from here / pauses it (the bar's button).
+      lbTogglePlayAll();
+      e.preventDefault();
     } else if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !inField && activePath
                && typeof filteredMainOutputs === 'function') {
       // Carousel keyboard nav. Wraps at the edges so power users can
       // scrub through the whole gallery without lifting hands off the
       // keyboard. Works whether the lightbox is open or not — if it
       // IS open, the lightbox content updates with the new selection.
-      const list = filteredMainOutputs();
-      if (!list.length) return;
-      const idx = list.findIndex(o => o.path === activePath);
-      const nextIdx = e.key === 'ArrowLeft'
-        ? (idx <= 0 ? list.length - 1 : idx - 1)
-        : (idx < 0 || idx >= list.length - 1 ? 0 : idx + 1);
-      const next = list[nextIdx];
-      if (next && typeof selectOutput === 'function') {
-        selectOutput(next.path);
-        if (isOpen) openExpandLightbox();   // re-bind media to new pick
+      if (isOpen) {
+        lbStep(e.key === 'ArrowLeft' ? -1 : 1);
+      } else {
+        const list = filteredMainOutputs();
+        const idx = lbStepIndex(list, activePath, e.key === 'ArrowLeft' ? -1 : 1);
+        const next = idx >= 0 ? list[idx] : null;
+        if (next && typeof selectOutput === 'function') selectOutput(next.path);
       }
       e.preventDefault();
     }
@@ -8263,7 +8652,7 @@ Object.assign(globalThis, {
   ltxFinishSetTier, ltxFinishActive, _syncFinishAffordance,
   ltxFinishTargets, ltxFinishTierKey, ltxFinishFieldsFromSidecar, ltxTierByKeyExact,
   currentEngine, _syncEngineForMode, openH3InstallCard, closeH3InstallCard,
-  enhancePrompt, applyAspect, applyQuality, updateDerived, updateDerivedForClampedMode, keyframePriceFor,
+  enhancePrompt, enhanceLoraNote, applyAspect, applyQuality, updateDerived, updateDerivedForClampedMode, keyframePriceFor,
   _aspectDims, refreshPickerCropOverlays, refreshExtendClampNote, _setCropFocus, _cropFocusFromParams,
   pickerSetImage, pickerUploadFile, pickerWire, refreshUploadsStrip,
   refreshIngredientRecent, ingredientPickerWire, fmtMin, snippet,
@@ -8274,6 +8663,9 @@ Object.assign(globalThis, {
   retryJob, renderCarousel, findOutputByPath, stageMayAutoSelectOutput,
   setStageAspect, clearStageAspect, fitStagePlayer, initStagePlayerFit,
   selectOutput, openExpandLightbox, closeExpandLightbox, phosToast,
+  lbStep, lbStepIndex, lbCountLabel, lbSwipeDir, lbTogglePlayAll, lbSetPlaying, lbSetImageSec, lbPlayAll,
+  lbToggleFullscreen,
+  audioUseTargets, audioUseApply, useAudioAsSoundtrack, openAudioUseMenu, closeAudioUseMenu,
   animateActive, hide, unhide, openOutputsFolder, hideActive,
   useAsExtendSource, useAsUpscaleSource, useAsUpscaleSourcePath, setUpscalePreset,
   faceFixClip, faceFixActive, isUpscaledPath, loadParams, _flashActionDone, closeOutputInfoModal,

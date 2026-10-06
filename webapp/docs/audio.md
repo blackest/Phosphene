@@ -6,7 +6,7 @@ This is Phosphene's lip-sync: a picture (optional) and a stretch of audio become
 
 ## Making one {#make}
 
-1. Drop the **Audio** — WAV, MP3, M4A or FLAC. The panel reads its length and defaults Duration to match it.
+1. Drop the **Audio** — WAV, MP3, M4A or FLAC. The panel reads its length and defaults Duration to match it. Audio already in Outputs (a song you composed, a voice line) needs no Finder trip: **Use…** on its card → **Lip-sync**.
 2. Optional: a **Reference image** to open the clip on that frame — a portrait for a talking head. Leave it empty for pure audio-to-video. A closed-mouth, face-forward picture works best — see the tip below.
 3. Write the prompt. **Enhance** rewrites it for the model. Keep it short (under ~40 words) and describe the performance (expression, gesture, breathing) rather than the scene or the sound — a sync sentence is appended automatically.
 4. Set **Width** and **Height** (default 1024×576), **Start at** (seconds into the file, e.g. 30 to drive the clip from 0:30) and **Duration** (1–30 s). A start or a window that runs past the end of the file is refused or warned about before you render — that stretch would be silence, and silence is exactly where the mouth freezes.

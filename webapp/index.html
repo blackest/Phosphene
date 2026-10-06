@@ -4566,6 +4566,10 @@ The last line"></textarea>
                 onclick="stopEarly()" hidden>Stop early</button>
       </div>
     </div>
+    <!-- 4.18.0: "Use this audio for…" — one menu for every audio output
+         (the card's Use… chip and the player's button). Filled and placed by
+         openAudioUseMenu() in queue.js. -->
+    <div class="song-menu" id="audioUseMenu" hidden role="menu" aria-label="Use this audio for"></div>
     <!-- Expand lightbox: full-viewport overlay shared by image + video.
          Opens via the Expand button on the player overlay actions, or by
          pressing F when an output is selected. Click outside the media or
@@ -4584,6 +4588,35 @@ The last line"></textarea>
            the lightbox is the expanded, full-attention view. Filled by
            openExpandLightbox() for video only. -->
       <div class="expand-actions" id="expandActions"></div>
+      <!-- 4.18.0 — Play all: the gallery plays by itself (each clip once, a
+           photo for the chosen time, a song to its end), in the gallery's
+           own order. Wired by lbTogglePlayAll() & co in queue.js; fades
+           while playing and the mouse rests (.is-idle). -->
+      <div class="expand-progress" id="expandProgress" hidden aria-hidden="true"></div>
+      <div class="expand-bar" id="expandBar" role="toolbar" aria-label="Play the gallery">
+        <button type="button" class="expand-bar-btn" onclick="lbStep(-1)" title="Previous (←)" aria-label="Previous output">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M10 3 L5 8 L10 13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button type="button" class="expand-bar-btn expand-play" id="expandPlayBtn" onclick="lbTogglePlayAll()" aria-pressed="false"
+                title="Play all — each clip plays once, then the next (P)">
+          <svg class="ph" aria-hidden="true"><use href="#ph-play-fill"/></svg><span id="expandPlayLabel">Play all</span>
+        </button>
+        <button type="button" class="expand-bar-btn" onclick="lbStep(1)" title="Next (→)" aria-label="Next output">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6 3 L11 8 L6 13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <span class="expand-count" id="expandCount" aria-live="polite"></span>
+        <label class="expand-dur" title="How long a photo stays on screen while the gallery plays">Photos stay
+          <select id="expandImageSec" onchange="lbSetImageSec(this.value)">
+            <option value="1">1 s</option><option value="2">2 s</option><option value="3" selected>3 s</option>
+            <option value="4">4 s</option><option value="5">5 s</option><option value="6">6 s</option>
+            <option value="7">7 s</option><option value="8">8 s</option><option value="9">9 s</option>
+            <option value="10">10 s</option>
+          </select>
+        </label>
+        <button type="button" class="expand-bar-btn" id="expandFsBtn" onclick="lbToggleFullscreen()" title="Full screen" aria-label="Full screen" aria-pressed="false">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 6 V3 H6 M10 3 H13 V6 M13 10 V13 H10 M6 13 H3 V10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
     </div>
     <!-- ============== MUSIC STUDIO — the Song card =====================
          Under the player, for songs only. The song is the unit: its words,
@@ -5742,6 +5775,10 @@ The last line"></textarea>
              whenever an older entry exists. Clicking fetches /outputs
              (no polling on that endpoint) and re-renders the carousel
              with the full unified list. -->
+        <!-- 4.18.0: the gallery plays by itself, full size (lbPlayAll). -->
+        <button type="button" class="ghost-btn outputs-playall-btn" id="outputsPlayAllBtn"
+                title="Play all — every clip once, each photo for a few seconds, full size (P pauses, Esc closes)"
+                onclick="lbPlayAll()"><svg class="ph" aria-hidden="true"><use href="#ph-play-fill"/></svg>Play all</button>
         <button type="button" class="ghost-btn" id="outputsShowAllBtn"
                 style="display:none" title="Load every render in the gallery (not just the newest 60)"
                 onclick="outputsLoadAll()">Show all</button>

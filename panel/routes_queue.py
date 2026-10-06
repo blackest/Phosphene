@@ -684,6 +684,14 @@ def post_prompt_enhance(h, path, qs, ctype) -> None:
                 preserve_set.add(trig)
     except Exception:
         pass
+    # 4.18.0: the LoRAs on this render, as the prompt helper should know them
+    # (name, trigger words, the guide or the creator's note). Bounded and only
+    # read from files the LoRA library lists — see lora_enhance_context.
+    loras_raw = (form.get("loras", [""])[0] or "").strip()
+    try:
+        lora_ctx = P.lora_enhance_context(P.json.loads(loras_raw)) if loras_raw else []
+    except (TypeError, ValueError):
+        lora_ctx = []
     preserve_tokens = sorted(preserve_set)
     P.push(f"[enhance] {mode}: {user_prompt[:80]}…"
          + (f"  preserve={preserve_tokens}" if preserve_tokens else ""))
@@ -704,7 +712,8 @@ def post_prompt_enhance(h, path, qs, ctype) -> None:
             "action": "enhance_prompt",
             "id": f"enh-{int(P.time.time()*1000)}",
             "params": {"prompt": user_prompt, "mode": mode, "seed": 10,
-                       "preserve_tokens": preserve_tokens, "translate": translate},
+                       "preserve_tokens": preserve_tokens, "translate": translate,
+                       "lora_notes": lora_ctx},
         }, timeout=P.PROMPT_ENHANCE_TIMEOUT)
     except Exception as exc:
         P.push(f"[enhance] failed: {exc}")
@@ -728,6 +737,12 @@ def post_prompt_enhance(h, path, qs, ctype) -> None:
         enhanced = P.storyboard.a2v_prompt(enhanced, silent=False)
     if not enhanced:
         h._json({"error": "Gemma returned empty result"}, 500); return
+    # A LoRA whose trigger word the result never names would not fire — put
+    # its first trigger back at the front (after the a2v law above, so the
+    # word cap there cannot cut it off again).
+    enhanced, triggers_added = P.ensure_lora_triggers(enhanced, lora_ctx)
+    if triggers_added:
+        P.push(f"[enhance] added trigger word(s): {', '.join(triggers_added)}")
     P.push(f"[enhance] → {enhanced[:120]}… ({result.get('elapsed_sec','?')}s)")
     h._json({
         "ok": True,
@@ -739,6 +754,10 @@ def post_prompt_enhance(h, path, qs, ctype) -> None:
         # re-deriving the same script check the toggle's visibility used.
         "source_non_latin": source_non_latin,
         "translated": bool(source_non_latin and translate),
+        # 4.18.0: which LoRAs' notes the helper read, and the trigger words
+        # put back — the Enhance panel says both in one line.
+        "lora_notes_used": [c["name"] for c in lora_ctx if c.get("note")],
+        "lora_triggers_added": triggers_added,
     })
 
 

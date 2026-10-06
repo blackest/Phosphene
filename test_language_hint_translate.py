@@ -141,7 +141,7 @@ class TestEnhancePromptSendsTranslateFlag(unittest.TestCase):
 
     def test_passes_translated_flag_into_the_panel(self):
         fn = extract_function("enhancePrompt", QJS)
-        self.assertIn("showEnhancePanel(res.original, res.enhanced, !!res.translated)", fn)
+        self.assertIn("showEnhancePanel(res.original, res.enhanced, !!res.translated, enhanceLoraNote(res))", fn)
 
 
 # ---------------------------------------------------------------- 4

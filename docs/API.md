@@ -333,6 +333,15 @@ Form `repo`, `filename`, `meta` (the item JSON). Downloads through `huggingface_
 into the lane's LoRA directory, runs the H3 layout probe, and writes the same sidecar a CivitAI install writes plus
 `source`, `hf_repo`, `hf_url`. Returns `{ ok, skipped, name, path, sidecar_path, lane, layout, converted }`.
 
+### `GET /civitai/download/state` · `POST /civitai/download/cancel` (4.18.0)
+
+`POST /civitai/download` takes an optional form field `token` (8-64 characters, `A-Z a-z 0-9 _ -`) chosen by
+the caller. While that download runs, `GET /civitai/download/state?token=…` returns
+`{ ok, state: "running"|"cancelled", bytes, total, name }` (404 once it has finished), and
+`POST /civitai/download/cancel` with `token` stops it at the next 256 KB chunk: the partial file is removed,
+nothing is registered, and the download's own response is `{ ok: false, cancelled: true, error }`.
+Without a token a download runs exactly as before.
+
 ### `GET /loras/updates`
 
 Asks CivitAI whether any installed LoRA with a `civitai_id` in its sidecar has a
@@ -950,13 +959,17 @@ vendor reports gone (404 / 410) is dropped.
 
 ### `POST /prompt/enhance`
 
-`Content-Type: application/json`. Pre-rewrites a prompt with Gemma. Used by the panel's "✨ Enhance" button. **Avoid when LoRA trigger words are present** — the rewriter can drop them.
+Form-encoded. Pre-rewrites a prompt with Gemma. Used by the panel's Enhance buttons (Video and Lip-sync).
 
-```json
-{ "prompt": "...", "mode": "t2v" }
-```
+| Field | Note |
+|---|---|
+| `prompt` | required |
+| `mode` | `t2v` (default), `i2v` or `a2v` (Lip-sync: the i2v helper prompt plus the lip-sync prompt law) |
+| `preserve_tokens` | JSON list (or comma list) of words the result must keep, case-exact — trigger words |
+| `translate` | `0` keeps a non-Latin prompt in its own language; default translates to English |
+| `loras` | 4.18.0: JSON list of installed LoRA paths on the render. The panel reads each one's name, trigger words and guide (else the creator's description) from the LoRA library — paths it does not list are ignored — and hands at most 4, bounded, to the helper as fenced reference text. A LoRA whose trigger words are all missing from the result gets its first trigger put back at the front. |
 
-Returns `{"original": "...", "enhanced": "..."}`.
+Returns `{ ok, original, enhanced, mode, elapsed_sec, source_non_latin, translated, lora_notes_used: [names], lora_triggers_added: [words] }`; `{ error }` with 409 while a render holds the GPU.
 
 ### `POST /upload`
 

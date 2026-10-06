@@ -19,7 +19,7 @@
 
 </p>
 
-> **Current release: v4.17.5.** **Renders that recover when macOS stops the GPU.** On M1 and M2 Macs, when macOS stops a render because one GPU step ran too long, Phosphene now renders it again straight away in smaller GPU steps and remembers that size, instead of failing the same way every time; a size that still cannot finish is paused with a Retry smaller button. A job with no picture, clip or song is refused before it waits in the queue, a video LoRA picked for a song is named and refused, and the voice separator download resumes a broken connection. A failed install now says why (network, disk space, the package installer), and Update now on the version you already run says so instead of asking for a restart. 4.17.4: no more failures from a stray step count, the voice separator installs itself, and Repair engine fixes an unfinished install. 4.17.0 was the big one: estimates for your Mac, faces kept in portrait and phone photos, Undo on Stop/Clear/Hide, Lip-sync as a Video mode, and an Editor with Sync to song, Match colour, slip and roll edits, Replace and versioned renders. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
+> **Current release: v4.18.0.** **Your gallery plays itself, and your audio goes where it is needed.** **Play all** shows every output full size, one after another: each clip plays once, each photo stays as long as you choose (1-10 s), a song plays to its end, and the controls fade away while it runs. Any audio in Outputs has **Use this audio for...**: Lip-sync, a Music video, the soundtrack of an image-to-video clip, or a Music Studio cover - no trip to Finder. **Enhance knows your LoRAs**: it reads each active LoRA's guide or creator notes and puts back a trigger word the rewrite left out. A CivitAI LoRA download shows its percentage and can be **cancelled**, and toast messages show their words again (since 4.17.0 they appeared empty). 4.17.5: renders that recover when macOS stops the GPU on M1/M2. 4.17.0: estimates for your Mac, faces kept in portrait and phone photos, Lip-sync as a Video mode, and a much bigger Editor. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
 
 ## Overview
 
@@ -117,6 +117,8 @@ New workflow tab in 3.0 — Phosphene's lip-sync: a picture (optional) and a str
 ### LoRAs
 
 Drop `.safetensors` into `mlx_models/loras/` for immediate use, or browse and install LTX LoRAs from CivitAI inside the panel (per-row rename, download, companion-aware delete). Character bundles live alongside style LoRAs and are filtered out of the regular picker so they don't show up twice.
+
+A CivitAI download shows its progress on the Install button and can be cancelled; nothing half-downloaded is kept. **Enhance** reads the active LoRAs' guides (or their creators' notes) as reference and keeps their trigger words - if the rewrite drops one, it is put back at the front.
 
 **MiniMax H3 LoRAs use a separate library.** Switch the Video engine to
 **Hailuo H3** and the LoRAs panel gains an **Import H3 LoRA** button: pick a

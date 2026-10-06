@@ -677,24 +677,57 @@ async function audioStudioUploadAudio(file) {
     AUDIO_STUDIO.audioName = file.name;
     AUDIO_STUDIO.audioDuration = (data.duration_sec != null) ? Number(data.duration_sec) : null;
     audioStudioRenderSlots();
-    // Default the window to the file, not a fixed 7 s (VA-03): a fresh
-    // upload should default Duration to the whole clip (capped at the
-    // slider's own 30 s ceiling) so the common case — one short line —
-    // needs no manual trimming to avoid rendering silence.
-    if (AUDIO_STUDIO.audioDuration != null) {
-      const slider = document.getElementById('audioStudioDuration');
-      if (slider) {
-        // floor(len + 0.25): a 12.9 s file defaults to 13 s (0.1 s of tail,
-        // under the silent-tail threshold below), a 12.6 s file to 12 s —
-        // never a whole extra second of silence (4.17.0 render check).
-        const target = Math.max(1, Math.min(30, Math.floor(AUDIO_STUDIO.audioDuration + 0.25)));
-        slider.value = String(target);
-      }
-    }
-    audioStudioDurationChanged();
+    audioStudioDurationFromFile();
     if (status) status.textContent = '';
   } catch (e) {
     if (status) status.textContent = 'Audio upload failed: ' + (e.message || 'unknown');
+  }
+}
+
+// Default the window to the file, not a fixed 7 s (VA-03): a fresh audio
+// file should default Duration to the whole clip (capped at the slider's own
+// 30 s ceiling) so the common case — one short line — needs no manual
+// trimming to avoid rendering silence. Shared by an upload and by a file sent
+// here from the gallery (audioStudioUseAudio).
+function audioStudioDurationFromFile() {
+  if (AUDIO_STUDIO.audioDuration != null) {
+    const slider = document.getElementById('audioStudioDuration');
+    if (slider) {
+      // floor(len + 0.25): a 12.9 s file defaults to 13 s (0.1 s of tail,
+      // under the silent-tail threshold below), a 12.6 s file to 12 s —
+      // never a whole extra second of silence (4.17.0 render check).
+      const target = Math.max(1, Math.min(30, Math.floor(AUDIO_STUDIO.audioDuration + 0.25)));
+      slider.value = String(target);
+    }
+  }
+  if (typeof audioStudioDurationChanged === 'function') audioStudioDurationChanged();
+}
+
+// 4.18.0 — "Use this audio for… → Lip-sync" from the gallery: the file lands
+// in the Lip-sync audio slot exactly as if it had been dropped there (same
+// slot, same Duration default), and the Lip-sync form opens. A song or a
+// voice line already in Outputs never has to be found in Finder again.
+// The length comes from the output's sidecar when it has one, else from the
+// browser reading the file's own header.
+function audioStudioUseAudio(path, durationSec, url) {
+  if (!path) return;
+  AUDIO_STUDIO.audioPath = path;
+  AUDIO_STUDIO.audioName = String(path).split('/').pop();
+  const d = Number(durationSec);
+  AUDIO_STUDIO.audioDuration = (durationSec != null && isFinite(d) && d > 0) ? d : null;
+  openLipSyncEntry();
+  audioStudioRenderSlots();
+  audioStudioDurationFromFile();
+  if (AUDIO_STUDIO.audioDuration == null && url) {
+    const probe = new Audio();
+    probe.preload = 'metadata';
+    probe.addEventListener('loadedmetadata', () => {
+      if (AUDIO_STUDIO.audioPath !== path || !isFinite(probe.duration)) return;
+      AUDIO_STUDIO.audioDuration = probe.duration;
+      audioStudioRenderSlots();
+      audioStudioDurationFromFile();
+    }, { once: true });
+    probe.src = url;
   }
 }
 
@@ -1022,7 +1055,7 @@ function audioStudioPromptApplyFix(cleaned) {
 async function audioStudioEnhancePrompt() {
   const ta = document.getElementById('audioStudioPrompt');
   const original = ta.value.trim();
-  if (!original) { alert('Type a prompt before enhancing it.'); return; }
+  if (!original) { phosToast('Type a prompt before enhancing it.', { kind: 'warning' }); return; }
   const btn = document.getElementById('audioStudioEnhanceBtn');
   const originalLabel = btn.innerHTML;
   btn.disabled = true;
@@ -1035,12 +1068,52 @@ async function audioStudioEnhancePrompt() {
     // freezes the mouth. mode 'a2v' (routes_queue.py) borrows the i2v system
     // prompt instead and runs the result through the same stillness-cleanup
     // + word-cap every other a2v prompt goes through.
-    const r = await fetch('/prompt/enhance', { method: 'POST', body: new URLSearchParams({ prompt: original, mode: 'a2v' }) });
+    const fd = new URLSearchParams({ prompt: original, mode: 'a2v' });
+    // 4.18.0: Lip-sync renders with the Video tab's LoRAs (audioStudioGenerate
+    // forwards them), so Enhance describes the same ones and keeps their
+    // trigger words — it used to send neither, and a face LoRA's trigger
+    // could be rewritten away.
+    const loraPaths = (typeof enhanceLoraPaths === 'function') ? enhanceLoraPaths() : [];
+    if (loraPaths.length) {
+      fd.set('loras', JSON.stringify(loraPaths));
+      const triggers = [];
+      for (const l of (globalThis._activeLoras || [])) {
+        if (!loraPaths.includes(l.path)) continue;
+        for (const t of (l.trigger_words || [])) { const v = String(t || '').trim(); if (v) triggers.push(v); }
+      }
+      if (triggers.length) fd.set('preserve_tokens', JSON.stringify(triggers));
+    }
+    const r = await fetch('/prompt/enhance', { method: 'POST', body: fd });
     const res = await r.json();
-    if (res.error) { alert('Enhance failed: ' + res.error); return; }
-    if (confirm('Original:\n' + res.original + '\n\nEnhanced:\n' + res.enhanced + '\n\nReplace your prompt with the enhanced version?'))
-      { ta.value = res.enhanced; ta.dispatchEvent(new Event('input', { bubbles: true })); }
-  } catch (e) { alert('Enhance request failed: ' + (e.message || e)); }
+    if (res.error) { phosToast('Enhance failed: ' + res.error, { kind: 'danger', duration: 8000 }); return; }
+    // No native confirm (it blocked the page and could not be undone): apply
+    // the result, say what the LoRAs changed, and offer Undo in the toast.
+    // Codex 4.18.0: Enhance takes seconds and the box stays editable — if the
+    // prompt changed meanwhile, the new words are the person's and win; the
+    // result is offered instead of written over them. Undo, likewise, only
+    // puts the old prompt back while the box still holds the enhanced one.
+    const note = (typeof enhanceLoraNote === 'function') ? enhanceLoraNote(res) : '';
+    const setPrompt = (v) => { ta.value = v; ta.dispatchEvent(new Event('input', { bubbles: true })); };
+    const action = (el, label, fn) => {
+      if (!el) return;
+      const a = document.createElement('a');
+      a.href = '#'; a.className = 'phos-toast-action'; a.textContent = label;
+      a.onclick = (ev) => { ev.preventDefault(); el.remove(); fn(); };
+      el.appendChild(a);
+    };
+    if (ta.value.trim() !== original) {
+      const el = phosToast('Your prompt changed while Enhance was working, so it was kept.'
+        + (note ? ' ' + note : ''), { kind: 'warning', duration: 12000 });
+      action(el, 'Use the enhanced one', () => setPrompt(res.enhanced));
+      return;
+    }
+    setPrompt(res.enhanced);
+    const el = phosToast('Prompt enhanced.' + (note ? ' ' + note : ''), { kind: 'success', duration: 9000 });
+    action(el, 'Undo', () => {
+      if (ta.value === res.enhanced) setPrompt(original);
+      else phosToast('The prompt was edited since — Undo left it as it is.', { kind: 'warning' });
+    });
+  } catch (e) { phosToast('Enhance request failed: ' + (e.message || e), { kind: 'danger', duration: 8000 }); }
   finally { btn.disabled = false; btn.innerHTML = originalLabel; }
 }
 
@@ -4519,7 +4592,7 @@ document.querySelectorAll('#extendModeGroup .pill-btn').forEach(b => b.onclick =
 // the global scope; everything NOT listed here is private to this module.
 Object.assign(globalThis, {
   musicComposeActive, musicInit, updateMusicAvailability, audioModeSet, musicPick, musicFormChanged,
-  musicFormParams, musicGenerate, useTrackInA2V, openMusicInstallCard, closeMusicInstallCard,
+  musicFormParams, musicGenerate, useTrackInA2V, audioStudioUseAudio, openMusicInstallCard, closeMusicInstallCard,
   musicInstallRender, musicInstallStart, musicInstallStop,
   // Music Studio (cover): the install card's button is generated markup.
   musicCoverInstall, musicCoverSummary, musicCoverInstallCard, musicCfgValue,

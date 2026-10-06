@@ -5954,6 +5954,8 @@
       display: flex; flex-direction: column; align-items: stretch; gap: 10px;
     }
     .player-audio-open { align-self: center; }
+    /* 4.18.0: "Use this audio for…" sits beside "Open in Audio tab". */
+    .player-audio-btns { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
     .train-voice-controls {
       display: flex;
       flex-direction: column;
@@ -9840,6 +9842,9 @@
     .civitai-card .civitai-source-link:hover { text-decoration: underline; }
     .civitai-card .actions { padding: 0 12px 12px; }
     .civitai-card .actions button { width: 100%; }
+    /* 4.18.0: Cancel sits under the Install button while a CivitAI file downloads. */
+    .civitai-card .actions .civitai-cancel-btn { margin-top: 6px; }
+    .civitai-card .actions button[disabled] { font-variant-numeric: tabular-nums; }
     .civitai-status-line { color: var(--muted); font-size: 11px; margin-top: 12px; }
     .civitai-status-line.err { color: var(--danger, #f85149); }
     .civitai-status-line.ok { color: var(--success, #3fb950); }
@@ -10140,6 +10145,11 @@
     .phos-toast .phos-toast-close {
       /* Always the last item, after FILM-03's ×N repeat counter. */
       order: 99;
+      /* The panel's global `button { width: 100% }` made this × as wide as
+         the toast, and with flex-shrink 0 it squeezed the message to ZERO
+         width: from 4.17.0 to 4.17.5 every toast showed an icon and a × and
+         no words (measured in Chrome: message 0 px, × 230 px). */
+      width: auto;
       flex-shrink: 0; align-self: flex-start;
       background: none; border: none; color: var(--muted);
       font-size: 16px; line-height: 1; padding: 2px 4px; margin: -2px -4px 0 0;
@@ -10282,6 +10292,78 @@
     .expand-close:hover {
       background: rgba(40,50,90,0.95);
       transform: scale(1.05);
+    }
+    /* 4.18.0 — Play all. The bar under the picture: previous / play all /
+       next, "n of N", how long a photo stays, full screen. While the gallery
+       plays and nothing moves (.is-idle), the bar, the name, the actions and
+       the close button fade out and the cursor hides; any move brings them
+       back. A song gets a centred card instead of a bare control strip. */
+    .expand-bar {
+      flex: 0 0 auto;
+      display: flex; align-items: center; gap: 6px;
+      margin-top: 12px; padding: 6px 8px;
+      border-radius: 999px;
+      background: rgba(20,26,58,0.85);
+      border: 1px solid var(--ph-border-strong, rgba(140,160,220,0.16));
+      color: var(--text, #d8e0ee);
+      font-size: 12px;
+      max-width: calc(100vw - 32px);
+      flex-wrap: nowrap; justify-content: center; white-space: nowrap;
+    }
+    /* The panel's global `button, select { width: 100% }` would make every
+       control a full row of a shrink-to-fit bar — size them to content. */
+    .expand-bar-btn {
+      width: auto; flex: 0 0 auto;
+      height: 32px; min-width: 32px; padding: 0 10px;
+      border-radius: 999px; border: 0;
+      background: transparent; color: inherit; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      font: inherit; font-weight: 600;
+      transition: background 120ms ease;
+    }
+    .expand-bar-btn:hover { background: rgba(255,255,255,0.08); }
+    .expand-bar-btn:focus-visible { outline: 2px solid var(--accent, #2f81f7); outline-offset: 1px; }
+    .expand-bar-btn .ph { width: 14px; height: 14px; }
+    .expand-play { background: var(--accent, #2f81f7); color: #fff; padding: 0 14px; }
+    .expand-play:hover { background: var(--accent-bright, #58a6ff); }
+    .expand-play.is-on { background: rgba(255,255,255,0.14); }
+    .expand-count { color: var(--muted, #9aa7c2); font-variant-numeric: tabular-nums; padding: 0 6px; min-width: 56px; text-align: center; }
+    .expand-dur { color: var(--muted, #9aa7c2); display: inline-flex; align-items: center; gap: 6px; padding: 0 4px; }
+    .expand-dur select {
+      width: auto;
+      background: rgba(0,0,0,0.35); color: var(--text, #d8e0ee);
+      border: 1px solid var(--ph-border-strong, rgba(140,160,220,0.16));
+      border-radius: 6px; padding: 3px 4px; font: inherit;
+    }
+    .expand-progress {
+      position: absolute; left: 0; top: 0; height: 2px; width: 100%;
+      transform-origin: left center; transform: scaleX(0);
+      background: var(--accent, #2f81f7); opacity: .85; pointer-events: none;
+    }
+    .expand-progress.is-running { animation: lb-progress var(--lb-dur, 3s) linear forwards; }
+    @keyframes lb-progress { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+    .expand-audio {
+      display: flex; flex-direction: column; align-items: center; gap: 18px;
+      width: min(520px, 90vw); padding: 36px 28px;
+      border-radius: 12px; background: rgba(20,26,58,0.85);
+      border: 1px solid var(--ph-border-strong, rgba(140,160,220,0.16));
+    }
+    .expand-audio-note { font-size: 44px; line-height: 1; color: var(--accent-bright, #58a6ff); }
+    .expand-audio audio { width: 100%; }
+    .expand-lightbox .expand-bar,
+    .expand-lightbox .expand-close,
+    .expand-lightbox .expand-meta,
+    .expand-lightbox .expand-actions { transition: opacity 400ms ease; }
+    .expand-lightbox.is-idle { cursor: none; }
+    .expand-lightbox.is-idle .expand-bar,
+    .expand-lightbox.is-idle .expand-close,
+    .expand-lightbox.is-idle .expand-meta,
+    .expand-lightbox.is-idle .expand-actions { opacity: 0; pointer-events: none; }
+    .expand-lightbox:fullscreen { padding: 16px 24px 16px; }
+    .outputs-playall-btn { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+    .outputs-playall-btn .ph { width: 12px; height: 12px; }
+    @media (prefers-reduced-motion: reduce) {
+      .expand-progress.is-running { animation: none; transform: scaleX(1); opacity: .4; }
     }
 
     /* =========================================================
@@ -12478,6 +12560,11 @@ label > .ph:first-child:not(:only-child),
 .song-menu-item:hover:not([disabled]) { background: var(--panel-2); }
 .song-menu-item[disabled] { opacity: .45; cursor: not-allowed; }
 .song-menu-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+.song-menu-item:focus-visible { outline: 2px solid var(--accent, #8b7cff); outline-offset: -2px; background: var(--panel-2); }
+/* 4.18.0: the gallery's "Use this audio for…" menu reuses the song menu's
+   look; it says what it is for in a small header line. */
+.song-menu-head { font-size: var(--fs-2xs); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; padding: 6px 10px 4px; }
+#audioUseMenu { z-index: 120; width: 280px; }
 
 /* ===== MUSIC VIDEO — the cast of pictures =================================
    One row per picture: the thumbnail, what it is for, and an optional line

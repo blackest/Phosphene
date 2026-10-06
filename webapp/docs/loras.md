@@ -10,6 +10,7 @@ A LoRA is a small add-on that teaches a model a face, a style, a motion or a spe
 - With five or more LoRAs, a filter box finds them by name or trigger word.
 - The row buttons rename it (display name only), download the file, open it on CivitAI, or delete it from disk (asks first — it is permanent).
 - **Write a guide** has the planner model write what the LoRA does, how to prompt it, and a strength to start from.
+- **Enhance** knows the LoRAs that are on: it reads each one's guide (or the creator's description from CivitAI / Hugging Face) as reference, keeps their trigger words, and puts a trigger word back if the rewrite left it out. The line under the result says which.
 - **?** means its family is unknown — it may or may not work on this engine. **Update** means CivitAI has a newer version (**Check for updates** asks).
 
 LoRAs are per engine: an LTX LoRA cannot load on Hailuo H3 and an H3 LoRA cannot load on LTX. The picker shows the active engine's library and offers *Show N from other modes*.

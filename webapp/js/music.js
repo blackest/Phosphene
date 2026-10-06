@@ -914,6 +914,11 @@ function musicMenuOpen(ev, path) {
     item('Cover it', 'read the tune, write it fresh', `musicSongAction(${attr}, 'cover')`),
     item('Edit the score', '', `musicSongAction(${attr}, 'edit')`, noScore, 'No score on this song'),
     '<div class="song-menu-sep"></div>',
+    // 4.18.0: the same destinations the gallery's "Use this audio for…" offers.
+    item('Lip-sync', 'a face in your picture sings it', `audioUseApply(${attr}, 'lipsync')`),
+    item('Music video', 'your pictures, planned and cut to it', `audioUseApply(${attr}, 'musicvideo')`),
+    item('Soundtrack for a video', 'image-to-video, with this as its sound', `audioUseApply(${attr}, 'soundtrack')`),
+    '<div class="song-menu-sep"></div>',
     item('Show in Finder', 'the outputs folder', `if (typeof openOutputsFolder === 'function') openOutputsFolder()`),
     item('Delete', '', `if (typeof deleteOutput === 'function') deleteOutput(${attr})`),
   ].join('');

@@ -46,7 +46,7 @@ Stay on Q8 Draft unless the Mac has the memory.
 
 Describe the scene **and the sound**. Sound is generated with the picture; a prompt with no sound in it comes out near silent.
 
-- **Enhance** (LTX) rewrites your prompt in the style the model was trained on.
+- **Enhance** (LTX) rewrites your prompt in the style the model was trained on. With LoRAs on, it reads their notes and keeps their trigger words.
 - **No music** asks for voice, sound and ambience without a score.
 - **No voice** appears when the selected character has a voice: the face still locks, the audio stays ambient.
 
