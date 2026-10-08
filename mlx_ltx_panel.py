@@ -23203,7 +23203,13 @@ def take_expects_speech(params: dict, beats: list[str] | None = None) -> bool:
     shot with no mouth in it."""
     if (params.get("character_id") or "").strip():
         return True
-    text = " ".join([str(params.get("prompt") or "")] + [str(b) for b in (beats or [])])
+    # A part is judged by ITS OWN windows when it has any. The parent prompt
+    # carries every part's lines, so reading it made a part whose beats hold no
+    # speech at all (the second half of a 30 s one shot whose dialogue sat in
+    # the first) a "spoken" part: the gate scored a mouth with nothing to follow
+    # (-0.15) and spent two more 17-minute renders retaking it (2026-10-07).
+    own = [str(b) for b in (beats or []) if str(b or "").strip()]
+    text = " ".join(own) if own else str(params.get("prompt") or "")
     return bool(re.search(r'[“"][^”"]{2,}[”"]', text))
 
 
