@@ -402,6 +402,34 @@ class H3PreviewSchemaContract(unittest.TestCase):
             current["progress"]["phase"] = "decode"
             self.assertFalse(panel._h3_preview_progress(current)["live_preview"]["abortable"])
 
+    def test_a_take_parent_with_no_phase_is_still_abortable(self) -> None:
+        """A One Shot's queue job is the parent of the part that renders, and carries
+        no `progress.phase` of its own: the runner's status file has to answer."""
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(panel, "STATE_DIR", Path(tmp)), \
+                mock.patch.object(panel, "h3_live_preview_ready", return_value=True):
+            directory = panel.live_preview_dir("take-job-p1")
+            directory.mkdir(parents=True)
+            (directory / "preview_latest.png").write_bytes(b"png")
+
+            def write(forward: int, window: int) -> None:
+                (directory / "status.json").write_text(json.dumps({
+                    "schema": "h3-live-preview/1", "status": "running",
+                    "forward": forward, "total_forwards": 3,
+                    "window": window, "total_windows": 3, "eta_seconds": 700.0,
+                }))
+            parent = {"id": "take-job", "preview_id": "take-job-p1", "progress": {}}
+            write(2, 1)                                   # mid-denoise, first window
+            self.assertTrue(panel._h3_preview_progress(parent)["live_preview"]["abortable"])
+            write(3, 1)                                   # last forward, another window follows
+            self.assertTrue(panel._h3_preview_progress(parent)["live_preview"]["abortable"])
+            write(3, 3)                                   # last forward of the last window: nothing left to stop
+            self.assertFalse(panel._h3_preview_progress(parent)["live_preview"]["abortable"])
+            # a phase the job DOES carry still wins
+            write(1, 1)
+            parent["progress"] = {"phase": "decode"}
+            self.assertFalse(panel._h3_preview_progress(parent)["live_preview"]["abortable"])
+
     def test_unknown_h3_schema_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(panel, "STATE_DIR", Path(tmp)), \
