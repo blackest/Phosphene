@@ -174,9 +174,14 @@ class TheLevel(unittest.TestCase):
             self.assertEqual(rt.clamp_level(junk), rt.DEFAULT_LEVEL)
         self.assertEqual(rt.clamp_level(-99), rt.LEVEL_MIN)
 
-    def test_the_default_is_clearly_audible(self):
-        # "not something really subtle": between −30 and −24 LUFS
-        self.assertTrue(-30 <= rt.DEFAULT_LEVEL <= -24)
+    def test_the_default_is_a_bed_you_stop_hearing(self):
+        # The bed is written at REF_LUFS (-18, speech level) and the default fader sets
+        # how far under the speech it sits. At -27 that is ~9 dB: a hum under every
+        # line. Room tone is meant to be the background the ear tunes out — between
+        # −42 and −34 LUFS — while still filling the gaps a cut would otherwise drop
+        # to silence. The slider (−45…−18) still reaches the louder end.
+        self.assertTrue(-42 <= rt.DEFAULT_LEVEL <= -34)
+        self.assertGreater(rt.DEFAULT_LEVEL, rt.LEVEL_MIN)
 
     def test_the_file_is_rounded_up_so_trims_never_regenerate(self):
         self.assertEqual(rt.bed_seconds(0), 30)
@@ -844,7 +849,7 @@ class TheCard(unittest.TestCase):
         card = self.html[self.html.index('id="edRoomTone"'):]
         card = card[:card.index("</section>")]
         for needle in ('id="edRtVariant"', 'id="edRtLevel"', 'min="-45"', 'max="-18"',
-                       'value="-27"', "edRtApply('apply')", "edRtApply('take')",
+                       'value="-38"', "edRtApply('apply')", "edRtApply('take')",
                        'edRtRemove()', 'edRtAuto(this.checked)', 'Add room tone',
                        'New take', 'Remove', 'Add room tone to automatic cuts'):
             self.assertIn(needle, card, needle)
