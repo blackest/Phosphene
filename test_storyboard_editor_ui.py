@@ -7399,7 +7399,7 @@ ONESHOT_FUNCTIONS = (
     "osRenderCharacters", "osRenderToggles", "osRenderAnchor", "osRenderBeats", "osSetBeats", "osBeatsInput",
     "osPartsText", "osPartsShort",
     "osRenderSummary", "osRenderAll", "osSetEngine", "osSetSeconds", "osSetQuality", "osSetCharacter",
-    "osToggle", "osSplitPrompt", "osVerdict", "osPaintStatus", "oneshotOpenFromParams", "osWire",
+    "osToggle", "osSentences", "osJoinTriggerLine", "osSplitPrompt", "osVerdict", "osPaintStatus", "oneshotOpenFromParams", "osWire",
     "_osStoredSeconds", "_osApplyStoredPrefs",
     # the async ones osWire binds; the shim's fetch answers {ok:false}, so they are inert here
     "osPlanBeats", "osGenerate", "osUpload", "osClearAnchor", "osEstimate", "osStatusTick",
@@ -7565,6 +7565,23 @@ out.beats = { hint: $('osBeatsHint').textContent, rows: chipsOf('osBeats').lengt
 $('osPrompt').value = 'She pushes off. A van sweeps past! Pigeons burst up? Then nothing.';
 osSplitPrompt();
 out.split = osBeatsList();
+// Spoken lines end inside their closing quote and never split mid-quote; sentences past the
+// last window are reported, not silently dropped (two parts' prompts pasted into one box).
+$('osPrompt').value = 'He nods. He says: "Now that\'s good coffee." She replies: "Deal. But you\'re choosing the table." They smile. '
+  + 'Then a second part. One more. And another. Last one.';
+osSplitPrompt();
+out.splitSpeech = { beats: osBeatsList(), hint: $('osBeatsHint').textContent };
+$('osPrompt').value = 'She pushes off. A van sweeps past!';
+osSplitPrompt();
+out.splitFits = $('osBeatsHint').textContent;
+// Trigger words alone are not a window: they ride with the sentence after them.
+$('osPrompt').value = 'bgctrn, bizarrotrn. A man sits at a table. He says: "Hi there." She nods.';
+osSplitPrompt();
+out.splitTriggers = osBeatsList();
+// ...but a plain one-word sentence is still a beat of its own.
+$('osPrompt').value = 'Silence. A van sweeps past.';
+osSplitPrompt();
+out.splitOneWord = osBeatsList();
 // A character turns the handoff on, the qualities become the character's, and the document names it.
 osSetCharacter('bizarrotrn');
 out.character = { handoff: OS.handoff, handoffChips: active(TOGGLES.handoff.chips, 'osValue'), quality: osActiveQuality(),
@@ -7858,6 +7875,24 @@ class OneShotIsATab(unittest.TestCase):
         self.assertEqual(b["values"], ["she pushes off", "", "a van sweeps past", "1", "2", "3", "4", "5"])
         self.assertEqual(b["doc"], ["she pushes off", "", "a van sweeps past", "1", "2", "3", "4", "5"])
         self.assertEqual(self.r["split"], ["She pushes off.", "A van sweeps past!", "Pigeons burst up?", "Then nothing."])
+
+    def test_split_keeps_a_spoken_line_whole_and_says_what_it_left_out(self):
+        got = self.r["splitSpeech"]
+        self.assertEqual(got["beats"], [
+            "He nods.",
+            'He says: "Now that\'s good coffee."',
+            'She replies: "Deal. But you\'re choosing the table."',
+            "They smile.",
+            "Then a second part.",
+            "One more.",
+        ])
+        self.assertIn("2 sentences did not fit and were left out", got["hint"])
+        self.assertNotIn("did not fit", self.r["splitFits"])
+
+    def test_split_joins_a_trigger_word_line_onto_the_next_sentence(self):
+        self.assertEqual(self.r["splitTriggers"],
+                         ["bgctrn, bizarrotrn. A man sits at a table.", 'He says: "Hi there."', "She nods."])
+        self.assertEqual(self.r["splitOneWord"], ["Silence.", "A van sweeps past."])
 
     def test_a_character_turns_the_handoff_on_and_the_user_can_turn_it_back(self):
         c = self.r["character"]
