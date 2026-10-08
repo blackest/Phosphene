@@ -4208,12 +4208,12 @@ The last line"></textarea>
         <p class="ed-rt-sub">Background noise under the whole __SEQ__, so cuts never drop to silence.</p>
         <select class="sb-input ed-rt-pick" id="edRtVariant" aria-label="Which room tone"
                 onchange="edRtPick()"></select>
-        <label class="ed-rt-level" title="How loud the bed plays, in LUFS. Dialogue sits around −16; −27 is clearly there without competing. The render applies exactly this.">
+        <label class="ed-rt-level" title="How loud the bed plays, in LUFS. Dialogue sits around −16; −38 is a bed you stop hearing, −27 is clearly there. The render applies exactly this.">
           <span>Level</span>
-          <input type="range" id="edRtLevel" min="-45" max="-18" step="1" value="-27"
+          <input type="range" id="edRtLevel" min="-45" max="-18" step="1" value="-38"
                  aria-label="Room tone level in LUFS"
                  oninput="edRtLevelSlide(this.value)" onchange="edRtLevelCommit(this.value)">
-          <output id="edRtLevelOut">−27 LUFS</output>
+          <output id="edRtLevelOut">−38 LUFS</output>
         </label>
         <div class="ed-rt-acts">
           <button type="button" class="ghost-btn primary" id="edRtAdd" onclick="edRtApply('apply')">Add room tone</button>
