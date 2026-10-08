@@ -44331,6 +44331,17 @@ def _h3_preview_progress(current: dict | None) -> dict:
         _prog_windows = int((current.get("progress") or {}).get("window_total") or 1)
     except (TypeError, ValueError):
         _prog_window = _prog_windows = 1
+    if not phase and status in ("starting", "running"):
+        # A One Shot's queue job is the PARENT; the part rendering is a child
+        # (`<id>-p1`) and the Now card's progress dict is written only onto the
+        # job whose id is the queue's current one — so a take's parent never had
+        # a phase, `abortable` was False for the whole take, and Stop early never
+        # appeared on a One Shot (2026-10-08, H3 Standard 30 s). The runner's own
+        # status file says where it is: a forward still to come in this window is
+        # denoise; the last forward of a window is the decode hand-off, and the
+        # rule below already allows that one only when another window follows.
+        phase = "denoise" if forward < total else "decode"
+        _prog_window, _prog_windows = max(1, window), window_total
     try:
         remaining = max(0.0, float(st.get("eta_seconds") or 0.0))
     except (TypeError, ValueError):
