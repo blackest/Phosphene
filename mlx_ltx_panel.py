@@ -19968,6 +19968,30 @@ def ltx_grid_frames_up(frames: int) -> int:
 UPSCALE_FULL_CLIP_FRAMES = 129
 
 
+# Upscale ×2 safety rail: the lane doubles the source canvas, and above QHD
+# the output exhausted 96 GB + swap (3072×1792 did, 2026-10-12). Refused at
+# queue time, in the form's own words, instead of after a long render.
+UPSCALE_MAX_OUTPUT_W = 2560
+UPSCALE_MAX_OUTPUT_H = 1440
+
+
+def upscale_output_refusal(src_w, src_h) -> str | None:
+    """None if a ×2 of a src_w×src_h clip fits under QHD, else the sentence."""
+    try:
+        sw, sh = int(src_w or 0), int(src_h or 0)
+    except (TypeError, ValueError):
+        return None
+    if sw <= 0 or sh <= 0:
+        return None
+    out_w, out_h = sw * 2, sh * 2
+    if out_w <= UPSCALE_MAX_OUTPUT_W and out_h <= UPSCALE_MAX_OUTPUT_H:
+        return None
+    return (f"The source is {sw}×{sh}; ×2 would be {out_w}×{out_h}, above the "
+            f"{UPSCALE_MAX_OUTPUT_W}×{UPSCALE_MAX_OUTPUT_H} limit. Render the "
+            f"source at {UPSCALE_MAX_OUTPUT_W // 2}×{UPSCALE_MAX_OUTPUT_H // 2} "
+            "or smaller.")
+
+
 def upscale_frame_plan(src_frames: int, form_frames=None) -> tuple[int, int]:
     """(frames the ×2 delivers, frames the model renders) for a source clip.
 
@@ -34487,7 +34511,10 @@ def queue_face_fix(source_path: str, *, board_id: str = "",
     # guess is not (one measurement at 1024×576 exists, not a table).
     target_w = target_h = None
     if sw and sh:
-        cap = int(tier_max_dim("i2v") or 0) or max(sw, sh) * 2
+        qhd = upscale_output_refusal(sw, sh)
+        if qhd:
+            return {"ok": False, "code": "hardware_tier", "error": qhd}
+        cap =int(tier_max_dim("i2v") or 0) or max(sw, sh) * 2
         scale = min(2.0, cap / float(max(sw, sh)))
         if scale < 1.25:
             return {"ok": False, "code": "hardware_tier",

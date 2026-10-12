@@ -794,6 +794,13 @@ def post_run(h, path, qs, ctype) -> None:
     refusal = P.extend_face_fix_refusal(job["params"])
     if refusal:
         h._json({"error": refusal, "code": "pack_missing"}, 400); return
+    # Upscale ×2 above QHD exhausted 96 GB + swap: refused before it queues.
+    _up = job["params"]
+    if _up.get("mode") == "upscale" and _up.get("upscale_source_path"):
+        _sw, _sh = P._probe_video_dims(str(_up["upscale_source_path"]))
+        refusal = P.upscale_output_refusal(_sw, _sh)
+        if refusal:
+            h._json({"error": refusal, "code": "hardware_tier"}, 400); return
     # "Listen to the voice only" on an install that cannot separate a voice:
     # refused NOW with an install offer, never rendered on the full mix.
     refusal = P.a2v_stem_refusal(job["params"])
