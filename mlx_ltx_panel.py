@@ -17241,8 +17241,71 @@ def engines_payload() -> list[dict]:
             _gen = _lbl.replace("LTX-", "").strip()
             if _gen and _gen != _lbl.strip():
                 d["generation"] = _gen
+            # Every generation whose base pack is on disk, so the engine menu
+            # can offer a switch. Only offered when there is a real choice.
+            d["generations"] = ltx_generation_choices()
         out.append(d)
     return out
+
+
+def ltx_generation_choices() -> list[dict]:
+    """The LTX generations this install can switch between.
+
+    A generation is offered only when its base (q4) pack is complete on disk:
+    switching to one that is not installed would boot the panel into a
+    generation it cannot render with. The active one is always listed so the
+    menu can show which is current. Returns [] when there is no real choice
+    (fewer than two usable generations), which hides the control entirely."""
+    out: list[dict] = []
+    for v in MODEL_VERSIONS:
+        vid = v["id"]
+        active = vid == ACTIVE_MODEL_VERSION
+        try:
+            installed = not pack_missing_files("q4", vid)
+        except Exception:                                   # noqa: BLE001
+            installed = False
+        if not (installed or active):
+            continue
+        out.append({
+            "id": vid,
+            "label": str(v.get("label") or vid).replace("LTX-", "").strip(),
+            "active": active,
+            "default": bool(v.get("default")),
+        })
+    return out if len(out) > 1 else []
+
+
+def set_environment_value(key: str, value: str) -> None:
+    """Set `KEY=value` in <install>/ENVIRONMENT, preserving every other line.
+
+    That file is the one the Pinokio launcher, pinokio.js and download_q8.js
+    all read, so writing here keeps the panel, the sidebar and the installers
+    agreeing about the generation after the next full Pinokio restart. Replaces
+    an existing assignment in place (the LAST one, since last wins in dotenv),
+    otherwise appends. Written to a temp file and renamed, so a crash cannot
+    leave a half-written ENVIRONMENT."""
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+        raise ValueError("refusing to write an unsafe ENVIRONMENT entry")
+    path = ROOT / "ENVIRONMENT"
+    try:
+        text = path.read_text(encoding="utf8")
+    except FileNotFoundError:
+        text = ""
+    lines = text.split("\n")
+    pat = re.compile(r"^\s*(?:export\s+)?" + re.escape(key) + r"\s*[=:]")
+    hits = [i for i, ln in enumerate(lines) if pat.match(ln) and not ln.lstrip().startswith("#")]
+    entry = f"{key}={value}"
+    if hits:
+        lines[hits[-1]] = entry
+    else:
+        if lines and lines[-1] == "":
+            lines.insert(len(lines) - 1, entry)
+        else:
+            lines.append(entry)
+            lines.append("")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(lines), encoding="utf8")
+    os.replace(tmp, path)
 
 
 def _engine_css() -> str:

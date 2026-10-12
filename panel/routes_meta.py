@@ -346,40 +346,40 @@ def post_version_finish(h, path, qs, ctype) -> None:
     h._json(payload, code); return
 
 
-@post("/restart")
-def post_restart(h, path, qs, ctype) -> None:
-    # The "Restart to finish update" pill used to open an alert() that
-    # told the user to go and do it themselves in Pinokio — a button
-    # naming an action and delivering a paragraph. Worse, Chrome
-    # silently swallows repeat dialogs once "prevent additional
-    # dialogs" is ticked, so for some users the click did visibly
-    # nothing at all (reported 2026-08-16).
-    #
-    # os.execv REPLACES this process with a fresh one: same pid, same
-    # port, same argv and cwd, running the code that is on disk NOW.
-    # That is exactly what a stale process needs. The queue and
-    # settings live on disk, so nothing in flight is lost EXCEPT a
-    # running render — which is why a busy panel refuses instead.
-    # The update is not finished until post_update.sh has run: restarting
-    # into new code before that is how a release's new package was skipped.
+def restart_refusal():
+    """Why the panel cannot be re-exec'd right now, or None when it can.
+
+    Returns (http_status, payload). Shared by /restart and anything else that
+    restarts the panel (the LTX generation switch), so the two can never
+    disagree about when a restart is safe — and so a caller can ask BEFORE it
+    changes anything on disk, instead of changing state and then being refused."""
     _pu = P.post_update_status()
     if _pu.get("pending") or _pu.get("active"):
-        h._json({"ok": False, "post_update": True,
-                    "error": "Finishing the update first (installing what the "
-                             "new version needs) - restart becomes available "
-                             "when it is done."}, 409); return
+        return 409, {"ok": False, "post_update": True,
+                     "error": "Finishing the update first (installing what the "
+                              "new version needs) - restart becomes available "
+                              "when it is done."}
     if _pu.get("state") == "failed":
-        h._json({"ok": False, "post_update": True,
-                    "error": "The update did not finish: " + str(_pu.get("error"))
-                             + ". Use Pinokio's Update (Stop, then Update), "
-                             "or try again from the update banner."}, 409); return
+        return 409, {"ok": False, "post_update": True,
+                     "error": "The update did not finish: " + str(_pu.get("error"))
+                              + ". Use Pinokio's Update (Stop, then Update), "
+                              "or try again from the update banner."}
     with P.LOCK:
         _busy = P.STATE.get("current") is not None
     if _busy:
-        h._json({"ok": False, "busy": True,
-                    "error": "A render is running. Stop it first, or "
-                             "wait for it to finish — restarting now "
-                             "would kill it."}, 409); return
+        return 409, {"ok": False, "busy": True,
+                     "error": "A render is running. Stop it first, or "
+                              "wait for it to finish — restarting now "
+                              "would kill it."}
+    return None
+
+
+def reexec_panel(h) -> None:
+    """Answer the request, then replace this process with a fresh one.
+
+    The caller has already passed restart_refusal(). See post_restart for why
+    os.execv is the right restart: same pid, same port, running what is on disk
+    now, and the queue/settings live on disk so nothing is lost."""
     P.persist_queue()
     h._json({"ok": True, "restarting": True})
     try:
@@ -399,6 +399,73 @@ def post_restart(h, path, qs, ctype) -> None:
             P.sys.stderr.write(f"restart failed: {exc}\n")
     P.threading.Thread(target=_reexec, name="panel-restart",
                      daemon=True).start()
+
+
+@post("/restart")
+def post_restart(h, path, qs, ctype) -> None:
+    # The "Restart to finish update" pill used to open an alert() that
+    # told the user to go and do it themselves in Pinokio — a button
+    # naming an action and delivering a paragraph. Worse, Chrome
+    # silently swallows repeat dialogs once "prevent additional
+    # dialogs" is ticked, so for some users the click did visibly
+    # nothing at all (reported 2026-08-16).
+    #
+    # os.execv REPLACES this process with a fresh one: same pid, same
+    # port, same argv and cwd, running the code that is on disk NOW.
+    # That is exactly what a stale process needs. The queue and
+    # settings live on disk, so nothing in flight is lost EXCEPT a
+    # running render — which is why a busy panel refuses instead.
+    # The update is not finished until post_update.sh has run: restarting
+    # into new code before that is how a release's new package was skipped.
+    _refusal = restart_refusal()
+    if _refusal:
+        h._json(_refusal[1], _refusal[0]); return
+    reexec_panel(h)
+
+
+@post("/ltx/generation")
+def post_ltx_generation(h, path, qs, ctype) -> None:
+    # Switch which LTX generation the panel renders with (2.3 <-> 2.5).
+    #
+    # The generation is fixed per process: ACTIVE_MODEL_VERSION is read once
+    # from LTX_MODEL_VERSION at import, and the helper, packs, tiers and the
+    # Ingredients gate all key off it. So this is not a live toggle — it
+    # persists the choice to <install>/ENVIRONMENT (the file Pinokio, the
+    # sidebar and the installers all read, so they keep agreeing) and then
+    # re-execs the panel, exactly as /restart does. It replaces editing that
+    # file by hand and restarting from Pinokio.
+    #
+    # Refusals come BEFORE anything is written, and they are the same ones
+    # /restart makes: a running render or an unfinished update. The target must
+    # be a registered generation whose base pack is complete on disk — never a
+    # path or a free-form string from the client.
+    _rb = h._read_form_body()
+    if _rb is None:
+        return
+    body, form = _rb
+    vid = (form.get("version", [""])[0] or "").strip()
+    choices = {c["id"]: c for c in P.ltx_generation_choices()}
+    if vid not in choices:
+        h._json({"ok": False,
+                 "error": f"{vid!r} is not an installed LTX generation. "
+                          f"Installed: {sorted(choices) or 'only the active one'}."},
+                400); return
+    if vid == P.ACTIVE_MODEL_VERSION:
+        h._json({"ok": True, "unchanged": True, "version": vid}); return
+    _refusal = restart_refusal()
+    if _refusal:
+        h._json(_refusal[1], _refusal[0]); return
+    try:
+        P.set_environment_value("LTX_MODEL_VERSION", vid)
+    except Exception as exc:                               # noqa: BLE001
+        h._json({"ok": False,
+                 "error": f"Could not save the choice to ENVIRONMENT: {exc}"},
+                500); return
+    # The re-exec'd process inherits THIS process's environment, which still
+    # holds the old value (Pinokio put it there at launch), so update it too.
+    P.os.environ["LTX_MODEL_VERSION"] = vid
+    P.push(f"generation: switching to {choices[vid]['label']} - restarting the panel.")
+    reexec_panel(h)
 
 
 @post("/version/check")

@@ -466,6 +466,10 @@
              2.5 does the pixels. Works on any clip in Outputs. -->
         <button type="button" class="mode-chip pill-btn" data-remix="upscale" title="Upscale &amp; Face Fix — LTX-2.5 Pixel Spatial Upscaler IC-LoRA. Re-renders a clip at twice its size with real generated detail (not a filter) and keeps the face and the sound. Made for H3 drafts, works on any clip. One click from any clip: the Upscale &amp; Face Fix button under the player.">Upscale &amp; Face Fix<span class="mc-sub sub">any clip → 2× sharper · face kept</span></button>
       </div>
+      <!-- One LTX generation runs at a time (2.3 or 2.5). Filled by
+           renderLtxGenSwitch() ONLY when this install has both; empty and
+           hidden otherwise. Ingredients needs 2.3, so the switch sits with it. -->
+      <div id="ltxGenSwitch" class="eng-gen eng-gen-inline" hidden></div>
     </div>
 
     <form id="genForm">
