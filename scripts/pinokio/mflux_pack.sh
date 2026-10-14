@@ -25,8 +25,8 @@
 # FBCache patch is applied.
 
 echo 'Installing the mflux image-engine pack (Ideogram 4 + Qwen-Edit)…' && \
-( uv pip install --python ./ltx-2-mlx/env/bin/python 'mflux==0.18.0' && \
-  uv pip install --python ./ltx-2-mlx/env/bin/python --reinstall --no-deps 'mflux==0.18.0' && \
-  uv pip install --python ./ltx-2-mlx/env/bin/python 'mlx-teacache==0.4.1' && \
+( uv pip install --python ./ltx-2-mlx/env/bin/python -c scripts/pinokio/engine_constraints.txt 'mflux==0.18.0' && \
+  uv pip install --python ./ltx-2-mlx/env/bin/python -c scripts/pinokio/engine_constraints.txt --reinstall --no-deps 'mflux==0.18.0' && \
+  uv pip install --python ./ltx-2-mlx/env/bin/python -c scripts/pinokio/engine_constraints.txt 'mlx-teacache==0.4.1' && \
   ./ltx-2-mlx/env/bin/python3.11 patch_mflux_fbcache.py ) \
 || echo 'WARN: mflux image-engine install hit an error — video still works; use the Reinstall image engines action to retry image generation.'

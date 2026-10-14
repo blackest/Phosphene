@@ -86,6 +86,12 @@ require() {
 PY="$ROOT/ltx-2-mlx/env/bin/python3.11"
 VENV_PY="$ROOT/ltx-2-mlx/env/bin/python"
 HF="$ROOT/ltx-2-mlx/env/bin/hf"
+# THE ENGINE VENV'S KNOWN-GOOD SET (4.19.4). EVERY uv pip install into the
+# engine venv below passes it with -c, so no step - however eager - can leave
+# the venv outside it, and an Update that stops half-way cannot strand an
+# install on a set nobody tested. The file says why each line is there.
+export EC="$ROOT/scripts/pinokio/engine_constraints.txt"   # exported: the bash -c steps read it
+[ -f "$EC" ] || { echo "FATAL error: $EC is missing - the repo pull did not land. Re-run Update."; exit 1; }
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 echo "=== Phosphene post-update — app root: $ROOT ==="
@@ -132,7 +138,7 @@ require "the vendored engine pin move" -- bash "$ROOT/scripts/pinokio/ltx_checko
 # 2026-08-28 measurements behind holding at 0.31.1 rather than moving to
 # 0.32.x, are in scripts/check_post_update.js and install.js. Read them before
 # touching this line — and change both pins in one commit or not at all.
-require "the mlx 0.31.1 pin" -- uv pip install --python "$VENV_PY" --reinstall --no-deps 'mlx==0.31.1' 'mlx-lm==0.31.1' 'mlx-metal==0.31.1'
+require "the mlx 0.31.1 pin" -- uv pip install --python "$VENV_PY" -c "$EC" --reinstall --no-deps 'mlx==0.31.1' 'mlx-lm==0.31.1' 'mlx-metal==0.31.1'
 
 # ---- 2b. THE TRANSFORMERS CAP — the one install.js has been promising -------
 # install.js has said, since the 2026-07-10 ship-blocker, that "uv downgrades an
@@ -153,7 +159,7 @@ require "the mlx 0.31.1 pin" -- uv pip install --python "$VENV_PY" --reinstall -
 # on the SAME uv invocation as the mlx trio (exactly as install.js:268 does it)
 # so the solver cannot re-widen the cap while satisfying mlx-lm.
 require "the transformers <5.13.0 cap (5.13.0 breaks every generation)" -- \
-  uv pip install --python "$VENV_PY" 'mlx==0.31.1' 'mlx-lm==0.31.1' 'mlx-metal==0.31.1' 'transformers>=5.0.0,<5.13.0'
+  uv pip install --python "$VENV_PY" -c "$EC" 'mlx==0.31.1' 'mlx-lm==0.31.1' 'mlx-metal==0.31.1' 'transformers>=5.0.0,<5.13.0'
 
 # ---- 3. Re-install the three vendored packages ------------------------------
 # This is what actually moves an existing user's RUNTIME: a bare git checkout
@@ -182,8 +188,8 @@ require "the transformers <5.13.0 cap (5.13.0 breaks every generation)" -- \
 # this is a no-op. It links the workspace members editable — the --reinstall
 # --no-deps pass right after replaces those links with real copies, exactly
 # as install.js does.
-require "installing the vendored packages' dependencies (mlx-arsenal and the rest)" -- bash -c 'cd "$1/ltx-2-mlx" && shift && uv pip install --python env/bin/python --build-constraints ../pip-build-constraints.txt "$@" ./packages/ltx-core-mlx ./packages/ltx-pipelines-mlx ./packages/ltx-trainer' _ "$ROOT" 'mlx==0.31.1' 'mlx-lm==0.31.1' 'mlx-metal==0.31.1' 'transformers>=5.0.0,<5.13.0'
-require "re-installing the three vendored packages" -- bash -c 'cd "$1/ltx-2-mlx" && uv pip install --python env/bin/python --reinstall --no-deps --build-constraints ../pip-build-constraints.txt ./packages/ltx-core-mlx ./packages/ltx-pipelines-mlx ./packages/ltx-trainer' _ "$ROOT"
+require "installing the vendored packages' dependencies (mlx-arsenal and the rest)" -- bash -c 'cd "$1/ltx-2-mlx" && shift && uv pip install --python env/bin/python -c "$EC" --build-constraints ../pip-build-constraints.txt "$@" ./packages/ltx-core-mlx ./packages/ltx-pipelines-mlx ./packages/ltx-trainer' _ "$ROOT" 'mlx==0.31.1' 'mlx-lm==0.31.1' 'mlx-metal==0.31.1' 'transformers>=5.0.0,<5.13.0'
+require "re-installing the three vendored packages" -- bash -c 'cd "$1/ltx-2-mlx" && uv pip install --python env/bin/python -c "$EC" --reinstall --no-deps --build-constraints ../pip-build-constraints.txt ./packages/ltx-core-mlx ./packages/ltx-pipelines-mlx ./packages/ltx-trainer' _ "$ROOT"
 
 # ---- 4. The codec patch — IMMEDIATELY after the reinstall -------------------
 # It MUST be here: step 3 overwrites site-packages, so a patch applied before
@@ -199,10 +205,10 @@ require "the codec patch (without it every render encodes 4:2:0 - blocky faces)"
 # ---- 5. Trainer transitive deps ---------------------------------------------
 # ltx-trainer went in with --no-deps above, so pyyaml/pydantic/tqdm/rich were
 # never resolved; the trainer subprocess dies at `import yaml` without them.
-( cd "$ROOT/ltx-2-mlx" && uv pip install --python env/bin/python 'pyyaml>=6.0' 'pydantic>=2.0' 'tqdm>=4.65' 'rich>=13.0' )
+( cd "$ROOT/ltx-2-mlx" && uv pip install --python env/bin/python -c "$EC" 'pyyaml>=6.0' 'pydantic>=2.0' 'tqdm>=4.65' 'rich>=13.0' )
 # pywebpush signs the closed-tab completion alerts (Settings → Completion
 # alerts). Optional: the panel offers the button only when it imports.
-( cd "$ROOT/ltx-2-mlx" && uv pip install --python env/bin/python 'pywebpush>=2.0' )
+( cd "$ROOT/ltx-2-mlx" && uv pip install --python env/bin/python -c "$EC" 'pywebpush>=2.0' )
 
 # ---- 6. Optional runtime packages -------------------------------------------
 # mlx-vlm --no-deps on purpose (its default deps fight our mflux/transformers/
@@ -215,11 +221,20 @@ require "the codec patch (without it every render encodes 4:2:0 - blocky faces)"
 # huggingface-hub<1.0.0, which pip refuses to resolve against our >=1.5.0 floor
 # (ResolutionImpossible — the "blue screen error flashing for a second every
 # update"), while uv installs both and leaves it warned-but-functional.
-( cd "$ROOT/ltx-2-mlx" && uv pip install --python env/bin/python --no-deps 'mlx-vlm==0.4.4' )
-uv pip install --python "$VENV_PY" --upgrade 'hf_transfer>=0.1.6'
-uv pip install --python "$VENV_PY" --upgrade certifi
-uv pip install --python "$VENV_PY" --upgrade 'litellm>=1.83.14'
-uv pip install --python "$VENV_PY" --upgrade 'huggingface-hub>=1.5.0,<2.0' 'smolagents>=1.24.0'
+( cd "$ROOT/ltx-2-mlx" && uv pip install --python env/bin/python -c "$EC" --no-deps 'mlx-vlm==0.4.4' )
+uv pip install --python "$VENV_PY" -c "$EC" --upgrade 'hf_transfer>=0.1.6'
+uv pip install --python "$VENV_PY" -c "$EC" --upgrade certifi
+# NOT --upgrade (4.19.4). uv's --upgrade is EAGER: it re-resolves every package
+# under litellm to its newest release, and litellm accepts tokenizers <1.0 - so
+# on 2026-10-09 this line moved tokenizers to 0.23.3, which transformers <5.13
+# refuses to import with, and every render failed until step 7 happened to
+# resolve transformers and move it back. An Update that stopped in between
+# (Pinokio stops a run on an "error:" line, a dropped connection, a closed
+# window) left the install unable to render. The floors below still install or
+# raise litellm / smolagents when they are missing or too old; -c "$EC" holds
+# the rest of the venv where it is.
+uv pip install --python "$VENV_PY" -c "$EC" 'litellm>=1.83.14'
+uv pip install --python "$VENV_PY" -c "$EC" 'huggingface-hub>=1.5.0,<2.0' 'smolagents>=1.24.0'
 
 # ---- 7. The mflux image-engine pack (Ideogram 4 + Qwen-Edit) ----------------
 # STANDARD since 2026-06-13, for every user — this is what unblocked Ideogram 4
@@ -228,9 +243,9 @@ uv pip install --python "$VENV_PY" --upgrade 'huggingface-hub>=1.5.0,<2.0' 'smol
 # resolves and then the version locks. BEST-EFFORT: video is unaffected if it
 # fails, and the panel offers a one-click reinstall.
 echo 'Installing/refreshing the mflux image-engine pack (Ideogram 4 + Qwen-Edit)…'
-( uv pip install --python "$VENV_PY" 'mflux==0.18.0' \
-  && uv pip install --python "$VENV_PY" --reinstall --no-deps 'mflux==0.18.0' \
-  && uv pip install --python "$VENV_PY" 'mlx-teacache==0.4.1' ) \
+( uv pip install --python "$VENV_PY" -c "$EC" 'mflux==0.18.0' \
+  && uv pip install --python "$VENV_PY" -c "$EC" --reinstall --no-deps 'mflux==0.18.0' \
+  && uv pip install --python "$VENV_PY" -c "$EC" 'mlx-teacache==0.4.1' ) \
   || echo 'WARN: mflux image-engine install hit an error — video is unaffected; re-run Update, or use the Reinstall image engines action, to retry.'
 
 # The FBCache patch has to follow the step that installs what it patches.
@@ -396,20 +411,28 @@ echo 'Trim done.'
 # could never install a missing `mlx_arsenal`, so it failed the same way every
 # time (INST-03). mlx_arsenal is imported explicitly because the package roots
 # import without it — the failure used to surface only at Generate.
+# 4.19.4: and transformers, through the module every render loads it from
+# (the Gemma prompt encoder reaches it via mlx_lm.tokenizer_utils). transformers
+# checks its own dependency versions AT IMPORT and refuses to load on a
+# mismatch - tokenizers 0.23.3 under transformers <5.13 was exactly that, and
+# every render on the install failed with "tokenizers>=0.22.0,<=0.23.0 is
+# required ... but found tokenizers==0.23.3". The repair below resolves
+# transformers under -c "$EC", which moves tokenizers back into range, so an
+# install that already has the bad set is fixed by this Update.
 echo 'Verifying the render engine actually imports…'
-if ! "$PY" -c "import ltx_core_mlx; import ltx_pipelines_mlx; import mlx; import mlx_arsenal" 2>/dev/null; then
+if ! "$PY" -c "import ltx_core_mlx; import ltx_pipelines_mlx; import mlx; import mlx_arsenal; import transformers; import mlx_lm.tokenizer_utils" 2>/dev/null; then
   echo 'Render engine did not import — repairing the vendored packages once…'
-  ( cd "$ROOT/ltx-2-mlx" && uv pip install --python env/bin/python \
+  ( cd "$ROOT/ltx-2-mlx" && uv pip install --python env/bin/python -c "$EC" \
       --build-constraints ../pip-build-constraints.txt \
       'mlx==0.31.1' 'mlx-lm==0.31.1' 'mlx-metal==0.31.1' 'transformers>=5.0.0,<5.13.0' \
       ./packages/ltx-core-mlx ./packages/ltx-pipelines-mlx ./packages/ltx-trainer \
-    && uv pip install --python env/bin/python --reinstall \
+    && uv pip install --python env/bin/python -c "$EC" --reinstall \
       --no-deps --build-constraints ../pip-build-constraints.txt \
       ./packages/ltx-core-mlx ./packages/ltx-pipelines-mlx ./packages/ltx-trainer \
     && "$PY" "$ROOT/patch_ltx_codec.py" ) \
     || true
 fi
-require "the render engine import gate" -- "$PY" -c "import ltx_core_mlx, ltx_pipelines_mlx, mlx, mlx_arsenal"
+require "the render engine import gate" -- "$PY" -c "import ltx_core_mlx, ltx_pipelines_mlx, mlx, mlx_arsenal, transformers, mlx_lm.tokenizer_utils"
 
 # Music is independent of LTX. Update only an installed checkout; never pull
 # an 11 GB pack as a side effect of an ordinary panel update.

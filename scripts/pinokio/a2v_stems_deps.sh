@@ -96,6 +96,11 @@ PY="$VENV/bin/python3.11"
 export TORCH_HOME="$SEP_HOME"
 unset PYTORCH_ENABLE_MPS_FALLBACK PYTORCH_MPS_FAST_MATH
 RUNNER="$APP_ROOT/scripts/a2v_separate.py"
+# The engine venv's known-good set (4.19.4) rides along with the torch/numpy
+# pins below, so demucs can never move tokenizers / transformers / the mlx trio.
+EC="$APP_ROOT/scripts/pinokio/engine_constraints.txt"
+EC_ARGS=()
+[ -f "$EC" ] && EC_ARGS=(-c "$EC")
 PROBE='import demucs.pretrained, demucs.apply, torch'
 
 if "$PY" -c "$PROBE" >/dev/null 2>&1; then
@@ -123,10 +128,10 @@ PYPINS
   n=1
   while :; do
     if command -v uv >/dev/null 2>&1; then
-      uv pip install --python "$PY" -c "$PINS" 'demucs==4.0.1' 2>&1 | defuse
+      uv pip install --python "$PY" -c "$PINS" ${EC_ARGS[@]+"${EC_ARGS[@]}"} 'demucs==4.0.1' 2>&1 | defuse
       rc=$?
     else
-      "$PY" -m pip install --retries 5 --timeout 60 -c "$PINS" 'demucs==4.0.1' 2>&1 | defuse
+      "$PY" -m pip install --retries 5 --timeout 60 -c "$PINS" ${EC_ARGS[@]+"${EC_ARGS[@]}"} 'demucs==4.0.1' 2>&1 | defuse
       rc=$?
     fi
     [ "$rc" -eq 0 ] && break

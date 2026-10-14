@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -825,6 +826,28 @@ def _generate_mock(prompt: str, n: int, width: int, height: int,
     return results
 
 
+_EXC_LINE_RX = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Interrupt|Exit)\s*:\s*\S")
+_NOISE_PREFIXES = ("Traceback", 'File "', "During handling", "The above exception",
+                   "^^^", "~~~", "[", "step")
+
+
+def _subprocess_cause_line(lines) -> str:
+    """The line in a dead engine subprocess's tail that names the cause: the
+    last `SomethingError: ...` line, else the last line that is not traceback
+    scaffolding or a progress bar, else "". Same rule as the panel's
+    failure_line() (mlx_ltx_panel.py), kept here because this module is
+    imported by the panel, not the other way round."""
+    clean = [str(t).strip() for t in (lines or ()) if str(t or "").strip()]
+    for t in reversed(clean):
+        if _EXC_LINE_RX.match(t):
+            return t
+    for t in reversed(clean):
+        if (not t.startswith(_NOISE_PREFIXES) and not t[0].isdigit()
+                and "%|" not in t and "it/s]" not in t and "s/it]" not in t):
+            return t
+    return ""
+
+
 def _generate_mflux(prompt: str, n: int, width: int, height: int,
                     output_dir: Path, base_seed: int | None,
                     config: ImageEngineConfig,
@@ -1449,6 +1472,13 @@ def _generate_mflux(prompt: str, n: int, width: int, height: int,
                 pass
 
     stderr_tail = "\n".join(last_lines)
+    # 4.19.4: the line that NAMES the cause goes on the error's FIRST line.
+    # The fleet keeps only that first line (scrubbed), and it used to read
+    # "mflux-generate-flux2 failed (exit 1) on batch of 1 seeds. Tail of
+    # stdout/stderr:" - two Macs, 21 FLUX.2 failures since 4.16, and not one
+    # word of why. The tail still follows in full for the user and the Logs.
+    cause = _subprocess_cause_line(last_lines)
+    cause_note = f" — last line: {cause[:220]}" if cause else ""
     # SIGTERM/SIGKILL → user hit /stop. Surface as a typed cancellation
     # so the queue worker marks the job 'cancelled' rather than 'failed'.
     if rc in (-15, 143, -9, 137):
@@ -1490,7 +1520,7 @@ def _generate_mflux(prompt: str, n: int, width: int, height: int,
                 else "GPU/Metal error from MLX. Could be OOM or a kernel limit."
             )
             raise RuntimeError(
-                f"{bin_name} aborted on batch of {n} seeds (exit {rc}). {hint}\n\n"
+                f"{bin_name} aborted on batch of {n} seeds (exit {rc}){cause_note}. {hint}\n\n"
                 f"Try one of:\n"
                 f"  - Smaller engine (FLUX.2 [klein] 4B / Z-Image-Turbo) "
                 f"if you picked a 9B/edit model.\n"
@@ -1506,7 +1536,7 @@ def _generate_mflux(prompt: str, n: int, width: int, height: int,
         # traceback puts the exception on its last line, and the head-slice
         # this used to take cut it off right before the message (#73).
         raise RuntimeError(
-            f"{bin_name} failed (exit {rc}) on batch of {n} seeds. "
+            f"{bin_name} failed (exit {rc}) on batch of {n} seeds{cause_note}. "
             f"Tail of stdout/stderr:\n{stderr_tail[-1200:]}"
         )
 

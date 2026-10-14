@@ -272,6 +272,67 @@ for (const [label, re] of [["the IC-LoRA fetches", /IC-LoRA-Colorizer/], ["the L
   else console.log(`  ok    ${label} is best-effort`)
 }
 
+// --- 4. EVERY INSTALL INTO THE ENGINE VENV CARRIES THE KNOWN-GOOD SET -------
+// 4.19.4 fleet fix. tokenizers 0.23.3 shipped 2026-10-09; Update's
+// `uv pip install --upgrade 'litellm>=1.83.14'` (uv's --upgrade is EAGER: it
+// re-resolves everything under litellm, which accepts tokenizers <1.0) moved it
+// there, and transformers <5.13 refuses to import with it - every render dies.
+// A later resolve that included transformers happened to move it back, so the
+// install was broken only while the Update was in between; one that stopped
+// there (a dropped connection, Pinokio ending the run on an "error:" line)
+// stayed broken. A constraints file on EVERY install into the venv closes the
+// class: no step, however eager, can leave the set.
+{
+  const EC_REL = "scripts/pinokio/engine_constraints.txt"
+  let ec = ""
+  try { ec = fs.readFileSync(path.join(repoRoot, EC_REL), "utf8") } catch (e) {
+    failures.push(`${EC_REL} is missing - nothing holds the engine venv to its known-good set.`)
+  }
+  const ecLines = ec.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"))
+  const need = [
+    ["the transformers cap", (l) => l === "transformers>=5.0.0,<5.13.0"],
+    // transformers <5.13 itself requires tokenizers >=0.22.0,<=0.23.0
+    ["a tokenizers range inside transformers <5.13's own", (l) => /^tokenizers>=0\.22\.0,<(=)?0\.23\.0$/.test(l)],
+    ["the huggingface-hub 1.x range", (l) => l === "huggingface-hub>=1.5.0,<2.0"],
+    [`mlx==${PIN_PAIR.mlx}`, (l) => l === `mlx==${PIN_PAIR.mlx}`],
+    [`mlx-metal==${PIN_PAIR.mlx}`, (l) => l === `mlx-metal==${PIN_PAIR.mlx}`],
+    ["mlx-lm==0.31.1", (l) => l === "mlx-lm==0.31.1"],
+  ]
+  for (const [label, ok] of need) {
+    if (ec && !ecLines.some(ok)) failures.push(`${EC_REL} does not carry ${label}.`)
+  }
+  if (ec) console.log(`  ok    ${EC_REL}: ${ecLines.length} constraints`)
+
+  // Every install line, in every file that installs into the engine venv.
+  const ecRef = /-c\s+("\$EC"|\$EC\b|scripts\/pinokio\/engine_constraints\.txt)|\$\{EC_ARGS\[@\]/
+  const sites = [
+    ["scripts/post_update.sh", /\buv pip install\b/],
+    ["scripts/pinokio/ltx_engine_env.sh", /\buv pip install\b/],
+    ["scripts/pinokio/mflux_pack.sh", /\buv pip install\b/],
+    ["scripts/pinokio/a2v_stems_deps.sh", /\bpip install\b/],
+    ["install_qwen.js", /\bpip install\b/],
+    ["install_sharp.js", /\bpip install\b/],
+  ]
+  for (const [rel, re] of sites) {
+    let text = ""
+    try { text = fs.readFileSync(path.join(repoRoot, rel), "utf8") } catch (e) {
+      failures.push(`${rel} is missing.`); continue
+    }
+    const cmds = text.replace(/\\\n/g, " ").split("\n")
+      .filter((l) => !/^\s*(#|\/\/|\*)/.test(l) && re.test(l))
+    // Count per INSTALL, not per line: `\`-continued chains join several
+    // installs into one line, and one -c must not vouch for its neighbours.
+    const installRe = /\bpip install\b/g
+    const refRe = new RegExp(ecRef.source, "g")
+    const bare = cmds.filter((l) => (l.match(installRe) || []).length > (l.match(refRe) || []).length)
+    if (!cmds.length) failures.push(`${rel}: no install line found - is this gate still looking at the right file?`)
+    else if (bare.length) failures.push(`${rel}: ${bare.length} install line(s) into the engine venv without -c ${EC_REL}: ${bare[0].trim().slice(0, 140)}`)
+    else console.log(`  ok    ${rel}: all ${cmds.reduce((n, l) => n + (l.match(/\bpip install\b/g) || []).length, 0)} install(s) carry the engine constraints`)
+    const eager = cmds.filter((l) => /--upgrade\b|\s-U\s/.test(l) && /litellm|smolagents|huggingface-hub|transformers|mflux/.test(l))
+    if (eager.length) failures.push(`${rel}: an EAGER --upgrade of a package with a deep dependency tree (${eager[0].trim().slice(0, 120)}) - that is the step that moved tokenizers to 0.23.3.`)
+  }
+}
+
 console.log("")
 console.log(failures.length ? `RESULT: FAIL (${failures.length})` : "RESULT: PASS")
 for (const f of failures) console.log("FAIL  " + f)

@@ -76,6 +76,8 @@ class _App:
         pin.mkdir(parents=True)
         shutil.copy(SCRIPT, pin / SCRIPT.name)
         shutil.copy(CHECK, pin / CHECK.name)
+        # 4.19.4: every install in the step passes the engine constraints.
+        shutil.copy(SCRIPT.parent / "engine_constraints.txt", pin / "engine_constraints.txt")
         self.mlx = self.tmp / "ltx-2-mlx"
         (self.mlx / "env" / "bin").mkdir(parents=True)
         self.mark = self.tmp / "installed.mark"

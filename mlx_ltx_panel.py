@@ -212,6 +212,93 @@ def engine_env_fault() -> str:
     if pkgs and not any((d / "ltx_pipelines_mlx").exists() for d in pkgs):
         return ("the engine venv has a Python but no packages — "
                 "ltx_pipelines_mlx never finished installing into it")
+    for d in pkgs:
+        mismatch = engine_dependency_mismatch(d)
+        if mismatch:
+            return f"{ENGINE_ENV_MISMATCH_WORDS} - {mismatch}"
+    return ""
+
+
+# --- THE THIRD SHAPE: PACKAGES PRESENT, VERSIONS THAT REFUSE (4.19.4) -------
+# transformers checks a handful of its dependencies' versions AT IMPORT
+# (transformers/dependency_versions_check.py) and raises on a mismatch, and
+# every render imports it (the Gemma prompt encoder, through mlx_lm). On
+# 2026-10-09 tokenizers 0.23.3 shipped; an Update's eager
+# `--upgrade 'litellm…'` moved it there, transformers <5.13 refused it, and
+# every render on the install died half a minute in with "tokenizers>=0.22.0,
+# <=0.23.0 is required for a normal functioning of this module, but found
+# tokenizers==0.23.3" - filed as bad_params, with no way out in the sentence.
+# Same question as the package-directory check above, answered from files:
+# transformers' own table against the dist-info folders, no import, a few ms.
+# A mismatch is a broken environment, so it gets the Repair engine sentence
+# (scripts/pinokio/ltx_engine_env.sh resolves under engine_constraints.txt,
+# which puts the set back).
+ENGINE_ENV_MISMATCH_WORDS = "the engine venv's packages do not fit together"
+#: The packages transformers checks at import (its pkgs_to_check_at_runtime,
+#: minus python, which is the venv's own).
+TRANSFORMERS_RUNTIME_DEPS = ("tqdm", "regex", "packaging", "filelock", "numpy",
+                             "tokenizers", "huggingface-hub", "safetensors",
+                             "accelerate", "pyyaml")
+
+
+def _dist_versions(site: Path) -> dict:
+    """{normalised name: version} from site-packages' *.dist-info folders."""
+    out: dict = {}
+    try:
+        names = [p.name for p in site.iterdir() if p.name.endswith(".dist-info")]
+    except OSError:
+        return out
+    dupes: set = set()
+    for n in names:
+        stem = n[:-len(".dist-info")]
+        name, _, ver = stem.rpartition("-")
+        if name and ver:
+            key = re.sub(r"[-_.]+", "-", name).lower()
+            if key in out and out[key] != ver:
+                dupes.add(key)
+            out[key] = ver
+    # Two dist-info folders for one package (a stale leftover beside the real
+    # one): which one Python's importlib.metadata picks is not ours to guess,
+    # so say nothing about that package rather than block a working venv
+    # (Codex 4.19.4).
+    for key in dupes:
+        out.pop(key, None)
+    return out
+
+
+def engine_dependency_mismatch(site: Path) -> str:
+    """"" when transformers in `site` will import, else which package is out
+    of the range transformers itself requires. Fails open: anything this
+    cannot read (no transformers, an unparsable table, no `packaging`) is ""."""
+    try:
+        table = site / "transformers" / "dependency_versions_table.py"
+        if not table.is_file():
+            return ""
+        import ast
+        tree = ast.parse(table.read_text(encoding="utf-8"))
+        deps = None
+        for node in tree.body:
+            if (isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "deps" for t in node.targets)):
+                deps = ast.literal_eval(node.value)
+        if not isinstance(deps, dict):
+            return ""
+        from packaging.requirements import Requirement
+        from packaging.version import Version
+        installed = _dist_versions(site)
+        tf = installed.get("transformers", "?")
+        for pkg in TRANSFORMERS_RUNTIME_DEPS:
+            spec = deps.get(pkg)
+            have = installed.get(pkg)
+            if not spec or not have:
+                continue        # transformers skips what is not installed too
+            req = Requirement(spec)
+            if not req.specifier.contains(Version(have), prereleases=True):
+                return (f"transformers {tf} needs {spec} but {pkg} {have} is "
+                        f"installed, so every render would stop at its first "
+                        f"step")
+    except Exception:                                          # noqa: BLE001
+        return ""
     return ""
 
 
@@ -292,7 +379,7 @@ def _engine_install_running() -> bool:
 #: The installer's own words (scripts/pinokio/install_cause.sh) plus the two
 #: the panel can see for itself. docs/ANALYTICS.md, install_step.cause.
 ENGINE_ENV_CAUSES = ("network", "disk", "uv_error", "python_missing", "timeout",
-                     "installing", "other", "unknown")
+                     "installing", "mismatch", "other", "unknown")
 ENGINE_ENV_RESULT_NAME = ".phosphene_engine_result.json"
 
 
@@ -320,6 +407,11 @@ def engine_env_cause() -> str:
             return "installing"
         if not HELPER_PYTHON.is_file():
             return "python_missing"
+        # 4.19.4: the packages are there but transformers refuses their
+        # versions (engine_dependency_mismatch) - whatever the last install
+        # recorded, that is why this venv cannot render now.
+        if ENGINE_ENV_MISMATCH_WORDS in engine_env_fault():
+            return "mismatch"
         rec = engine_env_record() or {}
         cause = str(rec.get("cause") or "")
         if rec.get("outcome") == "failed" and cause in ENGINE_ENV_CAUSES:
@@ -10544,6 +10636,15 @@ _CRASH_LINE_CLASSES = (
     ("gpu_oom", ("kiogpucommandbuffercallbackerroroutofmemory",
                  "insufficient memory")),
     ("gpu_victim", ("innocentvictim", "innocent victim")),
+    # 4.19.4: the rest of IOGPU's / Metal's command-buffer error names, so
+    # `gpu_other` stops being one bucket. Fleet 4.19.3: an M2 Max (macOS
+    # 15.3) died 3 times in prompt encoding with a command-buffer error that
+    # was none of the six above - and passed on its next try each time.
+    ("gpu_internal", ("internal error", "errorinternal")),
+    ("gpu_submissions_ignored", ("submissionsignored", "submissions ignored")),
+    ("gpu_invalid_resource", ("invalidresource", "invalid resource")),
+    ("gpu_not_permitted", ("notpermitted", "not permitted")),
+    ("gpu_device_removed", ("deviceremoved", "device removed")),
     ("gpu_other", ("kiogpucommandbuffercallbackerror",
                    "command buffer execution failed", "[metal]")),
     ("resource_limit", ("resource limit",)),
@@ -10554,12 +10655,24 @@ _CRASH_LINE_CLASSES = (
 CRASH_LINES = tuple(c for c, _ in _CRASH_LINE_CLASSES) + ("none",)
 
 
+#: 4.19.4 (Codex): the plain-language names below are GPU errors only on a
+#: line that is about the GPU - "Operation not permitted" in a C++ exception
+#: is a file or process permission, not Metal. These classes need a marker.
+_CRASH_LINE_GPU_ONLY = ("gpu_internal", "gpu_submissions_ignored",
+                        "gpu_invalid_resource", "gpu_not_permitted",
+                        "gpu_device_removed")
+_CRASH_LINE_GPU_MARKERS = ("command buffer", "kiogpu", "[metal]", "mtl", "gpu")
+
+
 def crash_line_class(line: str) -> str:
     """The closed class of a native error line, or "" for any other line."""
     low = str(line or "").lower()
     if not low:
         return ""
+    gpu_line = any(m in low for m in _CRASH_LINE_GPU_MARKERS)
     for cls, needles in _CRASH_LINE_CLASSES:
+        if cls in _CRASH_LINE_GPU_ONLY and not gpu_line:
+            continue
         if any(n in low for n in needles):
             return cls
     return ""
@@ -18837,6 +18950,11 @@ _ANALYTICS_ERROR_CLASSES = (
                        "runner is behind this panel")),
     ("venv_broken", ("venv", "dangling", "runner missing",
                      "no module named",
+                     # transformers' own import-time version check (4.19.4:
+                     # tokenizers 0.23.3 under transformers <5.13 - 7 renders
+                     # on one Mac filed as bad_params on the word "required").
+                     # A package set that refuses to import is a broken venv.
+                     "required for a normal functioning of this module",
                      # The engine tree itself is absent. The fleet's shape is
                      # `[Errno 2] No such file or directory: 'ltx-2-mlx<path>'`
                      # (67 events, 2 installs) — the scrubber leaves the
@@ -18874,9 +18992,36 @@ _ANALYTICS_ERROR_CLASSES = (
 )
 
 
+_ANALYTICS_TB_FRAME_RX = re.compile(r'^\s*File "[^"]*", line \d+')
+
+
+def _analytics_drop_tb_frames(text: str) -> str:
+    """The error text minus Python traceback frames (`File "…", line N, in f`
+    and the source line printed under each).
+
+    4.19.4: an engine subprocess's error carries its tail, and every frame
+    of a traceback out of the engine venv names `…/ltx-2-mlx/env/lib/…` -
+    which the `venv_broken` row matches. So EVERY FLUX.2 failure with a
+    traceback was filed as a broken venv (two Macs, 21 events since 4.16),
+    whatever the exception said. Frames say where, never what: the class is
+    decided by the rest."""
+    out: list[str] = []
+    skip_next = False
+    for line in text.splitlines():
+        if _ANALYTICS_TB_FRAME_RX.match(line):
+            skip_next = True
+            continue
+        if skip_next and line.startswith((" ", "\t")):
+            skip_next = False
+            continue
+        skip_next = False
+        out.append(line)
+    return "\n".join(out)
+
+
 def _analytics_error_class(raw) -> str:
     """Map an original error string onto the closed taxonomy."""
-    s = str(raw or "").strip().lower()
+    s = _analytics_drop_tb_frames(str(raw or "")).strip().lower()
     if not s:
         return "other"
     for name, needles in _ANALYTICS_ERROR_CLASSES:

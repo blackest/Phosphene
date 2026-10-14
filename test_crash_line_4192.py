@@ -78,7 +78,10 @@ class TheLineClass(unittest.TestCase):
                            "Error (00000003:kIOGPUCommandBufferCallbackErrorHang)"), "gpu_hang")
         self.assertEqual(c("Discarded (victim of GPU error/recovery) (00000005:"
                            "kIOGPUCommandBufferCallbackErrorInnocentVictim)"), "gpu_victim")
+        # 4.19.4: Internal Error has its own class now (test_engine_deps_4194).
         self.assertEqual(c("[METAL] Command buffer execution failed: Internal Error"),
+                         "gpu_internal")
+        self.assertEqual(c("[METAL] Command buffer execution failed: something new"),
                          "gpu_other")
         self.assertEqual(c("[metal::malloc] Resource limit (499000) exceeded."),
                          "resource_limit")
