@@ -94,6 +94,14 @@ def stats_refresh(h, path, qs, ctype) -> None:
                  "hint": "read-only dashboard: the archive is refreshed by "
                          "the daily stats job, not by this panel"}, 409)
         return
+    if not P._stats_fetch_enabled():
+        # Maintainer-only (issue #106): without PHOSPHENE_STATS_FETCH=1 this
+        # panel never reads a GitHub token or runs `gh`, not even on a click.
+        h._json({"ok": False, "disabled": True,
+                 "hint": "this panel does not fetch repo stats (maintainer "
+                         "opt-in: PHOSPHENE_STATS_FETCH=1); the archive is "
+                         "refreshed by the daily stats job"}, 409)
+        return
     threading.Thread(
         target=P._run_stats_fetch_once, daemon=True,
         name="phos-stats-manual-refresh",

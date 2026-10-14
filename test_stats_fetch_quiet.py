@@ -26,6 +26,11 @@ import mlx_ltx_panel as p
 
 class StatsFetchNeverTouchesTheSharedLog(unittest.TestCase):
     def setUp(self):
+        # These cases exercise the maintainer's OPTED-IN path (4.19.3: the
+        # fetch is opt-in only; test_stats_fetch_opt_in.py covers "off").
+        _env = mock.patch.dict(p.os.environ, {"PHOSPHENE_STATS_FETCH": "1"})
+        _env.start()
+        self.addCleanup(_env.stop)
         # These two module-level warned-once latches persist across tests
         # in a whole-suite run; reset so each case actually exercises the
         # branch it means to.

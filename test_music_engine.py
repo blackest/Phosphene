@@ -59,6 +59,9 @@ def pack(tmp_path, monkeypatch):
     monkeypatch.setattr(P, "UPLOADS", tmp_path / "uploads")
     monkeypatch.setattr(P, "MUSIC_GPU_DIR_LOCK", tmp_path / "gpu-dir")
     monkeypatch.setattr(P, "MUSIC_GPU_FILE_LOCK", tmp_path / "gpu-file")
+    # The lab-lock tests below exercise the maintainer's Mac (4.19.3: a user's
+    # panel never waits on these; test_music_lab_locks_ignored_on_a_users_mac).
+    monkeypatch.setenv("PHOSPHENE_MUSIC_WAITS_GPU_LOCK", "1")
     monkeypatch.setattr(P, "_PROC_GUARDS", {"music": (tmp_path / "music_running.json", "yue2_run.py")})
     monkeypatch.setitem(P.STATE, "queue", [])
     monkeypatch.setitem(P.STATE, "history", [])
@@ -1233,3 +1236,36 @@ def test_no_trainer_spawns_the_raw_environment_any_more():
     assert "env={**os.environ" not in src
     assert "_train_env = trainer_child_env()" in src
     assert src.count("env=trainer_child_env()") >= 1
+
+
+def test_music_lab_locks_ignored_on_a_users_mac(pack, monkeypatch, tmp_path):
+    """4.19.3: the two lock paths are the maintainer's lab. On a user's Mac
+    (no ~/.phosphene-test-rig, no opt-in) a file sitting at the lock path must
+    not hold their song — the runner starts at once."""
+    stub = tmp_path / "stub_runner.py"
+    stub.write_text("""import sys,pathlib
+args=sys.argv[1:]; out=pathlib.Path(args[args.index('--output')+1])
+out.write_bytes(b'RIFF'); pathlib.Path(str(out)+'.json').write_text(args[args.index('--extra-json')+1])
+print('[music] done 5 '+str(out),flush=True)
+""")
+    monkeypatch.setattr(P, "MUSIC_RUNNER", stub)
+    monkeypatch.setattr(P.HELPER, "kill", lambda: None)
+    monkeypatch.setattr(P, "MUSIC_GPU_WAIT_MAX_S", 0.3)
+    monkeypatch.setattr(P, "MUSIC_TAKES_GPU_LOCK", False)
+    monkeypatch.delenv("PHOSPHENE_MUSIC_WAITS_GPU_LOCK", raising=False)
+    monkeypatch.setattr(P, "ANALYTICS_TEST_RIG_MARKER", tmp_path / "no-marker")
+    P.MUSIC_GPU_FILE_LOCK.write_text("12345 lab job")
+    P.MUSIC_GPU_DIR_LOCK.mkdir()
+    assert P._music_honours_lab_gpu_locks() is False
+    job = P.make_job({"mode": "music", "music_style": "test"})
+    P.STATE["current"] = job
+    P.run_job_inner(job)
+    assert Path(job["output_path"]).is_file()
+    assert P.MUSIC_GPU_FILE_LOCK.read_text() == "12345 lab job"   # untouched
+    # The maintainer's Mac (marker) and the explicit switches still honour them.
+    marker = tmp_path / "marker"
+    marker.write_text("x")
+    monkeypatch.setattr(P, "ANALYTICS_TEST_RIG_MARKER", marker)
+    assert P._music_honours_lab_gpu_locks() is True
+    monkeypatch.setenv("PHOSPHENE_MUSIC_WAITS_GPU_LOCK", "0")
+    assert P._music_honours_lab_gpu_locks() is False

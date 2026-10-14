@@ -212,7 +212,11 @@ def get_panel_bug_context(h, parsed) -> None:
         mem = P.get_memory()
         ram_gb = round(float(mem.get("total_gb") or 0.0))
         with P.LOCK:
-            tail = list(P.STATE["log"])[-50:]
+            _log = list(P.STATE["log"])
+        # 4.19.3 (#106): not simply the last 50 lines. Maintainer noise is
+        # dropped and earlier error lines are kept ahead of routine chatter,
+        # so a failure from a few minutes ago still reaches the report.
+        tail = P._bug_report_log_excerpt(_log)
         # SYS-12, privacy: this pre-fills the bug-report textarea that
         # opens a PUBLIC GitHub issue. Log lines routinely carry
         # /Users/<username>/... paths (panel_uploads, output paths), and
@@ -933,6 +937,27 @@ def post_panel_bug_report(h, path, qs, ctype) -> None:
     title = (payload.get("title") or "[bug] ").strip()
     body = (payload.get("body") or "").strip()
     include_crash = bool(payload.get("includeCrashReports"))
+
+    # 4.19.3 (#106): a report must say what went wrong. The modal checks
+    # this before it calls us, with friendlier copy; this is the backstop
+    # for anything else that posts here. Nothing is built or zipped first.
+    # The modal sends the box's own text as `whatHappened` (judged as is, so
+    # a description that itself starts with "## " is never mistaken for the
+    # next section — Codex, 4.19.3); other callers are judged on the body's
+    # "## What happened" section.
+    _what = payload.get("whatHappened")
+    if not isinstance(_what, str):
+        _what = P._bug_report_what_happened(body)
+    if not P._bug_report_what_ok(_what):
+        h._json({
+            "ok": False, "field": "what_happened",
+            "min_chars": P.BUG_REPORT_WHAT_MIN_CHARS,
+            "error": ("Please add a sentence about what went wrong under "
+                      "\"What happened\" (at least "
+                      f"{P.BUG_REPORT_WHAT_MIN_CHARS} characters). The log is "
+                      "attached for you, but it can't say what you saw."),
+        }, 400)
+        return
 
     # GitHub's URL parser tolerates ~8 KB of querystring before it
     # silently drops the body. Truncate the body to ~6 KB pre-encode

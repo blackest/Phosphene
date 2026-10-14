@@ -61,4 +61,4 @@ The **Logs** tab in the bottom panel shows the render log. When a render dies, t
 
 ## Reporting an issue {#report}
 
-The bug button in the header opens **Report a bug**: it fills in the version, your Mac's details and the last 50 log lines, and opens a GitHub issue in a new tab for you to finish — nothing is sent until you submit it there. Issues live at [github.com/mrbizarro/phosphene/issues](https://github.com/mrbizarro/phosphene/issues).
+The bug button in the header opens **Report a bug**. Write a sentence or two under **What happened?** (it needs at least 10 characters — the log can't say what you saw); it fills in the version, your Mac's details and the recent log, with error lines kept ahead of routine ones, and opens a GitHub issue in a new tab for you to finish — nothing is sent until you submit it there. Issues live at [github.com/mrbizarro/phosphene/issues](https://github.com/mrbizarro/phosphene/issues).

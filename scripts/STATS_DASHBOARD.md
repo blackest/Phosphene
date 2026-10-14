@@ -73,12 +73,38 @@ on that Mac at the source.
 | `panel_assets/stats.html` | Dashboard. Loads the JSONL at page load, renders cards + Chart.js charts client-side. No build step. | yes (template only, no data) |
 | `state/stats-data.jsonl` | Append-only data store on the maintainer's Mac. | **NO** — gitignored, never leaves your machine |
 | Panel routes `/stats` + `/stats/data` | Serve the dashboard + data file. Both 127.0.0.1-only via the panel's standard local-only guard. | n/a |
-| Panel `stats_fetch_loop` background thread | Runs the fetcher once a day (and once at startup if the data file is stale or missing). | n/a |
+| Panel `stats_fetch_loop` background thread | **Opt-in only** (`PHOSPHENE_STATS_FETCH=1`). Runs the fetcher once a day (and once at startup if the data file is stale or missing). | n/a |
 
-## What you actually need to do
+## The panel's own fetch is OPT-IN — one rule (4.19.3)
 
-**Once:** make sure a GitHub token is resolvable. The panel checks these in
-order, first hit wins:
+> **The panel fetches repo stats only when it was started with
+> `PHOSPHENE_STATS_FETCH=1`.** Without it — every user's install, every
+> clean room, the owner's own panels too — the panel never starts
+> `stats_fetch_loop`, never reads a token variable, never runs `gh`, and
+> never logs a `stats:` line. `POST /stats/refresh` answers 409.
+
+Why (issue #106): through 4.19.2 the loop started on **every** install. To
+find a token it ran the user's own `gh auth token`, so anyone with the GitHub
+CLI logged in had the panel quietly use *their* GitHub credentials once a day
+to read *our* repo's traffic; everyone else got "stats: no GitHub token
+resolvable …" in their log and, on 4.15 and older, in their bug reports.
+
+Why an environment variable and not the `~/.phosphene-test-rig` marker: the
+marker means "tag this Mac's analytics as a test rig" and sits on the
+maintainer's Mac, so every clean room built there would have started calling
+`gh` with the owner's credentials. Fetching is a separate decision, made per
+process. The owner does not need it at all: the **launchd job above** keeps
+the archive, and the dashboard (`/stats`, `/stats/data`, `/stats/usage`)
+reads the archive the same way with or without the opt-in.
+
+Gate: `test_stats_fetch_opt_in.py` (no `gh` subprocess, no token read, no
+thread, no log line without the opt-in; unchanged with it).
+
+## What you actually need to do (only if you opt a panel in)
+
+The launchd job is the normal path. To make a panel fetch as well, start it
+with `PHOSPHENE_STATS_FETCH=1`, and make sure a GitHub token is resolvable.
+The panel checks these in order, first hit wins:
 
 1. `PHOSPHENE_REPO_STATS_TOKEN` env var (explicit, recommended for Pinokio)
 2. `GH_STATS_TOKEN` env var
@@ -88,8 +114,9 @@ order, first hit wins:
 The token needs the `repo` scope (the GitHub Traffic API requires push
 access). `gh auth login` gives you that by default.
 
-**Then:** restart the panel. Within 90 seconds the background thread runs
-the first fetch. Open `/stats` — done.
+**Then:** restart the panel with `PHOSPHENE_STATS_FETCH=1` in its
+environment. Within 90 seconds the background thread runs the first fetch.
+Open `/stats` — done.
 
 ## Run the fetcher manually (debug / catch-up)
 
@@ -157,7 +184,8 @@ much into day-level fluctuations.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Dashboard at /stats is blank | No data yet (first fetch hasn't run) | Wait 90 s after panel boot or run fetcher manually |
-| Panel log: `stats: no GitHub token resolvable` | No token configured anywhere | `gh auth login`, or set `GITHUB_TOKEN` / `PHOSPHENE_REPO_STATS_TOKEN` |
+| Panel never fetches, Refresh answers 409 | Expected: the panel's own fetch is opt-in | Check the launchd job; or start the panel with `PHOSPHENE_STATS_FETCH=1` |
+| Panel stderr (opt-in only): `stats: no GitHub token resolvable` | No token configured anywhere | `gh auth login`, or set `GITHUB_TOKEN` / `PHOSPHENE_REPO_STATS_TOKEN` |
 | Panel log: `stats: fetch failed (exit 1)` | Token lacks `repo` scope | `gh auth refresh -s repo` |
 | `/stats/data` returns empty body | `state/stats-data.jsonl` doesn't exist yet | Same as "blank" above |
 | Charts blank but cards filled | Only one snapshot so far — charts need ≥2 points | Wait for tomorrow's fetch or change system date for testing |

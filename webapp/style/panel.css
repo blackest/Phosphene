@@ -12706,3 +12706,17 @@ body[data-engine="h3"][data-vmode="v2a"] #h3LengthLabel { display: none !importa
 #a2vH3QualityGroup .pill-btn { align-items: center; text-align: center; }
 #mvOneShotDetails:not([data-a2v-engine="h3"]) .a2v-h3-only { display: none !important; }
 #mvOneShotDetails[data-a2v-engine="h3"] .a2v-ltx-only { display: none !important; }
+
+/* ---- Bug report: the required "What happened?" box (4.19.3, #106) ------- */
+#bugModal .bug-what { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+#bugModal .bug-what > span:first-child { color: var(--text); font-weight: 600; font-size: 12.5px; }
+#bugModal .bug-what-req { font-weight: 400; color: var(--muted); font-size: 11px; margin-left: 6px; }
+#bugModal .bug-what textarea {
+  padding: 8px 10px; font-size: 13px; line-height: 1.45; resize: vertical; min-height: 56px;
+  background: rgba(140,160,220,0.04); border: 1px solid var(--ph-border-soft); border-radius: 6px;
+  color: var(--text); font-family: inherit;
+}
+#bugModal .bug-what textarea:focus { outline: none; border-color: var(--accent-bright, #7e98ff); }
+#bugModal .bug-what-hint { font-size: 11.5px; line-height: 1.4; color: var(--muted); }
+#bugModal .bug-what.is-invalid textarea { border-color: var(--danger, #f85149); }
+#bugModal .bug-what.is-invalid .bug-what-hint { color: var(--danger, #f85149); }

@@ -5616,16 +5616,37 @@ def get_version_state() -> dict:
 # Repo-stats background fetcher (Mr Bizarro's solo-maintainer dashboard).
 # Runs the stdlib-only fetcher script as a subprocess once per 24h, appending
 # a JSON line to state/stats-data.jsonl. Dashboard at /stats reads this file.
-# 127.0.0.1-only by design (state/ is gitignored, file lives on the user's
-# Mac only). Skipped silently if no GitHub token is resolvable — this fetcher
-# is opt-in via "have a token configured". It only READS GitHub's API and
-# sends nothing anywhere; the panel's outbound usage analytics is a separate
-# module entirely (see "Anonymous usage analytics" / docs/ANALYTICS.md).
+# 127.0.0.1-only by design (state/ is gitignored, file lives on the
+# maintainer's Mac only). It only READS GitHub's API and sends nothing
+# anywhere; the panel's outbound usage analytics is a separate module
+# entirely (see "Anonymous usage analytics" / docs/ANALYTICS.md).
+#
+# OPT-IN ONLY (4.19.3, issue #106). Until 4.19.2 this loop started on EVERY
+# install and, to find a token, ran the user's own `gh auth token` — so any
+# user with the GitHub CLI logged in had the panel silently borrow THEIR
+# GitHub credentials once a day to read OUR repo's traffic numbers, and
+# everyone else got "stats: no GitHub token resolvable ..." in their log and
+# in their bug reports. The one rule now: nothing in this section runs, reads
+# a token, spawns `gh` or logs a line unless the process was started with
+# PHOSPHENE_STATS_FETCH=1. The maintainer's daily archive does not need it —
+# a launchd job keeps it (scripts/STATS_DASHBOARD.md).
 # ---------------------------------------------------------------------------
 
 _STATS_POLL_INTERVAL_SEC = 24 * 60 * 60  # daily
 _STATS_STARTUP_DELAY_SEC = 90            # let the panel finish booting first
 _STATS_MIN_REFETCH_SEC   = 6 * 60 * 60   # don't re-fetch faster than every 6h
+
+
+STATS_FETCH_ENV = "PHOSPHENE_STATS_FETCH"
+
+
+def _stats_fetch_enabled() -> bool:
+    """True only when this process was started with PHOSPHENE_STATS_FETCH=1
+    (or true/yes/on). Read at call time, never cached, so a test can flip it.
+    Every entry point of the repo-stats fetcher checks this FIRST — before
+    any token lookup, any `gh` subprocess and any log line — see the
+    section header for why (issue #106)."""
+    return _optional_bool_env(STATS_FETCH_ENV) is True
 
 
 def _resolve_github_token() -> str:
@@ -5634,7 +5655,12 @@ def _resolve_github_token() -> str:
        2. GH_STATS_TOKEN — fetcher's own preferred name
        3. GH_TOKEN / GITHUB_TOKEN — generic env vars
        4. `gh auth token` subprocess (when gh CLI is installed + authed)
-    Returns empty string if nothing works — caller logs once and skips."""
+    Returns empty string if nothing works — caller logs once and skips.
+
+    Without the PHOSPHENE_STATS_FETCH opt-in this returns "" at once: no
+    environment variable is read and `gh` is never run."""
+    if not _stats_fetch_enabled():
+        return ""
     for name in ("PHOSPHENE_REPO_STATS_TOKEN", "GH_STATS_TOKEN",
                  "GH_TOKEN", "GITHUB_TOKEN"):
         v = (os.environ.get(name) or "").strip()
@@ -5675,6 +5701,10 @@ def _run_stats_fetch_once() -> None:
     docstring. Idempotent — the fetcher itself replaces today's row on
     re-runs in the same UTC day."""
     global _STATS_WARNED_NO_TOKEN, _STATS_WARNED_FETCH_FAIL
+    if not _stats_fetch_enabled():
+        return  # not the maintainer's opt-in: no token, no `gh`, no log line
+    if STATS_READONLY:
+        return  # the archive belongs to another install; see STATS_SOURCE_DIR
     if not STATS_FETCHER.is_file():
         return  # repo install missing the script — fail silent
     token = _resolve_github_token()
@@ -5688,8 +5718,6 @@ def _run_stats_fetch_once() -> None:
             )
             _STATS_WARNED_NO_TOKEN = True
         return
-    if STATS_READONLY:
-        return  # the archive belongs to another install; see STATS_SOURCE_DIR
     env = os.environ.copy()
     env["GITHUB_TOKEN"] = token
     # Write the archive the dashboard READS. The fetcher's own default is
@@ -5744,7 +5772,12 @@ def stats_fetch_loop() -> None:
     file is missing or stale), then daily on _STATS_POLL_INTERVAL_SEC.
 
     The startup-fetch is gated by _STATS_MIN_REFETCH_SEC so multiple panel
-    restarts in a short window don't hammer the GitHub API for nothing."""
+    restarts in a short window don't hammer the GitHub API for nothing.
+
+    Returns immediately without the PHOSPHENE_STATS_FETCH opt-in (the boot
+    block does not even start the thread then; this is the second lock)."""
+    if not _stats_fetch_enabled() or STATS_READONLY:
+        return
     time.sleep(_STATS_STARTUP_DELAY_SEC)
     # First-run / cold-start fetch — but only if it's been a while.
     try:
@@ -16228,6 +16261,16 @@ MUSIC_GPU_POLL_S = 0.5
 # jobs (a dev/test panel) can HOLD the file lock while a song renders, so those
 # jobs queue behind it. A user's panel never writes the shared lock unless told to.
 MUSIC_TAKES_GPU_LOCK = os.environ.get("PHOSPHENE_MUSIC_TAKES_GPU_LOCK", "") == "1"
+# MAINTAINER'S MAC ONLY (4.19.3). Both lock paths above belong to the
+# maintainer's lab: the directory lives in his own project tree and the file
+# is what his agents and command-line renders create. On anybody else's Mac a
+# file that happened to sit at /tmp/phosphene_gpu.lock would hold their song
+# for an hour and then refuse it. So the locks are honoured only where they
+# can mean something: on a Mac carrying the ~/.phosphene-test-rig marker (the
+# maintainer's — see _analytics_is_test_rig), with PHOSPHENE_MUSIC_TAKES_GPU_LOCK,
+# or with PHOSPHENE_MUSIC_WAITS_GPU_LOCK=1. PHOSPHENE_MUSIC_WAITS_GPU_LOCK=0
+# turns it off even on that Mac.
+MUSIC_WAITS_GPU_LOCK_ENV = "PHOSPHENE_MUSIC_WAITS_GPU_LOCK"
 
 
 def _music_python() -> Path | None:
@@ -16973,8 +17016,25 @@ def music_progress(line: str, previous: dict | None = None) -> dict | None:
     return {"phase": phase, "phase_label": label, "pct": pct}
 
 
+def _music_honours_lab_gpu_locks() -> bool:
+    """Whether this panel should wait on the maintainer's lab GPU locks at
+    all (see MUSIC_WAITS_GPU_LOCK_ENV). Read at call time."""
+    env = _optional_bool_env(MUSIC_WAITS_GPU_LOCK_ENV)
+    if env is not None:
+        return env
+    if MUSIC_TAKES_GPU_LOCK:
+        return True
+    try:
+        return ANALYTICS_TEST_RIG_MARKER.exists()
+    except OSError:
+        return False
+
+
 def _music_external_gpu_lock() -> Path | None:
-    """The first external GPU lock that exists (file or directory), else None."""
+    """The first external GPU lock that exists (file or directory), else None.
+    Always None on a user's Mac — see _music_honours_lab_gpu_locks()."""
+    if not _music_honours_lab_gpu_locks():
+        return None
     for path in (MUSIC_GPU_DIR_LOCK, MUSIC_GPU_FILE_LOCK):
         try:
             if path.exists() or path.is_symlink():
@@ -17773,6 +17833,108 @@ def _analytics_install_id() -> str:
     new = str(_uuid.uuid4())
     _settings_set_internal(analytics_install_id=new)
     return new
+
+
+# ---- Bug-report log excerpt + "What happened" (4.19.3, issue #106) ----------
+# #106 arrived with "What happened" and "Expected" empty and ONE log line:
+# the maintainer stats fetcher saying it had no GitHub token — a line about a
+# feature no user has, which said nothing about the user's problem. Two fixes:
+# the report must say what went wrong, and the auto-attached log must carry
+# the lines that explain a failure, never maintainer noise.
+BUG_REPORT_WHAT_MIN_CHARS = 10
+BUG_REPORT_LOG_LINES = 50
+BUG_REPORT_TAIL_LINES = 25
+# Lines that never belong in a user's bug report: the maintainer-only repo
+# stats fetcher (pre-4.19.3 builds pushed "stats: ..." into the shared log)
+# and anything about GitHub tokens. Matched after the "[HH:MM:SS] " stamp.
+_BUG_REPORT_NOISE_RES = (
+    re.compile(r"^(?:\[\d\d:\d\d:\d\d\]\s*)?\[?(?:repo[ -])?stats(?:\]|\s*:)", re.I),
+    re.compile(r"github token|gh auth token|rate-limit remaining|"
+               r"stats dashboard|maintainer stats|stats_fetch", re.I),
+)
+# A line that probably explains a failure. Deliberately broad: a wrongly
+# promoted line costs one row in a 50-row excerpt; a missed one is the
+# reason a report can't be acted on.
+_BUG_REPORT_ERROR_RE = re.compile(
+    r"\b(?:error|errors|failed|failure|fail|traceback|exception|fatal|"
+    r"crash(?:ed)?|killed|refused|out of memory|oom|watchdog|errno|"
+    r"sigkill|sigsegv|sigabrt|sigbus|cannot|could not|couldn't|"
+    r"not found|missing|timed out|timeout)\b", re.I)
+# ...and Python's own exception lines: "ValueError: ...", "RuntimeError",
+# "KeyboardInterrupt" is not one, "JSONDecodeError" is. Word boundaries keep
+# the regex above from seeing "error" inside "ValueError", and that last line
+# is the one that names the cause (Codex, 4.19.3). Case-sensitive on purpose.
+_BUG_REPORT_EXC_RE = re.compile(r"\b[A-Z]\w*(?:Error|Exception)\b")
+
+
+def _bug_report_is_noise(line: str) -> bool:
+    s = str(line or "")
+    return any(rx.search(s) for rx in _BUG_REPORT_NOISE_RES)
+
+
+def _bug_report_log_excerpt(lines, limit: int = BUG_REPORT_LOG_LINES,
+                            tail: int = BUG_REPORT_TAIL_LINES) -> list[str]:
+    """Pick the log lines a bug report carries, oldest first.
+
+    Until 4.19.3 this was simply the last 50 lines of the in-memory log, so a
+    failure followed by a few minutes of ordinary activity fell out of the
+    report, and harmless maintainer lines took up the room. Now:
+      1. noise (see _BUG_REPORT_NOISE_RES) is dropped outright;
+      2. the most recent `tail` lines are always kept (what just happened);
+      3. the remaining room goes to earlier lines that look like errors,
+         newest first, each with one line before and two after;
+      4. any room left is filled with the lines just before the tail.
+    Gaps inside the excerpt are marked with a "[… N lines skipped …]" row
+    so the reader can tell the excerpt from the raw log."""
+    kept = [str(x) for x in (lines or []) if str(x or "").strip()
+            and not _bug_report_is_noise(x)]
+    n = len(kept)
+    if n <= limit:
+        return kept
+    head_end = n - tail                      # indices < head_end are "earlier"
+    chosen = set(range(head_end, n))
+    budget = limit - tail
+    for i in range(head_end - 1, -1, -1):
+        if budget <= 0:
+            break
+        if not (_BUG_REPORT_ERROR_RE.search(kept[i])
+                or _BUG_REPORT_EXC_RE.search(kept[i])):
+            continue
+        for j in (i, i - 1, i + 1, i + 2):
+            if budget > 0 and 0 <= j < head_end and j not in chosen:
+                chosen.add(j)
+                budget -= 1
+    j = head_end - 1
+    while budget > 0 and j >= 0:
+        if j not in chosen:
+            chosen.add(j)
+            budget -= 1
+        j -= 1
+    out: list[str] = []
+    prev = None
+    for i in sorted(chosen):
+        if prev is not None and i != prev + 1:
+            gap = i - prev - 1
+            out.append(f"[… {gap} line{'s' if gap != 1 else ''} skipped …]")
+        out.append(kept[i])
+        prev = i
+    return out
+
+
+def _bug_report_what_happened(body: str) -> str:
+    """The text under the report's "## What happened" heading, up to the
+    next "## " heading; "" when the heading is absent."""
+    m = re.search(r"^##[ \t]*What happened[ \t]*$", str(body or ""),
+                  re.M | re.I)
+    if not m:
+        return ""
+    rest = body[m.end():]
+    nxt = re.search(r"^##[ \t]", rest, re.M)
+    return (rest[:nxt.start()] if nxt else rest).strip()
+
+
+def _bug_report_what_ok(text: str) -> bool:
+    return len(" ".join(str(text or "").split())) >= BUG_REPORT_WHAT_MIN_CHARS
 
 
 def _bug_report_scrub_line(line: str) -> str:
@@ -45365,13 +45527,14 @@ if __name__ == "__main__":
         threading.Thread(target=version_check_loop, daemon=True).start()
     else:
         _detect_local_install_state()
-    # Repo-stats fetcher — appends to state/stats-data.jsonl daily so
-    # the dashboard at /stats has historic data (not in read-only stats
-    # mode, where the archive belongs to another install). Data stays on disk in
-    # state/ (gitignored), never on the public repo. Skipped silently
-    # when no GitHub token is resolvable.
-    if not STATS_READONLY:
-        threading.Thread(target=stats_fetch_loop, daemon=True).start()
+    # Repo-stats fetcher — maintainer-only, OPT-IN (PHOSPHENE_STATS_FETCH=1;
+    # issue #106: it used to start on every install and borrow the user's
+    # `gh auth token`). Appends to state/stats-data.jsonl daily so /stats has
+    # historic data. Never in read-only stats mode, where the archive belongs
+    # to another install. Data stays on disk in state/ (gitignored).
+    if _stats_fetch_enabled() and not STATS_READONLY:
+        threading.Thread(target=stats_fetch_loop, daemon=True,
+                         name="phos-stats-fetch").start()
     # Anonymous usage analytics — one app_boot event plus any optional-pack
     # transitions since the last boot, then nothing until a job finishes.
     # Deliberately here in __main__ and not at import time, so `import

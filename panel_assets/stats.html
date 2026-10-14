@@ -12,8 +12,9 @@
 
     Served BY THE PANEL at http://127.0.0.1:8199/stats. The HTML
     template lives at panel_assets/stats.html and is read at request
-    time; the JSONL data is appended daily by the panel's
-    stats_fetch_loop background thread and persisted at
+    time; the JSONL data is appended daily by the maintainer's launchd
+    job (or by the panel's stats_fetch_loop, opt-in only with
+    PHOSPHENE_STATS_FETCH=1) and persisted at
     state/stats-data.jsonl (gitignored — never on the public repo).
     Both endpoints are 127.0.0.1-only.
 
@@ -1526,7 +1527,8 @@
       never on the public repo. A daily launchd job
       (<code>com.mrbizarro.phosphene-stats-fetch</code>) appends to it via
       <code>scripts/fetch_repo_stats.py</code> whether or not a panel is
-      running; a running panel refreshes it too.
+      running. A panel fetches too only when started with
+      <code>PHOSPHENE_STATS_FETCH=1</code>.
       <br>
       The GitHub Traffic API only retains 14 days of clones / views /
       referrers / paths; this archive is how we keep the history.

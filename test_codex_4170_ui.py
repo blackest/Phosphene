@@ -332,7 +332,8 @@ def test_ui6_crash_count_and_zip_hold_only_phosphene_processes(tmp_path):
         h = _H()
         GET_ROUTES["/panel/bug-context"](h, None)
         assert h.out[1]["crashCount"] == 1
-        body = json.dumps({"title": "t", "body": "b", "includeCrashReports": True}).encode()
+        body = json.dumps({"title": "t", "body": "## What happened\n\nthe helper crashed mid-render",
+                           "includeCrashReports": True}).encode()
         h = _H()
         h.headers = {"Content-Length": str(len(body))}
         h.rfile = io.BytesIO(body)

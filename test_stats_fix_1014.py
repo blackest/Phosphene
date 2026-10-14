@@ -197,6 +197,7 @@ class FetchWritesWhereTheDashboardReads(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
 
         with mock.patch.object(p, "_resolve_github_token", return_value="t"), \
+             mock.patch.dict(os.environ, {"PHOSPHENE_STATS_FETCH": "1"}), \
              mock.patch.object(p, "STATS_READONLY", False), \
              mock.patch.object(p.subprocess, "run", side_effect=fake_run):
             p._run_stats_fetch_once()
@@ -206,6 +207,7 @@ class FetchWritesWhereTheDashboardReads(unittest.TestCase):
 class ReadOnlyStatsMode(unittest.TestCase):
     def test_no_fetch_in_read_only_mode(self):
         with mock.patch.object(p, "_resolve_github_token", return_value="t"), \
+             mock.patch.dict(os.environ, {"PHOSPHENE_STATS_FETCH": "1"}), \
              mock.patch.object(p, "STATS_READONLY", True), \
              mock.patch.object(p.subprocess, "run") as run:
             p._run_stats_fetch_once()

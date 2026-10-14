@@ -3179,7 +3179,7 @@ The same wizard walks out of frame. Audio: footsteps on leaves."></textarea>
               <button type="button" class="pill-btn active" data-voice-preset="standard"><span>Standard <span class="rec-badge">250</span></span><span class="sub">~17 min wall</span></button>
               <button type="button" class="pill-btn" data-voice-preset="long"><span>Long <span class="rec-badge">500</span></span><span class="sub">~33 min wall</span></button>
             </div>
-            <div class="hint" style="margin-top:6px">Estimates assume ~30 s/step on M4 Max — measured value lives in lora-lab and may drift.</div>
+            <div class="hint" style="margin-top:6px">Estimates assume about 30 s per step on an M4 Max; slower Macs take longer.</div>
           </div>
         </div>
 
@@ -6540,16 +6540,29 @@ The last line"></textarea>
     </div>
     <div class="models-hint">
       Opens a pre-filled GitHub issue in a new tab. Environment info, version,
-      and the last 50 log lines are filled in for you.
+      and the recent log (errors first) are filled in for you.
     </div>
     <div id="bugModalBody" style="padding: 12px 0; display:flex; flex-direction:column; gap:10px">
+      <!-- 4.19.3 (#106): a report used to go out with "What happened" empty,
+           which left nothing to act on. This box is required (at least 10
+           characters); the copy under it says why, inline, never alert(). -->
+      <label class="bug-what" for="bugWhat">
+        <span>What happened? <span class="bug-what-req">required</span></span>
+        <textarea id="bugWhat" rows="3" aria-required="true" aria-describedby="bugWhatHint"
+                  placeholder="e.g. I pressed Generate on Text to video and it stopped at 40% with &quot;helper failed to start&quot;."
+                  oninput="bugWhatInput()"></textarea>
+        <span id="bugWhatHint" class="bug-what-hint" role="status" aria-live="polite">
+          A sentence or two in your own words. The log below is attached for
+          you, but it can't tell us what you saw.
+        </span>
+      </label>
       <label style="display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted)">
         Title
         <input id="bugTitle" type="text" value="[bug] "
                style="padding:6px 9px; font-size:13px; background:rgba(140,160,220,0.04); border:1px solid var(--ph-border-soft); border-radius:6px; color:var(--text); font-family:inherit">
       </label>
       <label style="display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted)">
-        Description
+        Details (optional) and environment
         <textarea id="bugBody" rows="14"
                   style="padding:8px 10px; font-size:12px; background:rgba(140,160,220,0.04); border:1px solid var(--ph-border-soft); border-radius:6px; color:var(--text); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.45; resize:vertical">Loading environment…</textarea>
       </label>
