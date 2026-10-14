@@ -638,6 +638,22 @@ def test_take_runner_gives_a_failing_part_two_retakes_and_keeps_the_best(tmp_pat
     assert j["take_lipsync"] == [0.1, 0.5, 0.5]
 
 
+def test_speech_is_judged_from_the_parts_own_windows_not_the_whole_prompt():
+    """The parent prompt quotes every part's lines. A second half whose own windows
+    hold no spoken line must not be graded on lip-sync (and retaken, twice, for it)."""
+    whole = 'He says: "Now that\'s good coffee." She says: "Fine."'
+    spoken_part = ['She smiles and says: "You say that every time."', "They hold eye contact."]
+    silent_part = ["Natural lip sync, cinematic, shallow depth of field.", "The same cafe, afternoon light."]
+    assert p.take_expects_speech({"prompt": whole}, spoken_part) is True
+    assert p.take_expects_speech({"prompt": whole}, silent_part) is False
+    # blank beats do not count as "own windows" — fall back to the prompt
+    assert p.take_expects_speech({"prompt": whole}, ["", "  "]) is True
+    # no windows given at all: the prompt decides, as before
+    assert p.take_expects_speech({"prompt": whole}) is True
+    # a character speaks with its own voice whatever the windows say
+    assert p.take_expects_speech({"character_id": "bizarrotrn", "prompt": whole}, silent_part) is True
+
+
 def test_lipsync_gate_only_judges_parts_that_speak(tmp_path, monkeypatch):
     """A flight with no character and no quoted line is never scored or retaken for lip-sync."""
     assert p.take_expects_speech({"character_id": "bizarrotrn", "prompt": "x"}) is True

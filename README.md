@@ -19,7 +19,7 @@
 
 </p>
 
-> **Current release: v4.19.1.** Voices trained in Phosphene save correctly again (4.19.0 still saved them scrambled; Update repairs them), and when a training run stops, the Logs now say why. **4.19.0: Hailuo H3 grows up, and trained characters look like themselves again.** On Hailuo H3: **Keyframes** (an end frame, first + last, or stills at exact moments), **Extend** any clip, **Lip-sync** a face to your own voice or song, **Add sound** to a silent clip, smoother 10-15 s shots (each window carries the end of the last one, picture and sound), and **Fast HD**. Characters and voices trained in Phosphene since June were saved with their numbers in the wrong order and carried no likeness; new trainings save correctly and **Update repairs the ones you already have** (found by @tanis2000, #62). **Extend no longer wears your clip down** round after round: the part you already had is delivered untouched and only the new part is encoded (#48). 4.18.0: Play all, Use this audio for..., LoRA-aware Enhance. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
+> **Current release: v4.19.2.** **Ingredients puts your reference pictures in the video again** on LTX-2.3 (#101), and you can **switch the LTX generation (2.3 or 2.5) from the panel** (@blackest, #102; 2.5 stays the default). High · 720p renders High · 720p, Upscale ×2 refuses a result bigger than QHD before it starts (@blackest, #103), One Shot gets Stop early and a smarter Split (@blackest, #97-#99), room tone sits at -38 LUFS (@blackest, #100), and fewer renders fail: missing pictures, keyframes and LoRAs are caught when you press Generate, the GPU-watchdog message says what can actually help, and vocal separation rides out a flaky connection. Linux on Apple Silicon arrives as a community-maintained, best-effort target (@joshuaswarren, #94). 4.19.1: voices trained in Phosphene save correctly again, and a stopped training run says why. **4.19.0: Hailuo H3 grows up, and trained characters look like themselves again.** On Hailuo H3: **Keyframes** (an end frame, first + last, or stills at exact moments), **Extend** any clip, **Lip-sync** a face to your own voice or song, **Add sound** to a silent clip, smoother 10-15 s shots (each window carries the end of the last one, picture and sound), and **Fast HD**. Characters and voices trained in Phosphene since June were saved with their numbers in the wrong order and carried no likeness; new trainings save correctly and **Update repairs the ones you already have** (found by @tanis2000, #62). **Extend no longer wears your clip down** round after round: the part you already had is delivered untouched and only the new part is encoded (#48). 4.18.0: Play all, Use this audio for..., LoRA-aware Enhance. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
 
 ## Overview
 
@@ -74,6 +74,7 @@ Text-to-video, image-to-video, and audio-to-video, all delivered as MP4 with joi
 | **Weights licence** | [LTX-2.x Community License](LICENSES/LTX-2.x-Community-License.md) (Lightricks) | MiniMax Community License — territory restrictions apply |
 
 Neither engine is a fallback for the other. If only one is installed, the other appears in the switcher as an offer with its size on it — one click explains what it does and where to get it, and nothing about your existing renders changes when it lands.
+
 
 #### Remix — bring your own media
 
@@ -189,6 +190,15 @@ Pinokio handles the hardware gate, the vendored `ltx-2-mlx` clone at its pinned 
 For trained characters and voices, install the **LTX-2.5 Q8 weights** (30.02 GB) from **Settings → Models**. The **High** tier additionally needs the **High add-on** (29.50 GB), which installs into the same folder.
 
 If you have a Hugging Face token, paste it under **Settings** in the panel. Downloads run roughly 10x faster, and the same token unlocks the one gated LoRA (HDR). **Motion Control does not need it** — the Union Control weight is public.
+
+### Linux on Apple Silicon - community-maintained, best effort
+
+Phosphene can run on Linux on M1/M2 Macs (Omarchy, MLX through the third-party
+omarchy-mlx Vulkan build), contributed and maintained by
+[@joshuaswarren](https://github.com/joshuaswarren). It is not tested by the
+release gates and Pinokio does not install it: run `bash scripts/linux/install.sh`,
+then `./run_panel.sh`. Details, the H3 engine and measured runs:
+[docs/LINUX.md](docs/LINUX.md).
 
 ### Manual install
 

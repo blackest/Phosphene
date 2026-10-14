@@ -466,6 +466,10 @@
              2.5 does the pixels. Works on any clip in Outputs. -->
         <button type="button" class="mode-chip pill-btn" data-remix="upscale" title="Upscale &amp; Face Fix — LTX-2.5 Pixel Spatial Upscaler IC-LoRA. Re-renders a clip at twice its size with real generated detail (not a filter) and keeps the face and the sound. Made for H3 drafts, works on any clip. One click from any clip: the Upscale &amp; Face Fix button under the player.">Upscale &amp; Face Fix<span class="mc-sub sub">any clip → 2× sharper · face kept</span></button>
       </div>
+      <!-- One LTX generation runs at a time (2.3 or 2.5). Filled by
+           renderLtxGenSwitch() ONLY when this install has both; empty and
+           hidden otherwise. Ingredients needs 2.3, so the switch sits with it. -->
+      <div id="ltxGenSwitch" class="eng-gen eng-gen-inline" hidden></div>
     </div>
 
     <form id="genForm">
@@ -4208,12 +4212,12 @@ The last line"></textarea>
         <p class="ed-rt-sub">Background noise under the whole __SEQ__, so cuts never drop to silence.</p>
         <select class="sb-input ed-rt-pick" id="edRtVariant" aria-label="Which room tone"
                 onchange="edRtPick()"></select>
-        <label class="ed-rt-level" title="How loud the bed plays, in LUFS. Dialogue sits around −16; −27 is clearly there without competing. The render applies exactly this.">
+        <label class="ed-rt-level" title="How loud the bed plays, in LUFS. Dialogue sits around −16; −38 is a bed you stop hearing, −27 is clearly there. The render applies exactly this.">
           <span>Level</span>
-          <input type="range" id="edRtLevel" min="-45" max="-18" step="1" value="-27"
+          <input type="range" id="edRtLevel" min="-45" max="-18" step="1" value="-38"
                  aria-label="Room tone level in LUFS"
                  oninput="edRtLevelSlide(this.value)" onchange="edRtLevelCommit(this.value)">
-          <output id="edRtLevelOut">−27 LUFS</output>
+          <output id="edRtLevelOut">−38 LUFS</output>
         </label>
         <div class="ed-rt-acts">
           <button type="button" class="ghost-btn primary" id="edRtAdd" onclick="edRtApply('apply')">Add room tone</button>

@@ -188,6 +188,29 @@ class TheHelperRetriesOnShortSteps(_Store):
                       "the class must still read as metal_watchdog")
         self.assertEqual(P._analytics_error_class(str(cm.exception)), "metal_watchdog")
 
+    def test_a_kill_in_prompt_encoding_does_not_advise_going_smaller(self):
+        # 4.19.2, fleet 4.19.1: 12 of 13 phase-known kills were in prompt
+        # encoding, on short steps, and encoding costs the same at every size
+        # - one Mac followed "Retry smaller" down to 256x192, five more kills.
+        h = _FakeHelper(["watchdog_encode", "watchdog_encode", "watchdog_encode"])
+        job = _job()
+        with self.assertRaises(RuntimeError) as cm:
+            self.run_job(h, job)
+        msg = str(cm.exception)
+        self.assertIn("reading the prompt", msg)
+        self.assertNotIn("Retry smaller", msg)
+        self.assertEqual(P._analytics_error_class(msg), "metal_watchdog")
+        refusal = P.metal_watchdog_refusal(P.metal_watchdog_key(job["params"]), mode="i2v")
+        self.assertIn("reading the prompt", refusal)
+        self.assertNotIn("Retry smaller", refusal)
+        self.assertIn("15 minutes", msg)
+        # the cause is the moment, not the size: it pauses for minutes, not a day
+        key = P.metal_watchdog_key(job["params"])
+        self.assertIsNotNone(P.metal_watchdog_refusal(key, now=time.time() + 14 * 60, mode="i2v"))
+        self.assertIsNone(P.metal_watchdog_refusal(key, now=time.time() + 16 * 60, mode="i2v"))
+        # a kill in any other phase keeps the size advice and the day
+        self.assertIn("Retry smaller", P.metal_watchdog_way("t2v", "denoise"))
+
     def test_the_fifty_failure_loop_is_impossible(self):
         """The field case: the same setting submitted again and again on a Mac
         where every run dies. At most two renders fail; the rest are refused

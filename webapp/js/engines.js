@@ -918,6 +918,7 @@ document.addEventListener('keydown', (ev) => {
 window.addEventListener('resize', () => closeEngineMenu({ returnFocus: false }));
 
 function renderEngineSwitch() {
+  renderLtxGenSwitch();   // the Remix-row switch; independent of the header row below
   const box = document.getElementById('engineSwitch');
   const div = document.getElementById('engineSwitchDivider');
   if (!box) return;
@@ -1000,6 +1001,99 @@ function renderEngineSwitch() {
       engineSegClick(b.dataset.engine);
     };
   });
+
+  // ---- LTX generation: only when this install has more than one ----
+  // The server sends `generations` already filtered to the ones whose base pack
+  // is on disk, and empty when there is no real choice, so this row simply does
+  // not exist for a single-generation install. A generation is fixed per panel
+  // process, so picking one restarts the panel (see /ltx/generation).
+  const ltxEng = list.find(e => e.id === 'ltx');
+  const gens = (ltxEng && ltxEng.generations) || [];
+  if (gens.length > 1) {
+    const row = document.createElement('div');
+    row.className = 'eng-gen';
+    row.innerHTML = _ltxGenSwitchHtml(gens, true);
+    _wireLtxGenSwitch(row);
+    menu.appendChild(row);
+  }
+}
+
+// The generation switch, as markup. Shared by the engine menu and the Remix row
+// so the two cannot drift: same buttons, same endpoint, same wording.
+function _ltxGenSwitchHtml(gens, withNote) {
+  return `<span class="eng-gen-label">LTX generation</span>
+      <span class="eng-gen-btns" role="group" aria-label="LTX generation">${
+      gens.map(g => `<button type="button" class="eng-gen-btn${g.active ? ' active' : ''}"
+          data-gen="${escapeHtml(g.id)}" aria-pressed="${g.active ? 'true' : 'false'}"
+          title="${g.active ? 'Rendering with LTX-' + escapeHtml(g.label)
+                           : 'Switch to LTX-' + escapeHtml(g.label) + ' (restarts the panel)'}">${escapeHtml(g.label)}</button>`).join('')
+      }</span>${withNote
+        ? '<span class="eng-gen-note">Switching restarts the panel. Ingredients needs 2.3.</span>'
+        : '<span class="eng-gen-note">Only one runs at a time - switching restarts the panel.</span>'}`;
+}
+function _wireLtxGenSwitch(root) {
+  root.querySelectorAll('.eng-gen-btn').forEach(b => {
+    b.onclick = () => { if (!b.classList.contains('active')) switchLtxGeneration(b.dataset.gen); };
+  });
+}
+// The same switch beside the Remix tools, where Ingredients' "needs 2.3" is
+// felt. Hidden unless the server listed more than one installed generation.
+function renderLtxGenSwitch() {
+  const box = document.getElementById('ltxGenSwitch');
+  if (!box) return;
+  const ltxEng = (globalThis.ENGINES || []).find(e => e.id === 'ltx');
+  const gens = (ltxEng && ltxEng.generations) || [];
+  box.hidden = gens.length < 2;
+  box.innerHTML = gens.length > 1 ? _ltxGenSwitchHtml(gens, false) : '';
+  if (gens.length > 1) _wireLtxGenSwitch(box);
+}
+// Not called at script load: escapeHtml and the rest of the page's helpers are
+// defined by scripts that load AFTER this one. renderEngineSwitch() runs once
+// everything is up and calls this.
+
+// Ask the server to pin a different LTX generation, then wait for the restarted
+// panel and reload so the page, the engine chip and every gated control (the
+// Ingredients chip among them) are rebuilt for the new generation.
+async function switchLtxGeneration(id) {
+  // phosToast (queue.js), NOT a bare `toast`: there is no global `toast` - the
+  // one in this file is a const local to h3SpeedClick. The bare call threw a
+  // ReferenceError on every path: a refusal (render running, jobs waiting) was
+  // swallowed by the catch below and treated as a successful exec, and the
+  // success path died before it polled, so the panel restarted under a page
+  // that never reloaded. lint_webapp flags it (no-undef).
+  const say = (m, kind) => { if (typeof phosToast === 'function') phosToast(m, { kind }); };
+  closeEngineMenu({ returnFocus: false });
+  let r = null;
+  try {
+    r = await fetch('/ltx/generation', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'version=' + encodeURIComponent(id),
+    });
+  } catch (e) {
+    // Only a NETWORK failure lands here: the process may have exec'd before
+    // the response reached us - a successful switch, so poll like
+    // panelRestart() does. A refusal is an HTTP answer and is handled below.
+  }
+  if (r) {
+    const d = await r.json().catch(() => ({}));
+    if (!d.ok) {
+      say(d.error || 'Could not switch the LTX generation.', r.status === 409 ? 'warning' : 'danger');
+      return false;
+    }
+    if (d.unchanged) return true;
+  }
+  say('Switching LTX generation - restarting the panel\u2026', 'success');
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    await new Promise(res => setTimeout(res, 700));
+    try {
+      const v = await fetch('/version', {cache: 'no-store'});
+      if (v.ok) { location.reload(); return true; }
+    } catch (e) { /* still down */ }
+  }
+  say('Panel did not come back within 60s - start it from Pinokio.', 'danger');
+  return false;
 }
 
 // One sentence per state, and it has to be the RIGHT one — telling a user with
@@ -1946,4 +2040,9 @@ Object.assign(globalThis, {
   renderH3WindowPrompts, toggleH3WindowHelp, setH3ChainPrompts, setH3Tier,
   h3InsertPromptStructure, h3InsertDialogueLine, h3SyncPromptHelper,
   h3CanServe, h3ClipIsH3, syncH3MediaModeUi, h3FmtEtaMin,
+  // The Ingredients chip (characters.js) IS a generation switch when 2.3 is
+  // installed. Module-private, its `typeof` guard read false on every click
+  // and the chip fell through to the "needs LTX-2.3" toast while its own
+  // tooltip said "click to switch".
+  switchLtxGeneration,
 });

@@ -21,6 +21,7 @@ deliberately. `test_state_sandbox.py` holds the line.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -158,6 +159,19 @@ def _no_network(request, monkeypatch):
         return
     monkeypatch.setattr(_socket.socket, "connect", _guarded(_REAL_CONNECT))
     monkeypatch.setattr(_socket.socket, "connect_ex", _guarded(_REAL_CONNECT_EX))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_test_rig_marker(monkeypatch):
+    """The maintainer's Mac carries ~/.phosphene-test-rig (the marker that tags
+    its own installs' telemetry). Read from the real home it made every
+    analytics test on that Mac see `test_rig: true` - 8 tests failed there and
+    nowhere else. A test that wants the marker patches it itself, after this."""
+    mod = sys.modules.get("mlx_ltx_panel")
+    if mod is not None and hasattr(mod, "ANALYTICS_TEST_RIG_MARKER"):
+        monkeypatch.setattr(mod, "ANALYTICS_TEST_RIG_MARKER",
+                            _SANDBOX_TMP / "no-test-rig-marker")
     yield
 
 

@@ -8,7 +8,62 @@ anonymous usage analytics, which does send: see `docs/ANALYTICS.md`. The
 dashboard's *Usage* section displays that data; it is not what collects it.)
 
 **Open the dashboard:** the Phosphene panel must be running, then visit
-**<http://127.0.0.1:8199/stats>**.
+**<http://127.0.0.1:8199/stats>** — or serve it read-only without the panel
+(see *Read-only dashboard* below).
+
+## The daily fetch does NOT depend on the panel (2026-10-14)
+
+The panel's `stats_fetch_loop` only runs while a panel is up. The owner's
+panel was down from 2026-09-29 to 2026-10-14 and nothing fetched; GitHub's
+traffic API keeps 14 days. (Sep 24-28 were saved only because other panels on
+the same Mac had fetched into their own state/ — merged back on 2026-10-14.)
+The archive is now kept by a **launchd job** on the maintainer's Mac:
+
+| | |
+|---|---|
+| Label | `com.mrbizarro.phosphene-stats-fetch` |
+| Plist | `~/Library/LaunchAgents/com.mrbizarro.phosphene-stats-fetch.plist` |
+| When | daily 09:15 local, at login, and on wake if a run was missed |
+| Runs | `~/AI/projects/phosphene/notes/stats/run_stats_fetch.sh` (private PM hub) |
+| Code | `scripts/fetch_repo_stats.py` read from `beta/main` with `git show` — no checkout touched |
+| Writes | `phosphene-dev.git/state/stats-data.jsonl` — **append-only** (one new line, or today's last line replaced) |
+| Token | `gh auth token` (never logged) |
+| Proof | exits 1 with `FATAL` unless the archive's last row is today's UTC date |
+| Log | `notes/stats/fetch.log` (+ `launchd.log` for the job's own output) |
+
+```bash
+launchctl list | grep phosphene-stats-fetch                  # loaded? last exit code
+launchctl kickstart -k gui/$(id -u)/com.mrbizarro.phosphene-stats-fetch   # run now
+tail -20 ~/AI/projects/phosphene/notes/stats/fetch.log
+```
+
+The dashboard header turns red when the newest snapshot is more than 36 h
+old — that is the signal this job stopped.
+
+## Read-only dashboard
+
+`PHOSPHENE_STATS_SOURCE_DIR=<another install's state dir>` makes a panel
+read that install's `stats-data.jsonl` and `usage-log.jsonl` and never write
+them: no fetch loop, `/stats/refresh` answers 409, its own capture mirror
+stays in its own `LTX_STATE_DIR`. Run it on a spare port with
+`PHOSPHENE_ANALYTICS_DISABLED=1`.
+
+## User numbers — one definition each
+
+| Tile | Definition |
+|---|---|
+| Installs that rendered | installs (one anonymous install id each) that finished ≥1 render, all time. The user count. |
+| Installs that opened the app | installs that sent ≥1 `app_boot`, all time; the gap to the line above is failed installs, reinstalls that minted a new id, and one-off opens |
+| Weekly active installs | installs that opened the app in the last 7×24 h. The growth chart's weekly line is the same window laid back to back ending now, so its last point equals the tile |
+| Daily unique cloners, summed (GitHub) | upper bound on cloners, never a user count — GitHub only publishes per-day uniques |
+
+**Owner exclusion.** Every fleet query drops `test_rig` events *and* the ids
+/ fingerprints in `analytics-owner-installs.json` (path:
+`PHOSPHENE_ANALYTICS_OWNER_FILE`, default `<state>/analytics-owner-installs.json`).
+`test_rig` alone excluded nothing: no event had ever carried it, because
+nothing that launches a panel on the maintainer's Mac set
+`PHOSPHENE_TEST_RIG`. A file `~/.phosphene-test-rig` now tags every install
+on that Mac at the source.
 
 ## The pieces
 
@@ -50,7 +105,8 @@ python3 scripts/fetch_repo_stats.py --repo OWNER/NAME     # different repo
 ```
 
 The fetcher is idempotent — re-running on the same UTC day REPLACES today's
-row rather than appending a duplicate.
+row rather than appending a duplicate — and append-only: earlier lines are
+never parsed and re-written, they are kept byte-for-byte.
 
 ## What's collected
 
@@ -65,8 +121,10 @@ for the canonical schema):
   stored — privacy by construction.
 - `referrers` — top 10 with `{referrer, count, uniques}`, 14-day aggregate
 - `paths` — top 10 with `{path, title, count, uniques}`
-- `releases` — `{total, by_release}` (empty for Phosphene, which ships via
-  Pinokio clone, not release binaries)
+- `releases` — `{total, by_release}` over ALL releases (paginated since
+  2026-10-14; it used to read only the newest 100). Code tags carry no
+  files — Phosphene ships by git — so the dashboard shows them as
+  *source-only*; only `weights-*` tags have downloads.
 
 ## What's deliberately NOT collected
 

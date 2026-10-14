@@ -58,8 +58,11 @@ class FleetQueriesAndPage(unittest.TestCase):
             self.assertNotIn("INTERVAL", q["total_installs"])
             self.assertNotIn("INTERVAL", q["installs_by_day"])
             self.assertIn("render_completed", q["total_renders"])
-            # the running week is excluded, or the caption reads as a collapse
-            self.assertIn("toStartOfWeek(timestamp) < toStartOfWeek(now())", q["active_by_week"])
+            self.assertNotIn("INTERVAL", q["rendered_installs"])
+            # 2026-10-14: weekly active = 7 x 24 h windows ENDING NOW (the
+            # same window as the tile), not calendar weeks.
+            self.assertIn("dateDiff('second', timestamp, now()), 604800", q["active_by_week"])
+            self.assertNotIn("toStartOfWeek", q["active_by_week"])
 
     def test_page_has_the_tiles_and_the_chart(self):
         html = p.STATS_HTML_FILE.read_text(encoding="utf-8")

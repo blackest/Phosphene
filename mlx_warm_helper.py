@@ -24,6 +24,7 @@ import math
 import os
 import random
 import sys
+import hostinfo
 
 import music_tags as _music_tags   # bare section tags, the way YuE2 reads them
 import threading
@@ -125,23 +126,10 @@ _USER_VAE_STREAMING_OVERRIDE = os.environ.get("LTX_VAE_STREAMING")
 
 def _log_memory_pressure() -> None:
     """Emit a log line with current memory stats for diagnosing GPU timeouts."""
-    try:
-        import subprocess, re
-        total = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, errors="replace", timeout=1).stdout.strip())
-        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, errors="replace", timeout=1).stdout
-        m = re.search(r"page size of (\d+)", vm)
-        page_size = int(m.group(1)) if m else 16384
-        def pages(name: str) -> int:
-            mm = re.search(rf"{re.escape(name)}:\s+(\d+)", vm)
-            return int(mm.group(1)) if mm else 0
-        used_bytes = (pages("Pages active") + pages("Pages wired down")
-                      + pages("Pages occupied by compressor")) * page_size
-        used_gb = used_bytes / 1024**3
-        pct = round(used_bytes / total * 100) if total else 0
-        emit({"event": "log", "line": f"[mem] used={used_gb:.1f}G/{total/1024**3:.0f}G ({pct}%)"})
-    except Exception:
-        pass
+    mem = hostinfo.memory_usage()
+    total = mem["total"]
+    pct = round(mem["used"] / total * 100) if total else 0
+    emit({"event": "log", "line": f"[mem] used={mem['used'] / 1024**3:.1f}G/{total / 1024**3:.0f}G ({pct}%)"})
 
 
 # =============================================================================
@@ -3268,13 +3256,7 @@ def _detect_runtime_env() -> dict:
         env["macos"] = _pf.mac_ver()[0] or None
     except Exception:
         pass
-    try:
-        import subprocess as _sp
-        _chip = _sp.run(["sysctl", "-n", "machdep.cpu.brand_string"],
-                        capture_output=True, text=True, errors="replace", timeout=3).stdout.strip()
-        env["chip"] = _chip or None
-    except Exception:
-        pass
+    env["chip"] = hostinfo.chip_brand() or None
     return env
 
 
@@ -3360,13 +3342,7 @@ def mlx_cache_limit_bytes(total_ram_bytes: int, override: str | None = None) -> 
 
 
 def _physical_ram_bytes() -> int:
-    try:
-        import subprocess as _sp
-        out = _sp.run(["sysctl", "-n", "hw.memsize"],
-                      capture_output=True, text=True, errors="replace", timeout=3).stdout.strip()
-        return int(out)
-    except Exception:
-        return 0
+    return hostinfo.total_ram_bytes()
 
 
 _MLX_CACHE_RAM_BYTES = _physical_ram_bytes()
@@ -4789,6 +4765,33 @@ for line in sys.__stdin__:
                     _scale = read_lora_reference_downscale_factor(_lp)
                     if _scale != 1:
                         pipe.reference_downscale_factor = _scale
+                # Stage 2 runs on the CLEAN distilled transformer (the
+                # reference recipe's second ledger). Fused, that reload read
+                # the file without the adapter; unfused, the reload honours
+                # _pending_loras and would carry the IC adapter into the
+                # refine too (4.19.2, Ingredients moved to unfused for #101).
+                # Bound through a WEAK reference and the class's own function
+                # (Codex 4.19.2): a wrapper holding the bound method or the
+                # pipeline itself kept a finished IC pipeline alive at module
+                # scope, next to the next render's weights.
+                if hasattr(type(pipe), "_reload_clean_transformer"):
+                    import weakref as _weakref
+                    _orig_reload = type(pipe)._reload_clean_transformer
+                    _pipe_ref = _weakref.ref(pipe)
+
+                    def _reload_without_adapters(_orig=_orig_reload, _ref=_pipe_ref):
+                        _pipe = _ref()
+                        if _pipe is None:
+                            return None
+                        _saved = getattr(_pipe, "_pending_loras", None)
+                        _pipe._pending_loras = []
+                        try:
+                            return _orig(_pipe)
+                        finally:
+                            _pipe._pending_loras = _saved
+
+                    pipe._reload_clean_transformer = _reload_without_adapters
+                    del _reload_without_adapters, _orig_reload, _pipe_ref
                 emit({"event": "log",
                       "line": f"IC-LoRA applied UNFUSED (exact runtime wrapper), "
                               f"reference downscale ×{pipe.reference_downscale_factor}"})

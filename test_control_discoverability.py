@@ -259,11 +259,13 @@ class TestSourceDerivedCanvasRidesTheEngineGrid(unittest.TestCase):
     def test_make_job_shares_the_same_helper(self):
         """One rule, one function — or the day the grid changes, two of the
         three lanes learn about it."""
-        # one def + seven call sites: make_job, Control, Colorize, Upscale &
+        # one def + eight call sites: make_job, Control, Colorize, Upscale &
         # Face Fix (the worker and the one-click admission check), the H3
-        # form's after-the-draft export note (same rule, same helper), and
-        # ltx_fit_canvas, which every hardware clamp goes through.
-        self.assertEqual(PANEL_SRC.count("ltx_floor_canvas("), 8)
+        # form's after-the-draft export note (same rule, same helper),
+        # ltx_fit_canvas, which every hardware clamp goes through, and
+        # upscale_output_canvas (4.19.2: the QHD limit judges the canvas the
+        # worker renders, with the worker's own arithmetic).
+        self.assertEqual(PANEL_SRC.count("ltx_floor_canvas("), 9)
 
 
 class TestTheDocumentation(unittest.TestCase):

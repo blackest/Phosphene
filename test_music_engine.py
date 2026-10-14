@@ -370,20 +370,36 @@ def test_video_switcher_byte_identical_and_music_surface():
     current = (ROOT / "webapp/js/engines.js").read_text()
     before = subprocess.check_output(["git", "show", "e1d500e36d2f1ee445a056811763d1b33b8f7d02:webapp/js/engines.js"], cwd=ROOT, text=True)
     names = ("engineStatus", "engineServesMode", "_currentSurface", "engineOnSurface", "engineRenderable", "_engineRowVisible", "_engineTooltip", "renderEngineSwitch")
+    # The LTX generation switch (2.3 <-> 2.5) lives beside renderEngineSwitch and
+    # is called from it; the old source has no such functions.
+    gen_names = ("renderLtxGenSwitch", "_ltxGenSwitchHtml", "_wireLtxGenSwitch")
     def render(source, engines, workflow, capable=True):
-        funcs = '\n'.join(extract_function(n, source) for n in names)
+        extra = gen_names if "function renderLtxGenSwitch" in source else ()
+        funcs = '\n'.join(extract_function(n, source) for n in names + extra)
         return node_eval('''const box={innerHTML:'',hidden:false,querySelector:()=>null};
-const divider={hidden:false}; const menu={innerHTML:'',querySelectorAll:()=>[]};
-const document={body:{dataset:{workflow:WORKFLOW}},getElementById:id=>id==='engineSwitch'?box:divider};
+const divider={hidden:false}; const menu={innerHTML:'',querySelectorAll:()=>[],rows:[],appendChild(r){this.rows.push(r.innerHTML)}};
+const document={body:{dataset:{workflow:WORKFLOW}},createElement:()=>({innerHTML:'',querySelectorAll:()=>[]}),
+  getElementById:id=>id==='engineSwitch'?box:id==='engineSwitchDivider'?divider:null};
 const window={_ENGINE_PROBES:{h3:{capable:CAPABLE,available:true},music:{capable:true,available:true}}};
 const ENGINES=REGISTRY; const currentMode='t2v';
 const currentEngine=()=> 'ltx'; const musicComposeActive=()=>true;
 const escapeHtml=s=>String(s||''); const _engineMenuEl=()=>menu; const closeEngineMenu=()=>{};
 '''.replace('WORKFLOW', json.dumps(workflow)).replace('CAPABLE', json.dumps(capable)).replace('REGISTRY', json.dumps(engines)) + funcs + '\nrenderEngineSwitch();console.log(JSON.stringify({box,divider,menu}));')
-    registry = P.engines_payload()
+    # `generations` is read from THIS disk (which LTX packs are installed), so
+    # pin it: with no choice the switcher must be byte-identical to before...
+    registry = [dict(e, generations=[]) if e["id"] == "ltx" else e for e in P.engines_payload()]
     old_registry = [e for e in registry if e["id"] != "music"]
     for capable in (False, True):
-        assert render(before, old_registry, "manual", capable) == render(current, registry, "manual", capable)
+        old_out = render(before, old_registry, "manual", capable)
+        new_out = render(current, registry, "manual", capable)
+        assert old_out["menu"].pop("rows") == [] and new_out["menu"].pop("rows") == []
+        assert old_out == new_out
+    # ...and with two installed generations it adds exactly the one row.
+    two = [{"id": "ltx23", "label": "2.3", "active": False, "default": False},
+           {"id": "ltx25", "label": "2.5", "active": True, "default": True}]
+    with_gens = [dict(e, generations=two) if e["id"] == "ltx" else e for e in registry]
+    rows = render(current, with_gens, "manual")["menu"]["rows"]
+    assert len(rows) == 1 and 'data-gen="ltx23"' in rows[0] and 'data-gen="ltx25"' in rows[0]
     music = render(current, registry, "audio")
     assert music["box"]["hidden"] is False and "YuE2" in music["box"]["innerHTML"]
     assert "Hailuo H3" not in music["menu"]["innerHTML"]

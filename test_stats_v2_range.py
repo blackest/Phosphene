@@ -41,13 +41,20 @@ def _day_row(date: str, **kw) -> dict:
 
 
 class StatsDataRangeParam(unittest.TestCase):
-    """/stats/data?range=... — server-side window + per-range cache."""
+    """/stats/data — since 2026-10-14 the WHOLE archive on every range (the
+    page slices by date). The per-range server trim this class used to pin
+    was the root of the all-time tiles changing with the range chip; see
+    test_stats_fix_1014.py for the replacement contract."""
 
     def setUp(self):
-        # Write a 120-day synthetic archive straight into the sandboxed
-        # STATE_DIR (conftest.py points LTX_STATE_DIR at a per-run temp
-        # tree before mlx_ltx_panel is even imported, so this never
-        # touches a real install's archive).
+        # Never the real archive: these 121 synthetic rows (stars=1) were
+        # found in 12 worktrees' state/ on 2026-10-14, written by this class
+        # wherever STATE_DIR resolved. A temp file, whatever the sandbox.
+        import tempfile
+        pt = mock.patch.object(p, "STATS_DATA_FILE",
+                               Path(tempfile.mkdtemp()) / "stats-data.jsonl")
+        pt.start()
+        self.addCleanup(pt.stop)
         now = time.time()
         rows = []
         for i in range(120, -1, -1):
@@ -62,55 +69,20 @@ class StatsDataRangeParam(unittest.TestCase):
         body = p._stats_data_for_range(range_key)
         return [json.loads(line)["date"] for line in body.splitlines() if line.strip()]
 
-    def test_all_returns_the_whole_archive(self):
-        dates = self._dates("all")
-        self.assertEqual(len(dates), 121)
+    def test_every_range_returns_the_whole_archive(self):
+        for rk in ("7d", "30d", "90d", "all", "not-a-real-range"):
+            self.assertEqual(len(self._dates(rk)), 121, rk)
 
-    def test_30d_returns_roughly_two_windows_not_the_whole_archive(self):
-        # 30d asks for 2x the window (60ish days) so the client can compute
-        # a "vs prior period" delta from one response — see
-        # _stats_data_for_range's docstring. It must be narrower than "all".
-        dates = self._dates("30d")
-        self.assertLess(len(dates), 121)
-        self.assertGreaterEqual(len(dates), 30)
-        today = time.strftime("%Y-%m-%d", time.gmtime())
-        self.assertIn(today, dates)
-
-    def test_7d_is_narrower_than_30d_is_narrower_than_90d(self):
-        n7 = len(self._dates("7d"))
-        n30 = len(self._dates("30d"))
-        n90 = len(self._dates("90d"))
-        self.assertLess(n7, n30)
-        self.assertLess(n30, n90)
-
-    def test_unknown_range_falls_back_to_the_default(self):
-        default = p._stats_data_for_range(p.STATS_RANGE_DEFAULT)
-        garbage = p._stats_data_for_range("not-a-real-range")
-        self.assertEqual(default, garbage)
-
-    def test_each_range_is_cached_separately_not_under_one_shared_key(self):
-        b7 = p._stats_data_for_range("7d")
-        b30 = p._stats_data_for_range("30d")
-        ball = p._stats_data_for_range("all")
-        self.assertNotEqual(b7, b30)
-        self.assertNotEqual(b30, ball)
-        self.assertEqual(set(p._STATS_DATA_RANGE_CACHE.keys()), {"7d", "30d", "all"})
-
-    def test_refresh_busts_every_ranges_cache_via_mtime(self):
-        # /stats/refresh rewrites the archive; that bumps its mtime, which
-        # must invalidate every cached range on the next read (no separate
-        # "clear the usage cache" call needed — see the function docstring).
+    def test_refresh_busts_the_cache_via_mtime(self):
         first = p._stats_data_for_range("all")
-        cached_mtime = p._STATS_DATA_RANGE_CACHE["all"][0]
-        # Simulate a slightly-later refresh appending a new day.
         time.sleep(0.02)
         with p.STATS_DATA_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(_day_row("2099-01-01")) + "\n")
         second = p._stats_data_for_range("all")
         self.assertNotEqual(first, second)
-        self.assertNotEqual(p._STATS_DATA_RANGE_CACHE["all"][0], cached_mtime)
+        self.assertEqual(self._dates("7d")[-1], "2099-01-01")
 
-    def test_route_defaults_to_30d_when_range_is_omitted(self):
+    def test_route_serves_the_archive_when_range_is_omitted(self):
         import panel.routes_stats as rs
         rs.P = p
 
@@ -134,8 +106,7 @@ class StatsDataRangeParam(unittest.TestCase):
 
         h = FakeHandler()
         rs.stats_data(h, FakeParsed())
-        expected = p._stats_data_for_range("30d")
-        h.wfile.write.assert_called_once_with(expected)
+        h.wfile.write.assert_called_once_with(p._stats_data_for_range("all"))
 
 
 class OwnerExclusionAppliedEverywhere(unittest.TestCase):

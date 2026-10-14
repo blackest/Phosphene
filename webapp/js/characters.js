@@ -4106,6 +4106,12 @@ globalThis.QUALITY_PRESETS = {
   // capacity, not raw pixels. User can still pick 1280×704 explicitly
   // via the resolution chip; this preset just sets the saner default.
   high:     { w: 1024, h: 576, upscale: 'off' },
+  // High · 720p (v4.0.2): the same two-stage HQ lane at the native 720p canvas.
+  // Without this row setQuality() treated the key as unknown and fell back to
+  // 'standard', so clicking the High · 720p chip queued a Standard render
+  // (quality=standard, 1280×704, 8 steps). test_high720_quality_preset.py
+  // holds every LTX registry key to a row here.
+  high_720p: { w: 1280, h: 704, upscale: 'off' },
 };
 
 function setQuality(q) {
@@ -4653,6 +4659,17 @@ document.querySelectorAll('#remixSubGroup .pill-btn').forEach(b => b.onclick = (
   // refuses too — this is the polite half.
   if (b.dataset.remix === 'ingredients'
       && (BOOT.ltx || {}).ingredients_available === false) {
+    // 2.3 is installed alongside: the chip is the switch. One click pins LTX-2.3
+    // (the panel restarts); switching back is the LTX generation row in the
+    // engine menu. Default stays 2.5 - nothing changes until this is clicked.
+    const g23 = _ltx23Switchable();
+    // No typeof guard: engines.js publishes switchLtxGeneration, and an
+    // unguarded reference is what lets lint_webapp's no-undef catch it the
+    // day it stops being published (the guard hid exactly that).
+    if (g23) {
+      switchLtxGeneration(g23.id);
+      return;
+    }
     if (typeof phosToast === 'function') {
       phosToast('Ingredients needs the LTX-2.3 generation — its reference '
         + 'adapter has no 2.5 release yet, so on 2.5 your references would '
@@ -4663,6 +4680,17 @@ document.querySelectorAll('#remixSubGroup .pill-btn').forEach(b => b.onclick = (
   }
   setMode(b.dataset.remix);
 });
+// The installed, non-active LTX-2.3 generation the server offers, or null. The
+// server only lists a generation whose base pack is complete on disk, so a
+// non-null answer means a click can actually land on something that renders.
+function _ltx23Switchable() {
+  // BOOT.engines, NOT globalThis.ENGINES: this runs while characters.js loads
+  // and engines.js (which assigns ENGINES from BOOT.engines) loads AFTER it, so
+  // ENGINES is still undefined here and the chip would never see 2.3.
+  const ltx = (BOOT.engines || []).find(e => e.id === 'ltx');
+  const gens = (ltx && ltx.generations) || [];
+  return gens.find(g => g.id === 'ltx23' && !g.active) || null;
+}
 // Paint the Ingredients chip as unavailable on a generation that cannot
 // serve it, so the state is visible before the click.
 (function _markIngredientsAvailability() {
@@ -4670,14 +4698,24 @@ document.querySelectorAll('#remixSubGroup .pill-btn').forEach(b => b.onclick = (
     if ((BOOT.ltx || {}).ingredients_available !== false) return;
     const chip = document.querySelector('#remixSubGroup [data-remix="ingredients"]');
     if (!chip) return;
-    chip.classList.add('disabled');
+    // `.disabled` carries pointer-events:none, which also swallows the click
+    // and the tooltip. A chip that can switch to 2.3 must stay clickable, so it
+    // gets its own muted-but-live class instead.
+    chip.classList.add(_ltx23Switchable() ? 'needs-switch' : 'disabled');
     chip.title = 'Needs LTX-2.3 — the 2.5 reference adapter is not published '
                + 'yet. Use Image mode with Inspire for reference-guided work '
                + 'on 2.5, or install the 2.3 pack from the Train tab. '
                + '(The same two routes the server names if you get here.)';
-    chip.setAttribute('aria-disabled', 'true');
+    if (!_ltx23Switchable()) chip.setAttribute('aria-disabled', 'true');
     const sub = chip.querySelector('.mc-sub');
     if (sub) sub.textContent = 'needs LTX-2.3';
+    if (_ltx23Switchable()) {
+      // Switchable: say what the click does, and keep it off the greyed look.
+      chip.title = 'Ingredients needs LTX-2.3. Click to switch to LTX-2.3 - the '
+                 + 'panel restarts, and you can switch back to 2.5 from the '
+                 + 'LTX generation row in the engine menu.';
+      if (sub) sub.textContent = 'click to switch to LTX-2.3';
+    }
   };
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', apply);

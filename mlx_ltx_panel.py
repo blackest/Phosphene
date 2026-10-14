@@ -71,6 +71,7 @@ SEQ_NOUN_CAP = "Sequence"
 # External agents drive Phosphene via the HTTP API documented in docs/API.md.
 # Pre-removal snapshot: git tag pre-agent-removal-2026-05-15.
 import image_engine as agent_image_engine
+import hostinfo
 
 # Agent-facing Ideogram 4 caption builder + validator (pure stdlib). Powers
 # the GET /image/agent/schema + POST /image/agent endpoints — a clean JSON
@@ -152,7 +153,9 @@ def _resolve_helper_python() -> Path:
     explicit = os.environ.get("LTX_HELPER_PYTHON")
     if explicit and Path(explicit).is_file():
         return Path(explicit)
-    for sub in (".venv/bin/python3.11", "env/bin/python3.11"):
+    # python3.11 is the Pinokio/macOS venv; plain python3 is a Linux venv
+    # (omarchy-mlx ships wheels for the distro's Python only).
+    for sub in (".venv/bin/python3.11", "env/bin/python3.11", ".venv/bin/python3", "env/bin/python3"):
         p = MLX / sub
         if p.is_file():
             return p
@@ -659,65 +662,98 @@ HIDDEN_FILE = STATE_DIR / "panel_hidden.json"
 # the JSONL data is appended daily by a background thread (see
 # stats_fetch_loop) and served at /stats/data. Both endpoints are
 # 127.0.0.1-only like the rest of the panel.
-STATS_DATA_FILE = STATE_DIR / "stats-data.jsonl"
+# READ-ONLY STATS MODE (2026-10-14). PHOSPHENE_STATS_SOURCE_DIR points the
+# dashboard at another install's state dir — the maintainer's real archive —
+# so /stats can be served by a throwaway panel on its own port without
+# booting (or writing into) the panel that owns that data. In this mode the
+# panel READS stats-data.jsonl and usage-log.jsonl from the source dir and
+# never writes there: no stats_fetch_loop, /stats/refresh answers 409, and
+# the usage mirror it appends to stays in its own STATE_DIR. The daily
+# archive is then kept by an external job (launchd, see
+# scripts/STATS_DASHBOARD.md), not by whichever panel happens to be running —
+# the reason the archive went 15 days without a row in Sep-Oct 2026.
+_STATS_SOURCE_RAW = (os.environ.get("PHOSPHENE_STATS_SOURCE_DIR") or "").strip()
+STATS_SOURCE_DIR = Path(_STATS_SOURCE_RAW).expanduser() if _STATS_SOURCE_RAW else None
+STATS_READONLY = STATS_SOURCE_DIR is not None
+STATS_DATA_FILE = (STATS_SOURCE_DIR or STATE_DIR) / "stats-data.jsonl"
 STATS_HTML_FILE = ROOT / "panel_assets" / "stats.html"
 STATS_FETCHER = ROOT / "scripts" / "fetch_repo_stats.py"
 
 # Dashboard v2 (2026-09-30): one range control (7d/30d/90d/all) drives every
-# panel on /stats. Server-side filtering of the JSONL archive lives here so
-# the payload the browser downloads matches what it asked for, and so a
-# range's own cache entry is invalidated (not served stale) the moment the
-# archive file changes underneath it — see _stats_data_for_range.
+# panel on /stats. The range is applied IN THE BROWSER, by date; the server
+# always sends the whole archive (see _stats_data_for_range for why).
 STATS_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "all": None}
 STATS_RANGE_DEFAULT = "30d"
 _STATS_DATA_RANGE_CACHE: dict[str, tuple[float, bytes]] = {}
 _STATS_DATA_RANGE_LOCK = threading.Lock()
 
+# Fields only the NEWEST row is ever read for (timelines rebuilt from the
+# full GitHub history on every fetch, the open-items board, the release
+# table). Older rows keep their per-day facts only; see _stats_slim_row.
+_STATS_LATEST_ONLY_FIELDS = (
+    "stars_timeline", "forks_timeline", "issues_opened", "issues_closed",
+    "prs_opened", "prs_closed", "commits_timeline", "release_timeline",
+    "open_items", "releases",
+)
 
-def _stats_data_for_range(range_key: str) -> bytes:
-    """JSONL bytes for one range, cached per (range, archive mtime).
 
-    Keying the cache on the file's own mtime — not a TTL — is what keeps
-    this correct after /stats/refresh: the fetcher rewrites STATS_DATA_FILE
-    in place, which bumps mtime, which makes every range's cache entry miss
-    on the very next read. No separate invalidation call needed.
+def _stats_slim_row(row: dict) -> dict:
+    return {k: v for k, v in row.items() if k not in _STATS_LATEST_ONLY_FIELDS}
 
-    A range narrower than "all" asks for 2x the window (e.g. 60 days of
-    rows for "30d") so the dashboard can compute "vs prior period" deltas
-    from one response instead of a second round trip."""
-    key = range_key if range_key in STATS_RANGE_DAYS else STATS_RANGE_DEFAULT
-    days = STATS_RANGE_DAYS[key]
+
+def _stats_data_for_range(range_key: str = STATS_RANGE_DEFAULT) -> bytes:
+    """The archive as JSONL for the dashboard: EVERY row, oldest first,
+    the newest one complete and the older ones slimmed. Cached on the
+    file's mtime, so a fetch that appends a row is seen on the next read.
+
+    `range_key` is accepted for old callers and ignored. Until 2026-10-14
+    the server trimmed the archive to twice the selected window, counted
+    back from the wall clock, and that was the root of three wrong numbers:
+      - the "all-time" tiles (total clones, unique cloners) were summed
+        from whatever the trim left, so they changed with the range chip
+        ("1,993 all-time" was 4 rows' worth on the 7-day view);
+      - a stale archive (no fetch for 15 days) trimmed to almost nothing,
+        and every over-time chart went blank instead of showing the
+        history it had;
+      - the cache was keyed on mtime only while the cutoff moved with the
+        date, so a panel up for four days kept serving the trim it made on
+        the first.
+    Sending everything is ~1 KB per older row (the timelines that make a
+    full row ~16 KB are only read from the newest one), so a year of
+    history is still well under a megabyte on a loopback request."""
     try:
         mtime = STATS_DATA_FILE.stat().st_mtime
     except OSError:
         return b""
     with _STATS_DATA_RANGE_LOCK:
-        cached = _STATS_DATA_RANGE_CACHE.get(key)
+        cached = _STATS_DATA_RANGE_CACHE.get("archive")
         if cached and cached[0] == mtime:
             return cached[1]
     try:
         raw = STATS_DATA_FILE.read_bytes()
     except FileNotFoundError:
         return b""
-    if days is None:
-        body = raw
-    else:
-        cutoff = time.strftime("%Y-%m-%d",
-                                time.gmtime(time.time() - days * 2 * 86400))
-        kept: list[bytes] = []
-        for line in raw.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                row = json.loads(stripped)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if str(row.get("date") or "") >= cutoff:
-                kept.append(stripped)
-        body = (b"\n".join(kept) + b"\n") if kept else b""
+    by_date: dict[str, dict] = {}
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            row = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(row, dict) or not row.get("date"):
+            continue
+        # A date seen twice keeps the LATER line (same rule as the fetcher).
+        by_date[str(row["date"])] = row
+    dates = sorted(by_date)
+    out = []
+    for i, d in enumerate(dates):
+        row = by_date[d] if i == len(dates) - 1 else _stats_slim_row(by_date[d])
+        out.append(json.dumps(row, ensure_ascii=False).encode("utf-8"))
+    body = (b"\n".join(out) + b"\n") if out else b""
     with _STATS_DATA_RANGE_LOCK:
-        _STATS_DATA_RANGE_CACHE[key] = (mtime, body)
+        _STATS_DATA_RANGE_CACHE["archive"] = (mtime, body)
     return body
 HELPER_IDLE_TIMEOUT = int(os.environ.get("LTX_HELPER_IDLE_TIMEOUT", "1800"))
 HELPER_LOW_MEMORY = os.environ.get("LTX_HELPER_LOW_MEMORY", "true")
@@ -5652,8 +5688,15 @@ def _run_stats_fetch_once() -> None:
             )
             _STATS_WARNED_NO_TOKEN = True
         return
+    if STATS_READONLY:
+        return  # the archive belongs to another install; see STATS_SOURCE_DIR
     env = os.environ.copy()
     env["GITHUB_TOKEN"] = token
+    # Write the archive the dashboard READS. The fetcher's own default is
+    # <repo>/state/stats-data.jsonl, which is a different file whenever the
+    # panel runs with LTX_STATE_DIR set — a refresh then landed somewhere
+    # /stats never looked.
+    env["PHOSPHENE_STATS_OUT"] = str(STATS_DATA_FILE)
     try:
         cp = subprocess.run(
             [sys.executable, str(STATS_FETCHER)],
@@ -8714,8 +8757,11 @@ def caffeinate_on() -> None:
     global CAFFEINATE_PROC
     if CAFFEINATE_PROC and CAFFEINATE_PROC.poll() is None:
         return
+    argv = hostinfo.keep_awake_prefix()
+    if not argv:
+        return
     try:
-        CAFFEINATE_PROC = subprocess.Popen(["caffeinate", "-i"],
+        CAFFEINATE_PROC = subprocess.Popen(argv,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         push("caffeinate active — Mac won't idle-sleep while queue is running")
     except Exception as exc:
@@ -8908,14 +8954,7 @@ CAPABILITIES: dict[str, dict] = {
 
 def _detect_total_ram_gb() -> float:
     """Return physical unified memory in GiB, or 0.0 when unavailable."""
-    try:
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, errors="replace", timeout=1,
-        ).stdout.strip()
-        return int(out) / 1024**3
-    except Exception:
-        return 0.0
+    return hostinfo.total_ram_bytes() / 1024**3
 
 
 SYSTEM_RAM_GB = _detect_total_ram_gb()
@@ -10347,8 +10386,7 @@ def _hw_chip_family() -> str:
     if _HW_CHIP_FAMILY is None:
         fam = "unknown"
         try:
-            brand = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
-                                   capture_output=True, text=True, errors="replace", timeout=3).stdout.strip()
+            brand = hostinfo.chip_brand()
             m = re.search(r"Apple (M\d+)(?: (Pro|Max|Ultra))?", brand)
             if m:
                 fam = m.group(1) + (f" {m.group(2)}" if m.group(2) else "")
@@ -10458,6 +10496,40 @@ GPU_STEPS_M1M2 = {"MLX_MAX_OPS_PER_BUFFER": "10", "MLX_MAX_MB_PER_BUFFER": "10"}
 GPU_STEPS_SHORT = {"MLX_MAX_OPS_PER_BUFFER": "1", "MLX_MAX_MB_PER_BUFFER": "1"}
 #: Closed vocabulary for render_*.watchdog_phase (docs/ANALYTICS.md).
 WATCHDOG_PHASES = ("encode", "load", "denoise", "decode")
+#: 4.19.2 - render_failed.crash_phase: the watchdog phases plus "start" (the
+#: helper died before its first step line).
+CRASH_PHASES = WATCHDOG_PHASES + ("start",)
+#: 4.19.2 - render_failed.crash_line: the CLASS of the last native error line
+#: a helper printed before it died from a signal. First match wins; the text
+#: itself never leaves the Mac. "none" = no such line reached the panel.
+_CRASH_LINE_CLASSES = (
+    ("gpu_timeout", ("kiogpucommandbuffercallbackerrortimeout",
+                     "caused gpu timeout error")),
+    ("gpu_interactivity", ("impactinginteractivity", "impacting interactivity")),
+    ("gpu_hang", ("kiogpucommandbuffercallbackerrorhang", "gpu hang")),
+    ("gpu_page_fault", ("pagefault", "page fault")),
+    ("gpu_oom", ("kiogpucommandbuffercallbackerroroutofmemory",
+                 "insufficient memory")),
+    ("gpu_victim", ("innocentvictim", "innocent victim")),
+    ("gpu_other", ("kiogpucommandbuffercallbackerror",
+                   "command buffer execution failed", "[metal]")),
+    ("resource_limit", ("resource limit",)),
+    ("cxx_exception", ("libc++abi", "terminating due to uncaught exception",
+                       "terminate called")),
+    ("assertion", ("assertion failed",)),
+)
+CRASH_LINES = tuple(c for c, _ in _CRASH_LINE_CLASSES) + ("none",)
+
+
+def crash_line_class(line: str) -> str:
+    """The closed class of a native error line, or "" for any other line."""
+    low = str(line or "").lower()
+    if not low:
+        return ""
+    for cls, needles in _CRASH_LINE_CLASSES:
+        if any(n in low for n in needles):
+            return cls
+    return ""
 GPU_STEPS_NOTE = ("short GPU steps: macOS's GPU watchdog stopped this setting "
                   "before on this Mac, so it renders in smaller pieces (a "
                   "little slower)")
@@ -10560,6 +10632,35 @@ def metal_watchdog_needs_short_encode(key: str) -> bool:
     return bool(ent.get("short_encode"))
 
 
+# 4.19.2 (fleet 4.19.1): 12 of the 13 real watchdog kills whose phase is known
+# died in PROMPT ENCODING, on short steps already - and prompt encoding costs
+# the same at every size. One Mac followed our "Retry smaller" advice down to
+# 256x192 and was stopped in encoding five more times. A kill in encoding gets
+# advice that can work instead.
+METAL_WATCHDOG_ENCODE_WAY = (
+    "It stopped while reading the prompt, which costs the same at every size, "
+    "so a smaller render will not help. Quit apps that use the graphics chip "
+    "(games, video playing in a browser, other AI apps), then press Retry")
+#: ...and since that cause is the moment (what else is using the GPU), not the
+#: size, a setting stopped in encoding pauses for minutes, not a day.
+METAL_WATCHDOG_ENCODE_REFUSE_SEC = 15 * 60
+
+
+def metal_watchdog_pause_words(phase: str | None) -> str:
+    return ("for 15 minutes" if str(phase or "") == "encode"
+            else "for 24 hours")
+
+
+def metal_watchdog_way(mode: str | None, phase: str | None = None) -> str:
+    """The way out after a watchdog kill on short steps, for this mode/phase."""
+    if str(phase or "") == "encode":
+        return METAL_WATCHDOG_ENCODE_WAY
+    if str(mode or "t2v") in ("t2v", "i2v", "i2v_clean_audio", "a2v",
+                              "keyframe", "upscale"):
+        return "Press Retry smaller, or pick a lower quality or a shorter clip"
+    return "Try a shorter extension or section, or a shorter source clip"
+
+
 def metal_watchdog_refusal(key: str, now: float | None = None,
                            mode: str | None = None) -> str | None:
     """The refusal for a setting the watchdog killed even on short steps, for
@@ -10571,16 +10672,16 @@ def metal_watchdog_refusal(key: str, now: float | None = None,
     if int(ent.get("short_kills") or 0) <= 0:
         return None
     last = int(ent.get("short_last_ts") or ent.get("last_ts") or 0)
-    if (now if now is not None else time.time()) - last > METAL_WATCHDOG_REFUSE_SEC:
+    phase = ent.get("phase")
+    window = (METAL_WATCHDOG_ENCODE_REFUSE_SEC if phase == "encode"
+              else METAL_WATCHDOG_REFUSE_SEC)
+    if (now if now is not None else time.time()) - last > window:
         return None
-    way = ("Press Retry smaller, or pick a lower quality or a shorter clip"
-           if str(mode or "t2v") in ("t2v", "i2v", "i2v_clean_audio", "a2v",
-                                     "keyframe", "upscale")
-           else "Try a shorter extension or section, or a shorter source clip")
+    way = metal_watchdog_way(mode, phase)
     return ("macOS's GPU watchdog stopped this exact render twice on this Mac - "
             "the second time in short GPU steps - so it is not started again "
             f"(it would stop the same way). {way}. This size is tried again "
-            "after the next update, or in 24 hours.")
+            f"after the next update, or {metal_watchdog_pause_words(phase).replace('for ', 'in ')}.")
 
 
 
@@ -13124,10 +13225,10 @@ def h3_paths() -> dict:
     dit = compact_root = text_config = models_root = None
     for root in _h3_model_roots():
         cand_dit = root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME
-        if not cand_dit.is_file():
+        if not _h3_holds_dit(root):
             continue
         models_root = root
-        dit = cand_dit
+        dit = cand_dit if cand_dit.is_file() else None
         # LTX_H3_COMPACT_DIR picks an alternate conditioning-encoder dir under the same
         # models root (e.g. "heretic-q8", an abliterated encoder re-quantized to the
         # ddalcu layout). Dev/testing override; default stays the shipped ddalcu-q8.
@@ -13151,7 +13252,7 @@ def h3_paths() -> dict:
         missing.append(f"runner {runner}")
     if python is None:
         missing.append(f"venv python under {H3_ROOT / '.venv'}")
-    if dit is None:
+    if dit is None and models_root is None:
         missing.append(f"pruned bf16 DiT ({H3_DIT_FILENAME})")
     if compact_root is None:
         missing.append("Q8 components (text_encoder / video_vae / audio_vae)")
@@ -13173,7 +13274,8 @@ def h3_paths() -> dict:
     # `repairable` is the load-bearing one: weights present + code/venv gone.
     # It is what stops the panel silently reporting "not installed" to a user
     # who has 75 GB of H3 weights sitting on their disk.
-    weights_ok = dit is not None and compact_root is not None and text_config is not None
+    weights_ok = (models_root is not None
+                  and compact_root is not None and text_config is not None)
     runner_ok = runner.is_file()
     venv_ok = python is not None
     venv_built = _h3_venv_present()
@@ -13194,9 +13296,10 @@ def h3_paths() -> dict:
         "runner": runner,
         "python": python,
         "dit": dit,
-        # bf16 master path stays canonical in `dit`; the render-time swap to
-        # the Q8 pack happens in the dispatch via h3_dit_choice(), so /status
-        # can always show BOTH what exists and what will be used.
+        # bf16 master path stays canonical in `dit` (None when there is no
+        # master: a Linux Q8-only install); the render-time swap to the Q8
+        # pack happens in the dispatch via h3_dit_choice(), so /status can
+        # always show BOTH what exists and what will be used.
         "compact_root": compact_root,
         "text_config": text_config,
         "missing": missing,
@@ -13238,12 +13341,17 @@ def _h3_q8_shards_complete(d: Path) -> bool:
         return False
 
 
+def _h3_q8_pack_complete(d: Path) -> bool:
+    return ((d / "config.json").is_file()
+            and (d / "quant_config.json").is_file()
+            and _h3_q8_shards_complete(d))
+
+
 def _h3_q8_dit_dir() -> Path | None:
     """The quantized DiT pack, if present: config + quant recipe + all shards."""
     for root in _h3_model_roots():
         d = root / H3_DIT_Q8_DIRNAME
-        if (d / "config.json").is_file() and (d / "quant_config.json").is_file() \
-                and _h3_q8_shards_complete(d):
+        if _h3_q8_pack_complete(d):
             return d
     return None
 
@@ -13267,7 +13375,9 @@ def h3_dit_choice() -> tuple[str, Path | None]:
     # 48 GB Mac died with Metal "Insufficient Memory" on every render, Draft
     # included (Pinokio report, M5 Max 48 GB, Q8 engine built and skipped).
     # Q8 is the only lane that fits there; the dispatch says so in the log.
-    if pref == "bf16" and (SYSTEM_RAM_GB >= H3_MIN_RAM_GB or q8 is None):
+    # Nor is one with no bf16 master on disk (#94: a Linux Q8-only install).
+    if pref == "bf16" and h3_paths()["dit"] is not None \
+            and (SYSTEM_RAM_GB >= H3_MIN_RAM_GB or q8 is None):
         return "bf16", None
     if pref == "q8" and q8 is None:
         pref = "auto"      # fall through, surfaced via /status
@@ -13590,6 +13700,13 @@ def h3_supports_lora() -> bool:
     return _h3_runner_has_flag("--lora")
 
 
+def _h3_holds_dit(root: Path) -> bool:
+    """Find the bf16 master, or a complete Linux Q8 pack."""
+    if (root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME).is_file():
+        return True
+    return not hostinfo.IS_MAC and _h3_q8_pack_complete(root / H3_DIT_Q8_DIRNAME)
+
+
 def _h3_turbo_dir() -> Path:
     """Where Turbo's adapter lives: alongside the other weight components.
 
@@ -13597,7 +13714,7 @@ def _h3_turbo_dir() -> Path:
     DiT, so Turbo lands next to `deepbeep-pruned-bf16` / `ddalcu-q8` rather
     than in a third place."""
     for root in _h3_model_roots():
-        if (root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME).is_file():
+        if _h3_holds_dit(root):
             return root / H3_TURBO_DIRNAME
     return H3_MODELS / H3_TURBO_DIRNAME
 
@@ -14171,7 +14288,7 @@ def _h3_loras_dir() -> Path:
     DiT — the identical rule `_h3_turbo_dir()` uses, so Turbo's adapter and a
     CivitAI adapter end up as siblings instead of in two different places."""
     for root in _h3_model_roots():
-        if (root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME).is_file():
+        if _h3_holds_dit(root):
             return root / H3_LORAS_DIRNAME
     return H3_MODELS / H3_LORAS_DIRNAME
 
@@ -17241,8 +17358,100 @@ def engines_payload() -> list[dict]:
             _gen = _lbl.replace("LTX-", "").strip()
             if _gen and _gen != _lbl.strip():
                 d["generation"] = _gen
+            # Every generation whose base pack is on disk, so the engine menu
+            # can offer a switch. Only offered when there is a real choice.
+            d["generations"] = ltx_generation_choices()
         out.append(d)
     return out
+
+
+def ltx_generation_choices() -> list[dict]:
+    """The LTX generations this install can switch between.
+
+    A generation is offered only when it can RENDER: its `render` capability
+    (base pack AND its own text encoder — Gemma 3 for 2.3, Gemma 4 for 2.5) is
+    complete. That is the same question, with the same HF-cache-aware answer,
+    the panel's blocker card and the Models modal ask (capability_missing), so
+    the switch can never offer a generation the panel would then call
+    incomplete. A q4 pack alone is not enough: switching onto a generation
+    whose text encoder is half-downloaded boots a panel that cannot render.
+    Complete is not enough either: a pack the boot integrity scan flags
+    (truncated / unreadable safetensors header - the "mosaic" class) is not
+    offered, because switching onto it boots straight into the Repair banner.
+    _model_integrity() is header-only and cached, so this stays cheap.
+    The active one is always listed so the menu can show which is current.
+    Returns [] when there is no real choice (fewer than two usable
+    generations), which hides the control entirely."""
+    try:
+        corrupt = {b.get("repo") for b in (_model_integrity().get("bad") or [])}
+    except Exception:                                       # noqa: BLE001
+        corrupt = set()
+    out: list[dict] = []
+    for v in MODEL_VERSIONS:
+        vid = v["id"]
+        active = vid == ACTIVE_MODEL_VERSION
+        try:
+            installed = (not capability_missing("render", vid)
+                         and not corrupt.intersection(capability_repo_keys("render", vid)))
+        except Exception:                                   # noqa: BLE001
+            installed = False
+        if not (installed or active):
+            continue
+        out.append({
+            "id": vid,
+            "label": str(v.get("label") or vid).replace("LTX-", "").strip(),
+            "active": active,
+            "default": bool(v.get("default")),
+        })
+    return out if len(out) > 1 else []
+
+
+def set_environment_value(key: str, value: str) -> None:
+    """Set `KEY=value` in <install>/ENVIRONMENT, preserving every other line.
+
+    That file is the one the Pinokio launcher, pinokio.js and download_q8.js
+    all read, so writing here keeps the panel, the sidebar and the installers
+    agreeing about the generation after the next full Pinokio restart.
+
+    EVERY live assignment of KEY is rewritten, not just the last. Pinokio's
+    dotenv, pinokio.js and q8_weights.sh take the LAST one, but download_q8.js
+    takes the FIRST — rewriting only the last left a file with duplicates
+    meaning ltx23 to the panel and ltx25 to the Q8 downloader. Commented lines
+    are left alone. No assignment: one is appended. A CRLF file stays CRLF, the
+    file's mode is kept, a symlinked ENVIRONMENT is written through (not
+    replaced by a regular file), and the write is atomic_write_text's temp +
+    fsync + rename, so a crash cannot leave a half-written ENVIRONMENT and two
+    writers cannot trample one temp file."""
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+        raise ValueError("refusing to write an unsafe ENVIRONMENT entry")
+    path = ROOT / "ENVIRONMENT"
+    if path.is_symlink():
+        path = path.resolve()
+    try:
+        # Bytes, not read_text(): universal-newline reading turns every CRLF
+        # into LF, which rewrote a CRLF file's EVERY line to change one.
+        text = path.read_bytes().decode("utf8")
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        text, mode = "", 0o644
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.split("\n")
+    pat = re.compile(r"^\s*(?:export\s+)?" + re.escape(key) + r"\s*[=:]")
+    hits = [i for i, ln in enumerate(lines) if pat.match(ln) and not ln.lstrip().startswith("#")]
+    entry = f"{key}={value}"
+    if hits:
+        for i in hits:
+            lines[i] = entry + ("\r" if lines[i].endswith("\r") else "")
+    else:
+        cr = "\r" if nl == "\r\n" else ""
+        if lines and lines[-1] == "":
+            lines.insert(len(lines) - 1, entry + cr)
+        else:
+            if lines and lines[-1] and cr and not lines[-1].endswith("\r"):
+                lines[-1] += cr
+            lines.append(entry + cr)
+            lines.append("")
+    atomic_write_text(path, "\n".join(lines), mode=mode)
 
 
 def _engine_css() -> str:
@@ -17366,9 +17575,28 @@ _ANALYTICS_RECEIVER_DIRECTIVES = {
 # state/ (gitignored, fs.link-preserved across Pinokio Reset) and is capped
 # so a heavy user's log can't grow without bound.
 USAGE_LOG_FILE = STATE_DIR / "usage-log.jsonl"
+# What the dashboard's "this Mac" numbers READ. The same file, except in
+# read-only stats mode, where it is the source install's mirror (read, never
+# appended — capture keeps writing USAGE_LOG_FILE in this panel's own state).
+USAGE_LOG_READ_FILE = (STATS_SOURCE_DIR / "usage-log.jsonl") if STATS_SOURCE_DIR else USAGE_LOG_FILE
+# The maintainer's own installs, for the fleet view's owner exclusion — see
+# _owner_exclusion_sql. Local, private, never shipped: a JSON file of
+# install ids (and optional machine fingerprints) that are NOT users.
+ANALYTICS_OWNER_FILE = Path(
+    (os.environ.get("PHOSPHENE_ANALYTICS_OWNER_FILE") or "").strip()
+    or str((STATS_SOURCE_DIR or STATE_DIR) / "analytics-owner-installs.json")
+).expanduser()
+# A file whose mere presence marks EVERY install on this Mac as a test rig.
+# See _analytics_is_test_rig: the env var alone never reached a single event.
+ANALYTICS_TEST_RIG_MARKER = Path.home() / ".phosphene-test-rig"
 USAGE_LOG_MAX_BYTES = 5 * 1024 * 1024
 USAGE_FLEET_CACHE = STATE_DIR / "usage-fleet.json"
 USAGE_FLEET_TTL_SEC = 6 * 60 * 60
+# Bumped whenever the fleet payload's meaning changes, so a cache written by
+# an older build is refetched instead of served for up to 6 h under the new
+# labels. 2: owner exclusion, rendered installs, rolling weekly active,
+# per-install pack losses (2026-10-14). 3: LIMIT 10000 on row series.
+USAGE_FLEET_SCHEMA = 3
 _USAGE_LOG_LOCK = threading.Lock()
 
 # Keys that must never appear in an event payload. This is defense in depth,
@@ -17468,8 +17696,22 @@ def _analytics_is_test_rig() -> bool:
     + no-geo-or-IL" heuristic re-derived by hand each time (see
     sys-fleet/q.py in the flow-review folder for that heuristic — this
     replaces the need for it going forward, on every install that sets
-    the var)."""
-    return _optional_bool_env("PHOSPHENE_TEST_RIG") is True
+    the var).
+
+    2026-10-14: PostHog held ZERO events with test_rig=true, ever. The
+    variable is real, but nothing that starts a panel on the maintainer's
+    Mac sets it: Pinokio launches start.js with its own environment, and a
+    clean-room install is a fresh Pinokio app. So the rule also accepts a
+    MARKER FILE, ~/.phosphene-test-rig — one `touch` on the maintainer's Mac
+    and every install there, however it was launched, is tagged. An explicit
+    PHOSPHENE_TEST_RIG=0 still wins (to test the untagged path)."""
+    env = _optional_bool_env("PHOSPHENE_TEST_RIG")
+    if env is not None:
+        return env
+    try:
+        return ANALYTICS_TEST_RIG_MARKER.exists()
+    except OSError:
+        return False
 
 
 def _analytics_key() -> str:
@@ -17672,10 +17914,7 @@ def _analytics_chip_family() -> str:
         return _CHIP_FAMILY_CACHE
     family = "unknown"
     try:
-        brand = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True, text=True, errors="replace", timeout=2,
-        ).stdout.strip()
+        brand = hostinfo.chip_brand()
         m = _CHIP_FAMILY_RE.search(brand)
         if m:
             family = f"M{m.group(1)}" + (f" {m.group(2).title()}" if m.group(2) else "")
@@ -18624,6 +18863,13 @@ def _analytics_render_event(job: dict) -> None:
             props["watchdog_retry"] = True
         if job.get("watchdog_phase") in WATCHDOG_PHASES:
             props["watchdog_phase"] = job["watchdog_phase"]
+        # 4.19.2: a helper that died from a signal - what its last native
+        # line was (closed class) and how far it got. Failures only.
+        if status != "done":
+            if job.get("crash_line") in CRASH_LINES:
+                props["crash_line"] = job["crash_line"]
+            if job.get("crash_phase") in CRASH_PHASES:
+                props["crash_phase"] = job["crash_phase"]
         # wall_sec_bucket only when the wall clock is known — a None would
         # just pollute the percentile aggregation it exists to feed.
         wall = _analytics_wall_sec_bucket(job.get("elapsed_sec"))
@@ -18717,7 +18963,7 @@ def _usage_log_read(max_age_days: float | None = None) -> list[dict]:
     is append-only from several threads and a torn last line is possible."""
     out: list[dict] = []
     try:
-        raw = USAGE_LOG_FILE.read_text(encoding="utf-8", errors="replace")
+        raw = USAGE_LOG_READ_FILE.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return out
     cutoff = (time.time() - max_age_days * 86400) if max_age_days else None
@@ -18791,6 +19037,8 @@ def _usage_local_report(range_key: str = STATS_RANGE_DEFAULT) -> dict:
     total_renders = 0
     renders_by_day: dict[str, int] = {}
     first_boot_ts = None
+    pack_seq: dict[str, list] = {}
+    last_boot_ts = 0.0
 
     for rec in recs:
         try:
@@ -18858,11 +19106,22 @@ def _usage_local_report(range_key: str = STATS_RANGE_DEFAULT) -> dict:
             k = (str(props.get("pack") or "?"),
                  bool(props.get("from")), bool(props.get("to")))
             flips[k] = flips.get(k, 0) + 1
+            pack_seq.setdefault(k[0], []).append((ts, k[1], k[2]))
+        if ev == "app_boot":
+            last_boot_ts = max(last_boot_ts, ts)
 
     flip_rows = [{"pack": p, "from": f, "to": t, "count": c}
                  for (p, f, t), c in sorted(flips.items(), key=lambda kv: -kv[1])]
     h3_lost = sum(r["count"] for r in flip_rows
                   if r["pack"] == "h3" and r["from"] and not r["to"])
+    # Same per-install shape as the fleet's pack_losses (this Mac = 1 install).
+    _loss_rows, _boot_rows = [], [("local", last_boot_ts)] if last_boot_ts else []
+    for _pk, _seq in pack_seq.items():
+        _seq.sort()
+        _lost = [t for t, f, to in _seq if f and not to]
+        if _lost:
+            _loss_rows.append((_pk, "local", _seq[-1][2], max(_lost)))
+    pack_losses = _usage_pack_loss_summary(_loss_rows, _boot_rows)
 
     error_group_rows = []
     for cls, g in error_groups.items():
@@ -18896,6 +19155,8 @@ def _usage_local_report(range_key: str = STATS_RANGE_DEFAULT) -> dict:
             "active_in_range": 1 if active_in_range else 0,
             "total_renders": total_renders,
             "total_installs": 1 if first_boot_ts else 0,
+            "rendered_installs": 1 if total_renders else 0,
+            "never_rendered_installs": 1 if (first_boot_ts and not total_renders) else 0,
             "renders_in_range": renders_in_range,
             "h3_share_pct": round(100.0 * h3_in_range / tot_in_range, 1) if tot_in_range else None,
             "error_rate_pct": (round(100.0 * fail_in_range / (ok_in_range + fail_in_range), 1)
@@ -18919,7 +19180,8 @@ def _usage_local_report(range_key: str = STATS_RANGE_DEFAULT) -> dict:
         "versions": _usage_rank(versions, "version"),
         "chips": _usage_rank(chips, "chip"),
         "ram": _usage_rank(rams, "ram_gb"),
-        "pack_flips": {"h3_lost": h3_lost, "rows": flip_rows},
+        "pack_flips": {"h3_lost": h3_lost, "rows": flip_rows,
+                       "losses": pack_losses},
         "events_logged": len(recs),
     }
 
@@ -18935,6 +19197,66 @@ def _usage_local_report(range_key: str = STATS_RANGE_DEFAULT) -> dict:
 # real user. Every query is built through _fleet_where[_raw] so a new one
 # can't repeat either omission.
 _TEST_RIG_EXCLUDE = "ifNull(properties['test_rig'], 'false') != 'true'"
+
+_OWNER_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_OWNER_FP_VALUE_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,40}$")
+_OWNER_FP_PROPS = {"country": "$geoip_country_code", "chip_family": "chip_family",
+                   "ram_gb": "ram_gb"}
+
+
+def _owner_exclusion_sql() -> str:
+    """HogQL clause dropping the maintainer's own installs, or "".
+
+    Why a second rule next to test_rig: test_rig only tags events sent
+    AFTER an install learned to set it, and on 2026-10-14 no event had ever
+    carried it. Measured that day: one machine class, M4 Max / 64 GB, held
+    467 installs of which 79% booted once and never rendered, against
+    6-25% for every other class — the maintainer's clean-room installs and
+    test boots, counted as users. Since geo-IP was switched back on
+    (2026-09-19) the same machine is identifiable by country.
+
+    ANALYTICS_OWNER_FILE (local, private) holds
+        {"install_ids": ["<uuid>", ...],
+         "fingerprints": [{"country": "IL", "chip_family": "M4 Max",
+                           "ram_gb": 64}]}
+    install_ids are the ids found in the maintainer's own state dirs;
+    a fingerprint drops every install that EVER reported all of its fields.
+    Values are validated (uuid / short [A-Za-z0-9 ._-]) before they reach a
+    query; anything else is skipped, so a bad file can narrow nothing but
+    itself."""
+    try:
+        data = json.loads(ANALYTICS_OWNER_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    parts: list[str] = []
+    ids = sorted({str(i).strip().lower() for i in (data.get("install_ids") or [])
+                  if _OWNER_ID_RE.match(str(i).strip().lower())})
+    if ids:
+        parts.append("distinct_id NOT IN (" + ", ".join(f"'{i}'" for i in ids) + ")")
+    for fp in (data.get("fingerprints") or []):
+        if not isinstance(fp, dict):
+            continue
+        conds = []
+        for key, prop in _OWNER_FP_PROPS.items():
+            if key not in fp:
+                continue
+            v = fp[key]
+            if isinstance(v, bool):
+                conds = []
+                break
+            if isinstance(v, (int, float)):
+                conds.append(f"properties['{prop}'] = {float(v):g}")
+            elif isinstance(v, str) and _OWNER_FP_VALUE_RE.match(v):
+                conds.append(f"properties['{prop}'] = '{v}'")
+            else:
+                conds = []
+                break
+        if conds:
+            parts.append("distinct_id NOT IN (SELECT distinct_id FROM events WHERE "
+                         + " AND ".join(conds) + ")")
+    return " AND ".join(parts)
 
 
 def _fleet_window_sql(range_key: str, *, prior: bool = False) -> str:
@@ -18960,6 +19282,9 @@ def _fleet_where_raw(event_clause: str, window_sql: str = "") -> str:
     if window_sql:
         parts.append(window_sql)
     parts.append(_TEST_RIG_EXCLUDE)
+    owner = _owner_exclusion_sql()
+    if owner:
+        parts.append(owner)
     return " AND ".join(parts)
 
 
@@ -18994,7 +19319,7 @@ def _fleet_queries(range_key: str) -> dict[str, str]:
         "boots_by_day":
             "SELECT toDate(timestamp) AS d, count() AS c FROM events WHERE "
             + _fleet_where("event = 'app_boot'", range_key)
-            + " GROUP BY d ORDER BY d",
+            + " GROUP BY d ORDER BY d LIMIT 10000",
         "engines":
             "SELECT properties['engine'] AS e, count() AS c FROM events WHERE "
             + _fleet_where(ev_render, range_key) + " GROUP BY e ORDER BY c DESC",
@@ -19074,31 +19399,67 @@ def _fleet_queries(range_key: str) -> dict[str, str]:
         # it is NEW on the day of its first boot — app_installed fires once
         # per install but only since it existed, so first-boot is the honest
         # date.
+        # Day series carry an explicit LIMIT: HogQL's default is 100 rows,
+        # and the archive passes 100 days in Nov 2026 — the all-time
+        # install curve would have stopped short of today without a word.
         "total_renders":
             "SELECT count() FROM events WHERE "
             + _fleet_where_raw("event = 'render_completed'"),
         "total_installs":
             "SELECT count(DISTINCT distinct_id) FROM events WHERE "
             + _fleet_where_raw("event = 'app_boot'"),
+        # The user number (2026-10-14). An install that never finished a
+        # render is a failed install, a reinstall that minted a new id, or a
+        # test boot — 1,129 of the 2,453 "installs" that day had booted
+        # exactly once. Finishing one render is the line a person crosses.
+        "rendered_installs":
+            "SELECT count(DISTINCT distinct_id) FROM events WHERE "
+            + _fleet_where_raw("event = 'render_completed'"),
         "installs_by_day":
             "SELECT d, count() AS c FROM (SELECT distinct_id, toDate(min(timestamp)) AS d "
             "FROM events WHERE " + _fleet_where_raw("event = 'app_boot'")
-            + " GROUP BY distinct_id) GROUP BY d ORDER BY d",
+            + " GROUP BY distinct_id) GROUP BY d ORDER BY d LIMIT 10000",
         "renders_by_day":
             "SELECT toDate(timestamp) AS d, count() AS c FROM events WHERE "
             + _fleet_where("event = 'render_completed'", range_key)
-            + " GROUP BY d ORDER BY d",
-        # Complete weeks only: the running week would read as a collapse
-        # ("552 → 106") on a Sunday morning. Fixed 12-week context window,
-        # independent of the dashboard's range control on purpose — this is
-        # an evergreen "is the app growing" curve, not a range-scoped tile.
+            + " GROUP BY d ORDER BY d LIMIT 10000",
+        # ONE definition of "weekly active": installs that opened Phosphene
+        # in a 7 x 24 h window. The curve is twelve such windows laid back to
+        # back ENDING NOW, so its last point IS the weekly-active tile. It
+        # used to be calendar weeks (complete Sunday-Saturday weeks only)
+        # while the tile was the rolling last 7 days: "weekly active
+        # 298 -> 316" under a tile reading 327, the same words for two
+        # numbers. k = whole weeks before now; 0 is the current window.
         "active_by_week":
-            "SELECT toStartOfWeek(timestamp) AS w, count(DISTINCT distinct_id) AS c "
-            "FROM events WHERE "
+            "SELECT intDiv(dateDiff('second', timestamp, now()), 604800) AS k, "
+            "count(DISTINCT distinct_id) AS c FROM events WHERE "
             + _fleet_where_raw("event = 'app_boot'",
-                               "timestamp > now() - INTERVAL 12 WEEK "
-                               "AND toStartOfWeek(timestamp) < toStartOfWeek(now())")
-            + " GROUP BY w ORDER BY w",
+                               "timestamp > now() - INTERVAL 84 DAY")
+            + " GROUP BY k ORDER BY k DESC",
+        # Per install, per pack: did it lose the pack in the range, and what
+        # is its state at the LAST change? `pack_flips` above counts EVENTS,
+        # and a pack missing at one launch and back at the next is two of
+        # them: 6 of the 8 "H3 went from installed to missing" events in the
+        # week to 2026-10-14 were back by a later launch, four within an
+        # hour — launches that landed mid-Update, not broken installs.
+        "pack_losses":
+            "SELECT properties['pack'] AS pack, distinct_id, "
+            "argMax(properties['to'], timestamp) AS last_to, "
+            "maxIf(timestamp, properties['to'] = 'false') AS lost_at FROM events WHERE "
+            + _fleet_where("event = 'pack_state_change'", range_key)
+            + " GROUP BY pack, distinct_id "
+            "HAVING countIf(properties['from'] = 'true' AND properties['to'] = 'false') > 0"
+            # HogQL returns 100 rows unless told otherwise; the all-time run
+            # came back with exactly 100 and silently dropped the rest.
+            " LIMIT 10000",
+        # Last launch per install in the range — any launch after a loss
+        # falls inside the range too. A flat GROUP BY: the earlier
+        # `distinct_id IN (losses subquery)` form timed out on every
+        # attempt for 30d and all-time.
+        "pack_loss_last_boot":
+            "SELECT distinct_id, max(timestamp) FROM events WHERE "
+            + _fleet_where("event = 'app_boot'", range_key)
+            + " GROUP BY distinct_id LIMIT 10000",
     }
 
 
@@ -19120,6 +19481,84 @@ def _usage_growth_block(installs_by_day: list, renders_by_day: list,
     }
 
 
+def _usage_parse_ts(v) -> float | None:
+    """A HogQL timestamp ('2026-10-09T08:42:11Z', '...+00:00', or with a
+    space) as epoch seconds, or None."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    from datetime import datetime, timezone
+    txt = str(v).strip().replace(" ", "T")
+    if txt.endswith("Z"):
+        txt = txt[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(txt)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _usage_rolling_weeks(rows: list, now: float | None = None) -> list:
+    """active_by_week rows [(k, installs)] -> [(window_end_date, installs)],
+    oldest first. k is whole 7-day windows before now; the window k ends at
+    now - 7k days and is labelled by that end date (UTC)."""
+    now = time.time() if now is None else now
+    out = []
+    for r in rows:
+        try:
+            k, c = int(r[0]), int(r[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if k < 0 or k > 11:
+            continue  # the 84-day window can spill one partial 13th bucket
+        out.append((time.strftime("%Y-%m-%d", time.gmtime(now - k * 7 * 86400)), c, k))
+    out.sort(key=lambda t: -t[2])
+    return [(d, c) for d, c, _k in out]
+
+
+def _usage_pack_loss_summary(loss_rows: list, last_boot_rows: list | None) -> dict:
+    """{pack: {"installs", "recovered", "still_missing", "not_seen_since",
+    "unconfirmed"}}.
+
+    One entry per install that LOST the pack (installed -> missing) in the
+    range. `recovered`: its latest pack change put the pack back — missing at
+    one launch, present at a later one (the launch-during-Update pattern).
+    `still_missing`: still gone, and the install has launched again since,
+    so a later boot confirmed it. `not_seen_since`: still gone at the last
+    launch we know of, which was the launch that noticed — nothing confirms
+    or clears it yet. `unconfirmed`: not recovered, and the last-launch query
+    failed (last_boot_rows is None) — never guessed into either bucket."""
+    last_boot: dict[str, float] = {}
+    for r in last_boot_rows or []:
+        try:
+            ts = _usage_parse_ts(r[1])
+        except (IndexError, TypeError):
+            continue
+        if ts is not None:
+            last_boot[str(r[0])] = ts
+    out: dict[str, dict] = {}
+    for r in loss_rows or []:
+        if not (isinstance(r, (list, tuple)) and len(r) >= 4):
+            continue
+        pack, did, last_to, lost_at = str(r[0] or "?"), str(r[1]), r[2], _usage_parse_ts(r[3])
+        b = out.setdefault(pack, {"installs": 0, "recovered": 0,
+                                  "still_missing": 0, "not_seen_since": 0,
+                                  "unconfirmed": 0})
+        b["installs"] += 1
+        if str(last_to).lower() in ("true", "1"):
+            b["recovered"] += 1
+        elif last_boot_rows is None:
+            b["unconfirmed"] += 1
+        elif lost_at is not None and last_boot.get(did, 0) > lost_at + 60:
+            b["still_missing"] += 1
+        else:
+            b["not_seen_since"] += 1
+    return out
+
+
 def _usage_fleet_query_one(hogql: str, key: str) -> list:
     """Run one HogQL query. Returns the `results` rows, or [] on any error.
 
@@ -19136,7 +19575,9 @@ def _usage_fleet_query_one(hogql: str, key: str) -> list:
                  "User-Agent": "phosphene-panel-stats"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    # 25 s: the owner-exclusion subqueries make the all-time queries heavier,
+    # and at 10 s the all-range pack query timed out on every attempt.
+    with urllib.request.urlopen(req, timeout=25) as resp:
         data = json.loads(resp.read().decode("utf-8", "replace"))
     rows = data.get("results")
     return rows if isinstance(rows, list) else []
@@ -19168,13 +19609,28 @@ def _usage_fleet_report(range_key: str = STATS_RANGE_DEFAULT) -> dict | None:
         return None
     queries = _fleet_queries(range_key)
     res: dict[str, list] = {}
-    failures = 0
-    for name, hogql in queries.items():
-        try:
-            res[name] = _usage_fleet_query_one(hogql, key)
-        except Exception:
-            res[name] = []
-            failures += 1
+    failed: set[str] = set()
+
+    # Four at a time, one retry each. Run one after another, 24 queries took
+    # over a minute per range, and a single 10 s timeout under load blanked
+    # its tile — the measured 2026-10-14 run lost total_installs,
+    # total_renders and the pack queries to exactly that ("partial").
+    def _run(item):
+        name, hogql = item
+        for attempt in (1, 2):
+            try:
+                return name, _usage_fleet_query_one(hogql, key), True
+            except Exception:
+                if attempt == 2:
+                    return name, [], False
+                time.sleep(1.5)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="phos-fleet-q") as ex:
+        for name, rows, ok in ex.map(_run, queries.items()):
+            res[name] = rows
+            if not ok:
+                failed.add(name)
+    failures = len(failed)
     if failures == len(queries):
         return None
 
@@ -19217,8 +19673,28 @@ def _usage_fleet_report(range_key: str = STATS_RANGE_DEFAULT) -> dict | None:
         })
     h3_lost = sum(r["count"] for r in flip_rows
                   if r["pack"] == "h3" and r["from"] and not r["to"])
+    pack_losses = _usage_pack_loss_summary(
+        res.get("pack_losses") or [],
+        None if "pack_loss_last_boot" in failed else (res.get("pack_loss_last_boot") or []))
 
+    weeks = _usage_rolling_weeks(res.get("active_by_week") or [])
+    # Drop a window that starts before the first install ever reported: it
+    # is part-empty by construction and would draw as a collapse.
+    _first = next((str(r[0]) for r in (res.get("installs_by_day") or [])
+                   if isinstance(r, (list, tuple)) and r), None)
+    if _first:
+        import calendar
+        weeks = [(d, c) for d, c in weeks
+                 if time.strftime("%Y-%m-%d", time.gmtime(
+                     calendar.timegm(time.strptime(d, "%Y-%m-%d")) - 7 * 86400)) >= _first[:10]]
+    # The weekly-active tile IS the curve's last window (k == 0), so the two
+    # can never disagree; the stand-alone 'wau' query is the fallback.
+    wau = next((c for d, c in weeks[-1:]), None) if weeks else None
+    if wau is None:
+        wau = _scalar("wau")
     active_n = _scalar("active_in_range")
+    if range_key == "7d" and wau is not None:
+        active_n = wau
     active_prior_n = _scalar("active_in_range_prior")
     error_rate_n = (round(100.0 * fail_n / (ok_n + fail_n), 1)
                     if (ok_n + fail_n) else None)
@@ -19247,10 +19723,15 @@ def _usage_fleet_report(range_key: str = STATS_RANGE_DEFAULT) -> dict | None:
         "note": "",
         "partial": failures > 0,
         "tiles": {
-            "weekly_active_installs": _scalar("wau"),
+            "weekly_active_installs": wau,
             "daily_active_installs": _scalar("dau"),
             "total_renders": _scalar("total_renders"),
             "total_installs": _scalar("total_installs"),
+            "rendered_installs": _scalar("rendered_installs"),
+            "never_rendered_installs": (
+                max(0, int(_scalar("total_installs")) - int(_scalar("rendered_installs")))
+                if _scalar("total_installs") is not None
+                and _scalar("rendered_installs") is not None else None),
             "active_in_range": active_n,
             "renders_in_range": ok_n + fail_n,
             "h3_share_pct": round(100.0 * h3 / tot, 1) if tot else None,
@@ -19282,8 +19763,7 @@ def _usage_fleet_report(range_key: str = STATS_RANGE_DEFAULT) -> dict | None:
              if isinstance(r, (list, tuple)) and len(r) >= 2],
             [(r[0], r[1]) for r in (res.get("renders_by_day") or [])
              if isinstance(r, (list, tuple)) and len(r) >= 2],
-            [(r[0], r[1]) for r in (res.get("active_by_week") or [])
-             if isinstance(r, (list, tuple)) and len(r) >= 2]),
+            weeks),
         "boots_by_day": [{"date": str(r[0]), "count": int(r[1])}
                          for r in (res.get("boots_by_day") or [])
                          if isinstance(r, (list, tuple)) and len(r) >= 2],
@@ -19309,7 +19789,9 @@ def _usage_fleet_report(range_key: str = STATS_RANGE_DEFAULT) -> dict | None:
         "ram": [{"ram_gb": str(r[0] or "unknown"), "count": int(r[1])}
                 for r in (res.get("ram") or [])
                 if isinstance(r, (list, tuple)) and len(r) >= 2],
-        "pack_flips": {"h3_lost": h3_lost, "rows": flip_rows},
+        "pack_flips": {"h3_lost": h3_lost, "rows": flip_rows,
+                       "losses": pack_losses},
+        "owner_excluded": bool(_owner_exclusion_sql()),
     }
 
 
@@ -19362,7 +19844,8 @@ def _usage_report(force: bool = False, range_key: str = STATS_RANGE_DEFAULT) -> 
                 try:
                     all_cached = json.loads(USAGE_FLEET_CACHE.read_text(encoding="utf-8"))
                     cached = all_cached.get(range_key) if isinstance(all_cached, dict) else None
-                    if (cached and time.time() - float(cached.get("_fetched_at") or 0)
+                    if (cached and cached.get("_schema") == USAGE_FLEET_SCHEMA
+                            and time.time() - float(cached.get("_fetched_at") or 0)
                             < USAGE_FLEET_TTL_SEC):
                         cached = dict(cached)
                         cached["cached"] = True
@@ -19377,6 +19860,7 @@ def _usage_report(force: bool = False, range_key: str = STATS_RANGE_DEFAULT) -> 
                 fleet = None
             if fleet:
                 fleet["_fetched_at"] = time.time()
+                fleet["_schema"] = USAGE_FLEET_SCHEMA
                 fleet["fleet_blocked"] = ""
                 try:
                     _ensure_state_dir()
@@ -19605,32 +20089,12 @@ def ltx_mode_price_card(mode: str, steps: int | None = None, *,
 
 def get_memory() -> dict:
     info = {"total_gb": 0.0, "used_gb": 0.0, "pressure_pct": 0, "swap_gb": 0.0}
-    try:
-        total = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, errors="replace", timeout=1).stdout.strip())
-        info["total_gb"] = total / 1024**3
-        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, errors="replace", timeout=1).stdout
-        m = re.search(r"page size of (\d+)", vm)
-        page_size = int(m.group(1)) if m else 16384
-
-        def pages(name: str) -> int:
-            mm = re.search(rf"{re.escape(name)}:\s+(\d+)", vm)
-            return int(mm.group(1)) if mm else 0
-
-        used_bytes = (pages("Pages active") + pages("Pages wired down")
-                      + pages("Pages occupied by compressor")) * page_size
-        info["used_gb"] = used_bytes / 1024**3
-        info["pressure_pct"] = round(used_bytes / total * 100) if total else 0
-
-        swap = subprocess.run(["sysctl", "-n", "vm.swapusage"],
-            capture_output=True, text=True, errors="replace", timeout=1).stdout
-        m = re.search(r"used\s*=\s*([\d.]+)([KMG])", swap)
-        if m:
-            v = float(m.group(1))
-            mult = {"K": 1 / 1024 / 1024, "M": 1 / 1024, "G": 1.0}[m.group(2)]
-            info["swap_gb"] = v * mult
-    except Exception:
-        pass
+    mem = hostinfo.memory_usage()
+    total = mem["total"]
+    info["total_gb"] = total / 1024**3
+    info["used_gb"] = mem["used"] / 1024**3
+    info["pressure_pct"] = round(mem["used"] / total * 100) if total else 0
+    info["swap_gb"] = mem["swap_used"] / 1024**3
     # SYS-19: `pressure_pct` above (active+wired+compressed / total) is a
     # USED ratio, not a pressure signal — plan_memory_policy() above
     # deliberately keeps using it exactly as-is (its 82%+swap>=4GB
@@ -19644,14 +20108,7 @@ def get_memory() -> dict:
     # jetsam-kill (1 normal / 2 warning / 3 critical) — a genuine pressure
     # level, not a used ratio. New field, additive; nothing that reads
     # pressure_pct changes.
-    try:
-        lvl = subprocess.run(
-            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
-            capture_output=True, text=True, errors="replace", timeout=1,
-        ).stdout.strip()
-        info["pressure_level"] = int(lvl) if lvl.isdigit() else 1
-    except Exception:
-        info["pressure_level"] = 1
+    info["pressure_level"] = hostinfo.pressure_level()
     return info
 
 
@@ -19966,6 +20423,53 @@ def ltx_grid_frames_up(frames: int) -> int:
 # The longest clip the ×2 lane renders whole unless the form asks for more:
 # a 5 s H3 High render (124 frames) on its LTX grid (129). Measured there.
 UPSCALE_FULL_CLIP_FRAMES = 129
+
+
+# Upscale ×2 safety rail: the lane doubles the source canvas, and above QHD
+# the output exhausted 96 GB + swap (3072×1792 did, 2026-10-12). Refused at
+# queue time, in the form's own words, instead of after a long render.
+# The limit is QHD's PIXEL COUNT (2560×1440 = 3.7 MP), whatever the shape — a
+# portrait 1440×2560 or a square 1536×1536 costs no more memory than landscape
+# QHD — and it is judged on the canvas the lane will actually render (the
+# tier's own size cap included), not on a blind ×2.
+UPSCALE_MAX_OUTPUT_W = 2560
+UPSCALE_MAX_OUTPUT_H = 1440
+
+
+def upscale_output_canvas(src_w, src_h) -> tuple[int, int] | None:
+    """The canvas an Upscale ×2 of a src_w×src_h clip renders at on this Mac,
+    or None when the size is unknown or the tier refuses it anyway (scale
+    < 1.25 has its own sentence). The worker's own arithmetic, shared."""
+    try:
+        sw, sh = int(src_w or 0), int(src_h or 0)
+    except (TypeError, ValueError):
+        return None
+    if sw <= 0 or sh <= 0:
+        return None
+    cap = int(tier_max_dim("i2v") or 0) or max(sw, sh) * 2
+    scale = min(2.0, cap / float(max(sw, sh)))
+    if scale < 1.25:
+        return None
+    return ltx_floor_canvas(int(sw * scale), int(sh * scale))
+
+
+def upscale_output_refusal(src_w, src_h) -> str | None:
+    """None if the ×2 of a src_w×src_h clip fits within QHD, else the sentence."""
+    canvas = upscale_output_canvas(src_w, src_h)
+    if not canvas:
+        return None
+    out_w, out_h = canvas
+    # PIXELS, not a rectangle (Codex 4.19.2): a square 768 source becomes
+    # 1536x1536 - 2.4 MP, well under QHD's 3.7 MP - and a box test refused it.
+    if out_w * out_h <= UPSCALE_MAX_OUTPUT_W * UPSCALE_MAX_OUTPUT_H:
+        return None
+    sw, sh = int(src_w), int(src_h)
+    portrait = sh > sw
+    lim_w, lim_h = ((UPSCALE_MAX_OUTPUT_H, UPSCALE_MAX_OUTPUT_W) if portrait
+                    else (UPSCALE_MAX_OUTPUT_W, UPSCALE_MAX_OUTPUT_H))
+    return (f"The source is {sw}×{sh}; ×2 would be {out_w}×{out_h}, above the "
+            f"{lim_w}×{lim_h} limit. Render the source at "
+            f"{lim_w // 2}×{lim_h // 2} or smaller.")
 
 
 def upscale_frame_plan(src_frames: int, form_frames=None) -> tuple[int, int]:
@@ -21199,6 +21703,9 @@ class WarmHelper:
         # The phase the helper was in at its last line - a watchdog kill is
         # remembered with it ("encode" / "load" / "denoise" / "decode").
         self._last_phase = ""
+        # 4.19.2: the closed class of the last native error line the helper
+        # printed (crash_line_class) - what a SIGABRT actually said.
+        self._crash_line = ""
         # What the helper said on its way out. A helper that dies during
         # startup prints its traceback and exits, and the panel used to
         # report only the bookkeeping event — `helper failed to start:
@@ -21437,6 +21944,17 @@ class WarmHelper:
                     return None
                 if not chunk:
                     # EOF — helper closed stdout (likely crashed or was killed).
+                    # A native abort's last words can arrive WITHOUT a final
+                    # newline; they used to be dropped here unread, so the
+                    # watchdog line that names the crash never reached the
+                    # sniffer (4.19.2).
+                    _tail = self._read_carry.decode("utf-8", "replace").strip()
+                    self._read_carry = b""
+                    if _tail:
+                        push(_tail)
+                        if collect_tail is not None:
+                            collect_tail.append(_tail)
+                        self._sniff_helper_line(_tail)
                     return None
                 self._read_carry += chunk
                 continue  # loop back to drain complete lines from the buffer
@@ -21630,6 +22148,9 @@ class WarmHelper:
             self._metal_timeout_seen = True
         if not self._past_prompt_encode and self._PAST_PROMPT_ENCODE_RX.search(line):
             self._past_prompt_encode = True
+        _cls = crash_line_class(line)
+        if _cls:
+            self._crash_line = _cls
         for _rx, _phase in self._PHASE_RX:
             if _rx.search(line):
                 self._last_phase = _phase
@@ -21724,11 +22245,13 @@ class WarmHelper:
                     if short and key and not cancelled:
                         # The store now refuses this setting for a day; say
                         # so, with the way out.
+                        _way = metal_watchdog_way((params or {}).get("mode"),
+                                                  self._last_phase)
                         raise RuntimeError(
                             f"{exc} This render already ran in short GPU steps, "
-                            f"so this size is not started again on this Mac for "
-                            f"24 hours - press Retry smaller, or pick a lower "
-                            f"quality or a shorter clip.") from exc
+                            f"so this size is not started again on this Mac "
+                            f"{metal_watchdog_pause_words(self._last_phase)}. "
+                            f"{_way}.") from exc
                     raise
                 if gemma:
                     self.gemma_max_length = self.GEMMA_FALLBACK_MAX_LENGTH
@@ -21757,6 +22280,7 @@ class WarmHelper:
         self._metal_timeout_seen = False
         self._past_prompt_encode = False
         self._last_phase = ""
+        self._crash_line = ""
         # Whole-run serialization so concurrent callers don't both park in
         # _read_until and grab each other's done/error events. See __init__
         # for why this is distinct from self.lock.
@@ -21864,15 +22388,18 @@ class WarmHelper:
                     # LTX2_GEMMA_MAX_LENGTH, which upstream reads in
                     # PromptEncoder.encode; see the Gemma fallback block
                     # below, which arms it automatically on a detected kill.
+                    # 4.19.2: this sentence used to QUOTE the watchdog line
+                    # ("Caused GPU Timeout Error") as an example - and the
+                    # error classifier matched the quote, so every unexplained
+                    # SIGABRT was counted as the GPU watchdog (24 of 4.19.1's
+                    # 37 "watchdog" failures: no such line, no retry). The
+                    # watchdog has its own sentence below, used only when
+                    # its line really is in the log.
                     "SIGABRT": (
-                        "C-level abort. If the log shows '[METAL] Command buffer "
-                        "execution failed: Caused GPU Timeout Error', this is the "
-                        "macOS GPU watchdog killing an over-long Metal command "
-                        "buffer (seen on M1/M2-class GPUs during prompt encoding). "
-                        "Phosphene retries prompt encoding once at a shorter "
-                        "padded length when it sees that line; if it never "
-                        "reached the panel, please open an issue with your chip "
-                        "+ macOS version and the crashlog at "
+                        "C-level abort inside the render engine; no GPU "
+                        "watchdog line reached the panel. Please open an issue "
+                        "with your chip + macOS version, the last lines of the "
+                        "Logs tab, and the crashlog at "
                         "~/Library/Logs/DiagnosticReports/python3.11_*.ips"
                     ),
                     "SIGBUS":  "memory access fault — could indicate a Metal driver issue or a bad weight file",
@@ -21881,6 +22408,15 @@ class WarmHelper:
                 # log, stop hedging — name it outright and say what we already
                 # tried. The conditional SIGABRT wording above still covers the
                 # case where the line never reached us.
+                # 4.19.2: closed words for the fleet - what the last native
+                # line said and which phase the helper had reached ("start" =
+                # before its first step line). Never the line itself.
+                _cj = _thread_job()
+                if _cj is not None:
+                    _cj["crash_line"] = self._crash_line or "none"
+                    _cj["crash_phase"] = (self._last_phase
+                                          if self._last_phase in WATCHDOG_PHASES
+                                          else "start")
                 if self._metal_timeout_seen:
                     _tried = (
                         f" Prompt encoding was already retried at "
@@ -23426,7 +23962,13 @@ def take_expects_speech(params: dict, beats: list[str] | None = None) -> bool:
     shot with no mouth in it."""
     if (params.get("character_id") or "").strip():
         return True
-    text = " ".join([str(params.get("prompt") or "")] + [str(b) for b in (beats or [])])
+    # A part is judged by ITS OWN windows when it has any. The parent prompt
+    # carries every part's lines, so reading it made a part whose beats hold no
+    # speech at all (the second half of a 30 s one shot whose dialogue sat in
+    # the first) a "spoken" part: the gate scored a mouth with nothing to follow
+    # (-0.15) and spent two more 17-minute renders retaking it (2026-10-07).
+    own = [str(b) for b in (beats or []) if str(b or "").strip()]
+    text = " ".join(own) if own else str(params.get("prompt") or "")
     return bool(re.search(r'[“"][^”"]{2,}[”"]', text))
 
 
@@ -30705,7 +31247,17 @@ A2V_SEPARATOR_INSTALL: dict = {"state": "idle", "active": False}
 # after that. OFF until __main__ turns it on (a2v_separator_boot): importing
 # the panel from a test or a gate must never pip-install into a real venv.
 # PHOSPHENE_SEPARATOR_AUTOINSTALL=0 keeps it off for a test rig.
-A2V_SEPARATOR_AUTO: dict = {"enabled": False, "attempted": False}
+A2V_SEPARATOR_AUTO: dict = {"enabled": False, "attempted": False, "attempts": 0}
+# 4.19.2 (fleet: 12 of the week's 16 separator failures were the panel's ONE
+# automatic attempt at boot, most of them the network or a timeout). After a
+# failure like that, a voice-only job that needs the separator may start one
+# more automatic attempt once the failure is A2V_SEPARATOR_RETRY_AFTER_S old -
+# a connection that dropped at boot is often back by the time someone renders.
+# At most A2V_SEPARATOR_AUTO_MAX per panel process, and never for a cause that
+# fails the same way again (a resolver conflict, a full disk).
+A2V_SEPARATOR_AUTO_MAX = 3
+A2V_SEPARATOR_RETRY_AFTER_S = 600
+A2V_SEPARATOR_TRANSIENT_CAUSES = ("network", "timeout")
 A2V_SEPARATOR_TRIGGERS = ("boot", "job", "form")
 #: How long a voice-only job waits for an install before giving up. The
 #: install's own subprocess limit; a torch-less venv downloads torch too.
@@ -30732,17 +31284,38 @@ def a2v_separator_auto_start(trigger: str) -> bool:
     with A2V_SEPARATOR_INSTALL_LOCK:
         if A2V_SEPARATOR_INSTALL.get("active"):
             return True
-        if not A2V_SEPARATOR_AUTO.get("enabled") or A2V_SEPARATOR_AUTO.get("attempted"):
+        if not A2V_SEPARATOR_AUTO.get("enabled"):
+            return False
+        if A2V_SEPARATOR_AUTO.get("attempted") and not _a2v_separator_may_retry(trigger):
             return False
     if a2v_separator_status()["ready"]:
         return False
     with A2V_SEPARATOR_AUTO_LOCK:
-        if A2V_SEPARATOR_AUTO.get("attempted"):
-            with A2V_SEPARATOR_INSTALL_LOCK:
-                return bool(A2V_SEPARATOR_INSTALL.get("active"))
+        with A2V_SEPARATOR_INSTALL_LOCK:
+            if A2V_SEPARATOR_INSTALL.get("active"):
+                return True
+            if A2V_SEPARATOR_AUTO.get("attempted") and not _a2v_separator_may_retry(trigger):
+                return False
         A2V_SEPARATOR_AUTO["attempted"] = True
+        A2V_SEPARATOR_AUTO["attempts"] = int(A2V_SEPARATOR_AUTO.get("attempts") or 0) + 1
     code, _ = a2v_separator_install_start(trigger)
     return code in (202, 409)
+
+
+def _a2v_separator_may_retry(trigger: str, now: float | None = None) -> bool:
+    """Caller holds A2V_SEPARATOR_INSTALL_LOCK. May a job start another
+    automatic attempt after the last one failed? Only for a cause that can
+    clear on its own, only once it is old enough, and only a few times."""
+    if trigger != "job":
+        return False
+    if int(A2V_SEPARATOR_AUTO.get("attempts") or 0) >= A2V_SEPARATOR_AUTO_MAX:
+        return False
+    if A2V_SEPARATOR_INSTALL.get("state") != "failed":
+        return False
+    if A2V_SEPARATOR_INSTALL.get("cause") not in A2V_SEPARATOR_TRANSIENT_CAUSES:
+        return False
+    done = float(A2V_SEPARATOR_INSTALL.get("finished_ts") or 0)
+    return (now if now is not None else time.time()) - done >= A2V_SEPARATOR_RETRY_AFTER_S
 
 
 A2V_SEPARATOR_AUTO_LOCK = threading.Lock()
@@ -30847,18 +31420,18 @@ def _a2v_separator_install_thread(trigger: str = "form") -> None:
     if error is None and not st["ready"]:
         error = "the install finished but the separator is still not importable"
         error_class = "import_failed"
+    _cause = (("timeout" if error_class == "timeout" else
+               str((_a2v_separator_record() or {}).get("cause") or ""))
+              if error else "")
     with A2V_SEPARATOR_INSTALL_LOCK:
         A2V_SEPARATOR_INSTALL.update(active=False, finished_ts=time.time(),
                                      state="failed" if error else "done",
-                                     error=error)
+                                     error=error, cause=_cause)
     push("[a2v] vocal separation " + (f"install failed: {error}" if error
                                       else "installed - Listen to the voice only is ready"))
     _analytics_separator_install(
         "failed" if error else "ok", f"panel_{trigger}", error_class,
-        ready=st["ready"], weights=st["weights"],
-        cause=("timeout" if error_class == "timeout" else
-               str((_a2v_separator_record() or {}).get("cause") or ""))
-        if error else "")
+        ready=st["ready"], weights=st["weights"], cause=_cause)
     # This run wrote the outcome record itself; mark it reported so the next
     # boot does not count it twice.
     _rec = _a2v_separator_record()
@@ -31145,6 +31718,51 @@ def job_input_refusal(params: dict) -> str | None:
         if not _exists(audio):
             return (f"audio file not found: {audio}. It was moved or deleted "
                     "after it was picked - pick it again in the Audio slot.")
+    elif m == "keyframe":
+        # 4.19.2 (fleet 4.19.1): a Keyframes job with no start image reached
+        # its turn and failed "start_image not found:" - checked here instead,
+        # the same two shapes run_job_inner accepts.
+        # On Hailuo H3 the start frame is optional (an end frame alone is the
+        # official last-frame task, h3_media_plan); on LTX both are needed.
+        free_start = str(p.get("engine") or "ltx").strip().lower() == "h3"
+        raw = str(p.get("keyframes_json") or "").strip()
+        imgs: list[str] = []
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                imgs = [normalize_pasted_path(str((k or {}).get("image_path") or "").strip())
+                        for k in parsed] if isinstance(parsed, list) else []
+            except (ValueError, TypeError, AttributeError):
+                imgs = []
+            if len(imgs) < 2:
+                return ("Keyframes needs at least two pictures - add a start and "
+                        "an end frame.")
+        else:
+            imgs = [_path("start_image"), _path("end_image")]
+            if not imgs[0] and not free_start:
+                return ("Keyframes needs a start frame - drop a picture into the "
+                        "Start slot.")
+            if not imgs[1]:
+                return ("Keyframes needs an end frame - drop a picture into the "
+                        "End slot.")
+        if free_start and imgs and not imgs[0]:
+            imgs = imgs[1:]
+        for img in imgs:
+            if not img or not _exists(img):
+                return (f"A keyframe picture is no longer on disk: {img}. It was "
+                        "moved, renamed or deleted after it was picked. Pick it "
+                        "again, or choose another picture.")
+    # 4.19.2 (fleet 4.19.1): a picked LoRA that had been moved or deleted
+    # failed in the helper after its turn ("LoRA file not found"). An ABSOLUTE
+    # path must be on disk now (the pickers send absolute paths). A Hugging
+    # Face repo id, or a relative name the helper resolves from its own folder,
+    # is left to the helper.
+    for entry in (p.get("loras") or []):
+        lp = str((entry or {}).get("path") or "").strip() if isinstance(entry, dict) else ""
+        if lp.startswith("/") and not Path(lp).is_file():
+            return (f"The LoRA {Path(lp).name} is no longer on disk ({lp}). It was "
+                    "moved or deleted after it was picked - pick it again, or "
+                    "un-pick it and render again.")
     return None
 
 
@@ -34487,6 +35105,9 @@ def queue_face_fix(source_path: str, *, board_id: str = "",
     # guess is not (one measurement at 1024×576 exists, not a table).
     target_w = target_h = None
     if sw and sh:
+        qhd = upscale_output_refusal(sw, sh)
+        if qhd:
+            return {"ok": False, "code": "hardware_tier", "error": qhd}
         cap = int(tier_max_dim("i2v") or 0) or max(sw, sh) * 2
         scale = min(2.0, cap / float(max(sw, sh)))
         if scale < 1.25:
@@ -35338,7 +35959,7 @@ def run_h3_job_inner(job: dict) -> None:
     cmd = [
         # caffeinate keeps the Mac awake for the whole render; being the
         # process-group leader means /stop's killpg takes both down together.
-        "caffeinate", "-i",
+        *hostinfo.keep_awake_prefix(),
         str(paths["python"]), str(paths["runner"]),
     ]
     # The positional prompt and `--chain-prompts` are MUTUALLY EXCLUSIVE on the
@@ -35519,6 +36140,8 @@ def run_h3_job_inner(job: dict) -> None:
     # Pinokio's bundled binary is not on the default PATH.
     env["PATH"] = media_tool_path(env.get("PATH", ""))
     env["PYTHONUNBUFFERED"] = "1"
+    for _k, _v in hostinfo.h3_env_defaults().items():
+        env.setdefault(_k, _v)
     # FP16 VAE decode — the default (h3_vae_fp16_decode()). Passed as the runner's
     # own flag so the argv says what ran; a runner that predates the flag
     # would reject it, so that case is said out loud instead of passed.
@@ -37893,6 +38516,11 @@ def run_job_inner(job: dict) -> None:
                 f"tier, and {source.name} is already {sw}×{sh}. Use a smaller "
                 "source clip.")
         up_w, up_h = ltx_floor_canvas(int(sw * scale), int(sh * scale))
+        # Above QHD the ×2 exhausted 96 GB + swap. Queue time refuses it; this
+        # catches every door that did not ask (a restored queue, a replay).
+        _qhd = upscale_output_refusal(sw, sh)
+        if _qhd:
+            raise RenderRefused("hardware_tier", _qhd)
         # The ×2 is the same clip: same frame count, same duration, same
         # sound. LTX's grid is 1+8k frames and the IC reference loader
         # rounds whatever it is given DOWN to that grid, so the render runs
@@ -38242,11 +38870,27 @@ def run_job_inner(job: dict) -> None:
         # LTX_INGREDIENTS_REF_STRENGTH for iteration; clamped to [0.0, 1.0].
         # Colorize keeps its own strength (curated default, pristine reference)
         # → byte-identical, this branch never touches it.
+        #
+        # 4.19.2 (issue #101: on 2.3 "the generated videos do not contain the
+        # reference images at all"). THE MEASUREMENTS ABOVE WERE TAKEN WITH NO
+        # ADAPTER. This lane forces Q4 and FUSED the IC-LoRA, and fusing re-
+        # quantises W + B@A back onto the int4 grid: measured on the real
+        # Ingredients adapter against real Q4 block weights (12 layers, PM hub
+        # rel4192/evidence/ing_fuse_retention.json) what survives differs from
+        # the intended delta by 0.3x-5x its own size, cosine 0.03-0.96, median
+        # ~0.2 - the adapter was mostly quantisation noise. Without it, a
+        # pinned sheet is copied (s=1.0, as measured) and a free one is
+        # forgotten (s=0.0 noises the reference tokens to pure noise at the
+        # first step - the reporter's renders). So the adapter now rides
+        # UNFUSED (the exact runtime wrapper Upscale ×2 uses on Q4), and the
+        # reference uses the official recipe's strength, 1.0
+        # (ltx-community/ltx-2.3-ingredients-distilled: video_conditioning=
+        # [(sheet, 1.0)], LoRA 1.4). The env override stays.
         try:
             ing_ref_strength = float(
-                os.environ.get("LTX_INGREDIENTS_REF_STRENGTH", "0.0"))
+                os.environ.get("LTX_INGREDIENTS_REF_STRENGTH", "1.0"))
         except (TypeError, ValueError):
-            ing_ref_strength = 0.0
+            ing_ref_strength = 1.0
         ing_ref_strength = max(0.0, min(1.0, ing_ref_strength))
         # Quality → single-stage vs two-stage. The original Ingredients recipe
         # skipped stage 2 (the refine + 2x upscale), which is exactly what gave
@@ -38280,6 +38924,9 @@ def run_job_inner(job: dict) -> None:
                 # the pinned sheet.
                 "video_conditioning": [[str(cond_mp4), ing_ref_strength]],
                 "loras": ingredients_loras,
+                # Q4 cannot hold a fused adapter (#101, see above): attach it
+                # exactly, at runtime, as Upscale ×2 does.
+                "lora_mode": "unfused",
                 # Quality-driven: Quick/Draft = single-stage (fast, dreamy);
                 # Balanced (default) / Standard / High = two-stage refine + 2x
                 # upscale (clean, full 1536x896). See ing_skip_stage_2 above.
@@ -39747,10 +40394,24 @@ def post_update_status() -> dict:
     return out
 
 
+LINUX_POST_UPDATE_NOTE = (
+    "Update on Linux: the code is pulled, but the Mac update step does not "
+    "apply here - run `bash scripts/linux/install.sh` from the app folder, "
+    "then restart the panel (docs/LINUX.md).")
+
+
 def post_update_start(trigger: str = "update_now") -> tuple[int, dict]:
     """Run post_update.sh in the background once the GPU is free."""
     if not (ROOT / POST_UPDATE_SCRIPT).is_file():
         return 200, {"ok": True, "nothing_to_do": True}
+    if not hostinfo.IS_MAC:
+        # #94 (Codex 4.19.2): post_update.sh is the Mac step - it pins
+        # mlx-metal and runs env/bin/python3.11 - and a Linux install's venv is
+        # the distro Python with the omarchy-mlx wheel. Running it would fail,
+        # and a failed post-update blocks the restart. Say what to run instead.
+        push(f"[update] {LINUX_POST_UPDATE_NOTE}")
+        return 200, {"ok": True, "nothing_to_do": True, "linux": True,
+                     "note": LINUX_POST_UPDATE_NOTE}
     with POST_UPDATE_LOCK:
         if POST_UPDATE.get("active") or POST_UPDATE.get("pending"):
             return 409, {"error": "The update is already being finished.",
@@ -44325,6 +44986,17 @@ def _h3_preview_progress(current: dict | None) -> dict:
         _prog_windows = int((current.get("progress") or {}).get("window_total") or 1)
     except (TypeError, ValueError):
         _prog_window = _prog_windows = 1
+    if not phase and status in ("starting", "running"):
+        # A One Shot's queue job is the PARENT; the part rendering is a child
+        # (`<id>-p1`) and the Now card's progress dict is written only onto the
+        # job whose id is the queue's current one — so a take's parent never had
+        # a phase, `abortable` was False for the whole take, and Stop early never
+        # appeared on a One Shot (2026-10-08, H3 Standard 30 s). The runner's own
+        # status file says where it is: a forward still to come in this window is
+        # denoise; the last forward of a window is the decode hand-off, and the
+        # rule below already allows that one only when another window follows.
+        phase = "denoise" if forward < total else "decode"
+        _prog_window, _prog_windows = max(1, window), window_total
     try:
         remaining = max(0.0, float(st.get("eta_seconds") or 0.0))
     except (TypeError, ValueError):
@@ -44694,10 +45366,12 @@ if __name__ == "__main__":
     else:
         _detect_local_install_state()
     # Repo-stats fetcher — appends to state/stats-data.jsonl daily so
-    # the dashboard at /stats has historic data. Data stays on disk in
+    # the dashboard at /stats has historic data (not in read-only stats
+    # mode, where the archive belongs to another install). Data stays on disk in
     # state/ (gitignored), never on the public repo. Skipped silently
     # when no GitHub token is resolvable.
-    threading.Thread(target=stats_fetch_loop, daemon=True).start()
+    if not STATS_READONLY:
+        threading.Thread(target=stats_fetch_loop, daemon=True).start()
     # Anonymous usage analytics — one app_boot event plus any optional-pack
     # transitions since the last boot, then nothing until a job finishes.
     # Deliberately here in __main__ and not at import time, so `import
