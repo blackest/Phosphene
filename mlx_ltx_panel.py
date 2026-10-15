@@ -13357,10 +13357,273 @@ def h3_mlx_fault() -> str:
 
 
 H3_MLX_REPAIR = (
-    "Fix it from the Pinokio sidebar: \"Repair Hailuo H3\" reinstalls that "
-    "venv's packages and keeps every weight you have. LTX renders are "
-    "unaffected — the two engines keep separate venvs for this exact reason."
+    "Press Repair Hailuo H3 on this card - it re-installs only that venv's "
+    "Python packages, at the set this release was tested with (about a "
+    "minute, every weight kept). Or from the Pinokio sidebar: Stop Phosphene, "
+    "then \"Update Hailuo H3 runner\". LTX "
+    "renders are unaffected — the two engines keep separate venvs for this "
+    "exact reason."
 )
+#: 4.19.5: one sentence for every H3 venv fault (old MLX, a transformers
+#: dependency mismatch, a venv off its known-good set). Before, the sidebar
+#: entry it named ("Repair Hailuo H3") only exists while H3 is NOT ready - a
+#: venv with old packages reads as ready, so the menu showed "Update Hailuo H3
+#: runner" instead and the sentence sent people looking for a missing button.
+H3_ENV_REPAIR = H3_MLX_REPAIR
+
+
+# --- THE H3 VENV'S KNOWN-GOOD SET (4.19.5) ----------------------------------
+# Through 4.19.4 the H3 venv was resolved from the runner's requirements.txt
+# alone - floors, no lock - so every new H3 install ran whatever PyPI held that
+# day. scripts/pinokio/h3_constraints.txt is the set this release was rendered
+# with, and scripts/pinokio/h3_deps.sh is the one install into that venv
+# (install_h3.js, every Update, and the Repair below), always under it.
+#
+# The preflight here is the panel's half: before an H3 render takes the GPU,
+# read the venv's dist-info folders (no import, a few ms) and compare the
+# packages the runner is built on with the set. A venv off the set - a 4.19.4
+# install whose Update has not run the repair yet, a stray `pip install` -
+# is refused in a second with the one-click repair, instead of being allowed
+# to fail minutes into a render (or worse, to render differently from every
+# other install with no record of why). transformers' own import-time
+# dependency check (engine_dependency_mismatch, the 4.19.4 class) is asked of
+# this venv too - that one would fail the render outright.
+H3_CONSTRAINTS = ROOT / "scripts" / "pinokio" / "h3_constraints.txt"
+H3_DEPS_INSTALLER = "scripts/pinokio/h3_deps.sh"
+#: The packages the runner is built on - judged against the set before every
+#: H3 render. Everything else in the set is held by the install (-c) but not
+#: worth refusing a render over. Kept in step with REQUIRED in
+#: scripts/pinokio/h3_env_check.py (test_h3_env_lock.py).
+H3_ENV_JUDGED = ("mlx", "mlx-metal", "mlx-vlm", "transformers", "tokenizers",
+                 "huggingface-hub", "safetensors", "numpy", "pillow")
+H3_ENV_OFFSET_WORDS = "the Hailuo H3 venv is not on the package set this release was tested with"
+H3_REPAIR_LOCK = threading.Lock()
+H3_REPAIR: dict = {"state": "idle", "active": False}
+H3_REPAIR_TIMEOUT_S = 1200
+
+
+def h3_constraint_pins(path: Path | None = None) -> dict:
+    """{normalised name: version} for every exact pin in h3_constraints.txt.
+    {} when the file cannot be read - an unreadable lock judges nothing."""
+    out: dict = {}
+    try:
+        text = (path or H3_CONSTRAINTS).read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        m = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*==\s*([^\s,;]+)", line)
+        if m:
+            out[re.sub(r"[-_.]+", "-", m.group(1)).lower()] = m.group(2)
+    return out
+
+
+def _h3_site_packages(py: Path) -> list:
+    try:
+        return [d for d in (py.parent.parent / "lib").glob("python*/site-packages")
+                if d.is_dir()]
+    except OSError:
+        return []
+
+
+def h3_env_offset(py: Path | None = None) -> str:
+    """"" when the H3 venv's judged packages are the known-good set's, else
+    which ones are not. Fails open on anything it cannot read.
+
+    Judged only where the set applies: macOS (Linux on Apple Silicon builds
+    this venv in scripts/linux/install_h3.sh with its own mlx wheel), the
+    app's own venv (an LTX_H3_PYTHON override is a developer's interpreter,
+    not ours to judge) and not with LTX_H3_ENV_CHECK=0 (a developer pointing
+    LTX_H3_ROOT at a runner checkout they manage themselves)."""
+    if sys.platform != "darwin" or os.environ.get("LTX_H3_ENV_CHECK", "").strip() == "0":
+        return ""
+    if os.environ.get("LTX_H3_PYTHON", "").strip():
+        return ""
+    py = py or _h3_python()
+    if py is None:
+        return ""
+    pins = h3_constraint_pins()
+    if not pins:
+        return ""
+    off = []
+    for site in _h3_site_packages(py):
+        have = _dist_versions(site)
+        for name in H3_ENV_JUDGED:
+            want, got = pins.get(name), have.get(name)
+            if want and got and got != want:
+                off.append(f"{name} {got} (tested: {want})")
+    if not off:
+        return ""
+    return f"{H3_ENV_OFFSET_WORDS} - {', '.join(off[:4])}" + (
+        f" and {len(off) - 4} more" if len(off) > 4 else "")
+
+
+def h3_env_fault() -> str:
+    """"" when the H3 venv can run this release's runner, else the reason -
+    the old-MLX shape (h3_mlx_fault), then transformers refusing its own
+    dependencies, then a venv off the known-good set. Every shape carries
+    "venv" (venv_broken in the fleet view) and none of the words an earlier
+    row of the error taxonomy claims."""
+    fault = h3_mlx_fault()
+    if fault:
+        return fault
+    py = _h3_python()
+    if py is None:
+        return ""
+    for site in _h3_site_packages(py):
+        mismatch = engine_dependency_mismatch(site)
+        if mismatch:
+            return f"the Hailuo H3 venv's packages do not fit together - {mismatch}"
+    return h3_env_offset(py)
+
+
+H3_DEPS_LOCK_NAME = ".phosphene_h3_deps.d"   # h3_deps.sh's lock dir in the venv
+
+
+def _h3_deps_running() -> bool:
+    """True while scripts/pinokio/h3_deps.sh holds its lock in the H3 venv -
+    the panel's own Repair, or Pinokio's Install / Update running it."""
+    try:
+        pid = int((((H3_ROOT / ".venv" / H3_DEPS_LOCK_NAME / "pid")
+                    .read_text(encoding="utf-8").split() or ["0"])[0]))
+    except (OSError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def h3_env_busy() -> str:
+    with H3_REPAIR_LOCK:
+        active = bool(H3_REPAIR.get("active"))
+    if active or _h3_deps_running():
+        return ("Hailuo H3's packages are being repaired right now - H3 "
+                "renders can start when it finishes (about a minute)")
+    return ""
+
+
+def _h3_repair_hold(next_job: dict | None) -> str:
+    """The worker's hold for an H3 job at the head of the queue while H3's
+    packages are being installed (Codex 4.19.5): dequeued, it would only be
+    refused - and three identical refusals trip the queue breaker."""
+    if not isinstance(next_job, dict) or (next_job.get("params") or {}).get("engine") != "h3":
+        return ""
+    if not h3_env_busy():
+        return ""
+    return ("Queue held: Hailuo H3's packages are being repaired (about a "
+            "minute). The next H3 render starts when it finishes.")
+
+
+def h3_env_status() -> dict:
+    """/status.h3_env: is the H3 venv fit to render, and the repair's state.
+    `ok` is true when H3 is not installed (that is h3_paths()' story)."""
+    fault = h3_env_fault()
+    with H3_REPAIR_LOCK:
+        repair = {k: v for k, v in H3_REPAIR.items() if k != "log"}
+        repair["log"] = list(H3_REPAIR.get("log") or [])[-6:]
+    return {"ok": not fault and not repair.get("active"), "fault": fault,
+            "repair": repair}
+
+
+def _h3_job_running() -> bool:
+    with LOCK:
+        cur = STATE.get("current")
+        return bool(isinstance(cur, dict)
+                    and (cur.get("params") or {}).get("engine") == "h3")
+
+
+def h3_env_repair_start() -> tuple[int, dict]:
+    """POST /h3/repair - run scripts/pinokio/h3_deps.sh on the H3 checkout:
+    the same constrained install Install and Update run, no weights touched.
+    The panel never imports the H3 venv (every H3 render is its own
+    subprocess), so this is safe with the panel up - but not under a running
+    H3 render, which has that venv's packages open."""
+    if _h3_python() is None:
+        return 409, {"error": "Hailuo H3 is not installed here - install it "
+                              "from the Pinokio sidebar first."}
+    if _h3_deps_running():
+        return 409, {"error": "H3's packages are already being installed "
+                              "(Install, Update or a repair) - this clears "
+                              "itself when that finishes.", "repair": True}
+    if _external_build_hold():
+        return 409, {"error": "The Hailuo H3 compact engine is being built or "
+                              "an update is installing - repair after it "
+                              "finishes."}
+    # Checked and claimed under the queue lock (Codex 4.19.5): the worker sets
+    # STATE["current"] under the same lock, so an H3 job either is current
+    # now (refused here) or dequeues after `active` is set (held by
+    # _h3_repair_hold) - never both started.
+    with LOCK:
+        if _h3_job_running():
+            return 409, {"error": "An H3 render is running - repair after it "
+                                  "finishes, or stop it first."}
+        with H3_REPAIR_LOCK:
+            if H3_REPAIR.get("active"):
+                return 409, {"error": "The H3 repair is already running.", "repair": True}
+            H3_REPAIR.clear()
+            H3_REPAIR.update({"state": "running", "active": True,
+                              "started_ts": time.time(), "finished_ts": None,
+                              "error": None, "log": collections.deque(maxlen=60)})
+    threading.Thread(target=_h3_env_repair_thread, daemon=True,
+                     name="h3-env-repair").start()
+    push("[h3] repairing the Hailuo H3 venv (its Python packages, at the set "
+         "this release was tested with; weights are not touched)")
+    return 202, {"ok": True, "started": True}
+
+
+def _h3_env_repair_thread() -> None:
+    env = _music_install_env()          # Pinokio's uv on PATH, venv deactivated
+    cmd = ["bash", str(ROOT / H3_DEPS_INSTALLER), str(H3_ROOT)]
+    tail: list = []
+    error = None
+    timer = None
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(ROOT), env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                errors="replace", start_new_session=True)
+        timer = _kill_group_after(proc, H3_REPAIR_TIMEOUT_S)
+        for raw in proc.stdout:
+            for line in raw.replace("\r", "\n").splitlines():
+                line = line.rstrip()
+                if not line:
+                    continue
+                tail = (tail + [line])[-8:]
+                with H3_REPAIR_LOCK:
+                    H3_REPAIR["log"].append(line[:300])
+        rc = proc.wait(timeout=60)
+        if getattr(timer, "fired", False):
+            raise subprocess.TimeoutExpired(cmd, H3_REPAIR_TIMEOUT_S)
+        if rc != 0:
+            reason = next((l for l in reversed(tail) if l.startswith("error:")), "")
+            error = (reason[len("error:"):].strip() if reason
+                     else f"the install stopped (exit {rc})")
+    except subprocess.TimeoutExpired:
+        error = f"the install took longer than {H3_REPAIR_TIMEOUT_S // 60} minutes"
+    except Exception as exc:                                     # noqa: BLE001
+        error = f"the install could not run: {exc}"
+    finally:
+        if timer is not None:
+            timer.cancel()
+    fault = h3_env_fault()
+    if error is None and fault:
+        error = f"the install finished but H3 is still not usable: {fault}"
+    with H3_REPAIR_LOCK:
+        H3_REPAIR.update(active=False, finished_ts=time.time(),
+                         state="failed" if error else "done", error=error)
+    try:
+        with QUEUE_COND:            # a held H3 render can start now
+            QUEUE_COND.notify_all()
+    except Exception:                                            # noqa: BLE001
+        pass
+    push("[h3] " + (f"repair failed: {error}" if error
+                    else "Hailuo H3 venv repaired - H3 renders can run"))
 
 
 def h3_paths() -> dict:
@@ -36252,9 +36515,16 @@ def run_h3_job_inner(job: dict) -> None:
     # Checked here, before the LTX helper is killed and before 8 minutes of
     # GPU time, because the alternative is what the fleet saw: a TypeError
     # deep in the sampler that names a function and never names MLX.
-    _mlx_fault = h3_mlx_fault()
-    if _mlx_fault:
-        raise RuntimeError(f"H3 cannot start: {_mlx_fault}. {H3_MLX_REPAIR}")
+    # 4.19.5: and its packages have to be the set this release was tested
+    # with (h3_env_fault: old MLX, transformers refusing its own dependencies,
+    # or a venv off scripts/pinokio/h3_constraints.txt) - refused here in a
+    # second with the one-click repair, not minutes into the render.
+    _h3_busy = h3_env_busy()
+    if _h3_busy:
+        raise RuntimeError(f"H3 cannot start: {_h3_busy}.")
+    _h3_env = h3_env_fault()
+    if _h3_env:
+        raise RuntimeError(f"H3 cannot start: {_h3_env}. {H3_ENV_REPAIR}")
 
     # ---- memory safety: the warm helper cannot coexist with H3 -----------
     if HELPER.is_alive():
@@ -40904,13 +41174,15 @@ def worker_loop() -> None:
                 if not STATE["queue"] and not STATE["current"]:
                     caffeinate_off()
                 if STATE["queue"] and not STATE["paused"]:
-                    hold = _external_build_hold()
+                    hold = (_external_build_hold()
+                            or _h3_repair_hold(STATE["queue"][0]))
                     if not hold:
                         held_note = ""
                         break
                     if hold != held_note:
                         held_note = hold
-                        push(f"Queue held: {hold} is loading a large model. "
+                        push(hold if hold.startswith("Queue held:") else
+                             f"Queue held: {hold} is loading a large model. "
                              f"The next render starts when it finishes.")
                 QUEUE_COND.wait(timeout=2)
             job = STATE["queue"].pop(0)

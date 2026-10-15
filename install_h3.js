@@ -192,12 +192,22 @@ module.exports = {
       }
     },
 
+    // ---- Its packages, at the known-good set (4.19.5) ----------------------
+    // Through 4.19.4 this was `uv pip install -r requirements.txt`, whose lines
+    // are floors only - every new install resolved whatever PyPI held that
+    // day, and an upstream release could break every new H3 install with no
+    // Phosphene release behind it (the LTX venv's tokenizers 0.23.3 story,
+    // 4.19.4). scripts/pinokio/h3_deps.sh is THE one install into this venv:
+    // it resolves under scripts/pinokio/h3_constraints.txt (-c), which also
+    // MOVES a drifted package back - so Repair and "Update Hailuo H3 runner",
+    // which run this same script, repair a drifted venv - then checks the set
+    // and the runner's imports. It prints "error:" on failure, which is what
+    // stops the Pinokio run here instead of 75 GB later.
     {
       method: "shell.run",
       params: {
         message: [
-          "echo '=== H3 dependencies ==='",
-          RH3 + "uv pip install --python .venv/bin/python -r requirements.txt",
+          RH3 + "bash \"$APP_ROOT/scripts/pinokio/h3_deps.sh\" \"$(pwd)\"",
           RH3 + ".venv/bin/python -c \"import mlx.core as mx, numpy, PIL; print('H3 deps OK')\""
         ]
       }

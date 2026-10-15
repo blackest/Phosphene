@@ -2980,6 +2980,38 @@ async function engineRepairStart() {
   if (typeof poll === 'function') poll();
 }
 
+// 4.19.5: POST /h3/repair (scripts/pinokio/h3_deps.sh - H3's packages at the
+// known-good set, no weights). Progress rides /status.h3_env; the toast below
+// says when it ends, because the card that offered it may be gone by then.
+async function h3RepairStart() {
+  try {
+    const r = await fetch('/h3/repair', { method: 'POST', body: new URLSearchParams({}) });
+    const res = await r.json().catch(() => ({}));
+    if (typeof phosToast === 'function') {
+      phosToast(r.ok ? 'Repairing Hailuo H3\u2019s packages\u2026 (about a minute, weights kept)'
+                     : (res.error || ('Repair could not start: HTTP ' + r.status)),
+                { kind: r.ok ? 'info' : 'danger', duration: 8000 });
+    }
+  } catch (e) {
+    if (typeof phosToast === 'function') phosToast('Repair could not start: ' + (e.message || e), { kind: 'danger' });
+  }
+  if (typeof poll === 'function') poll();
+}
+let _h3RepairWas = '';
+let _h3EnvLast = null;
+function noteH3EnvRepair(st) {
+  _h3EnvLast = st || null;
+  const rep = (st && st.repair) || {};
+  const now = rep.state || '';
+  if (_h3RepairWas === 'running' && (now === 'done' || now === 'failed') && typeof phosToast === 'function') {
+    phosToast(now === 'done'
+      ? 'Hailuo H3 is repaired \u2014 H3 renders can run. Press Retry on the failed render.'
+      : 'The Hailuo H3 repair did not finish: ' + _redactLocalPaths(rep.error || 'unknown error'),
+      { kind: now === 'done' ? 'success' : 'danger', duration: 10000 });
+  }
+  _h3RepairWas = now;
+}
+
 // Translate a cryptic engine error into actionable user guidance. Extracted
 // from the Now card 2026-08-11 so a storyboard shot's failure reads EXACTLY
 // like a manual one — one if/else, two callers, no way for the two to drift.
@@ -3037,6 +3069,19 @@ function nowCardFailureActions(last, info) {
       `title="Reopen this job in its form to pick the missing file again">` +
       `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
       `<span>Open in the form</span></button>` + dismiss;
+  }
+  // 4.19.5: the Hailuo H3 venv is off the package set this release was
+  // tested with (or its MLX is too old, or transformers refuses its own
+  // dependencies). Same shape: the card offers H3's one-click repair.
+  // Once /status.h3_env says the venv is fine again (the repair ran), the
+  // same card offers the ordinary Retry its toast promises (Codex 4.19.5).
+  const h3Fixed = typeof _h3EnvLast !== 'undefined' && _h3EnvLast && _h3EnvLast.ok
+    && !((_h3EnvLast.repair || {}).active);
+  if (action === 'repair_h3' && !h3Fixed) {
+    return `<button type="button" class="now-card-retry" data-action="repair-h3" ` +
+      `title="Re-install only Hailuo H3's Python packages, at the set this release was tested with (about a minute, weights kept)">` +
+      `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
+      `<span>Repair Hailuo H3</span></button>` + dismiss;
   }
   // 4.17.4: the engine's packages are not installed - every render fails the
   // same way until they are, so the card offers the repair, never a Retry.
@@ -3100,6 +3145,19 @@ function friendlyJobError(raw, engine) {
           + 'Retrying as is fails the same way.',
       details: _redactLocalPaths(raw) || raw,
       action: 'repair_engine',
+    };
+  }
+  // 4.19.5: an H3 render refused at its start because the H3 venv cannot run
+  // this release's runner as tested (h3_env_fault in mlx_ltx_panel.py). Retry
+  // fails the same way; the repair re-installs only H3's packages.
+  if (/Hailuo H3 venv/i.test(raw)) {
+    return {
+      friendly: 'Hailuo H3\u2019s Python packages need a repair.',
+      hint: 'They are not the versions this release was tested with, so H3 stopped before using '
+          + 'the GPU. Press Repair Hailuo H3: it re-installs only those packages (about a minute) '
+          + 'and keeps every weight. LTX renders are not affected.',
+      details: _redactLocalPaths(raw) || raw,
+      action: 'repair_h3',
     };
   }
   if (/music engine isn't installed|YuE2 needs about|YuE2 weights.*repair/i.test(raw)) {
@@ -3400,6 +3458,7 @@ async function poll() {
   // Corrupt/partial-weight banner (mosaic self-heal).
   try { renderIntegrityBanner(mergeIntegrity(s.model_integrity, s.deep_verify)); } catch (_) {}
   try { renderEngineEnvBanner(s.engine_env); } catch (_) {}
+  try { noteH3EnvRepair(s.h3_env); } catch (_) {}
   try { renderDeepVerifyStatus(s.deep_verify); } catch (_) {}
 
   // Memory
@@ -8751,7 +8810,7 @@ function draftAutosaveInstall() {
 // Inline handlers in the markup and the other files resolve these through
 // the global scope; everything NOT listed here is private to this module.
 Object.assign(globalThis, {
-  openFailedJobInForm, engineRepairStart,
+  openFailedJobInForm, engineRepairStart, h3RepairStart,
   notifyJobsDone, notifyOneJob, playDoneChime,
   h3FinishSetTier, h3FinishActive, setEngine, _syncEnginePromptTools,
   ltxFinishSetTier, ltxFinishActive, _syncFinishAffordance,

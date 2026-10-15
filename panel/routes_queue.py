@@ -268,6 +268,9 @@ def get_status(h, parsed) -> None:
     # 4.17.4: can a render start at all (the engine venv), and the one-click
     # repair's progress. File checks only - cheap enough for every poll.
     payload["engine_env"] = P.engine_env_status()
+    # 4.19.5: the same question for the Hailuo H3 venv - on its known-good set
+    # (scripts/pinokio/h3_constraints.txt) or not - and its repair's progress.
+    payload["h3_env"] = P.h3_env_status()
     payload["train_profile"] = P.TRAIN_PROFILE
     payload["train_presets"] = P.TRAIN_PRESETS
     payload["train_style_presets"] = P.TRAIN_STYLE_PRESETS

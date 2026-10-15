@@ -1,6 +1,6 @@
 #!/bin/bash
 # Move the vendored minimax-h3-mlx checkout to the EXACT engine commit this
-# Phosphene release was validated against, and re-sync its venv deps.
+# Phosphene release was validated against. (Its venv's packages: h3_deps.sh.)
 # THE ONE PLACE THE H3 ENGINE PIN LIVES.
 #
 # Issue #74 (diagnosed by @blackest): installs cloned before the v2 engine sat
@@ -24,7 +24,7 @@
 # never force-move one), then change both lines below in the same commit.
 #
 # Usage: bash scripts/pinokio/h3_checkout.sh <h3-checkout-dir>
-# Exit 0 = the tree is at the pin and its deps are synced. Non-zero = left as
+# Exit 0 = the tree is at the pin. Non-zero = left as
 # it was (nothing destructive happens before the pinned commit is on disk).
 set -u
 H3_PIN_SHA="3f6c75c09ccfa336a8c211b787d6a2350d83ef7a"
@@ -66,8 +66,9 @@ if [ ! -f scripts/quantize_stream.py ]; then
   echo "WARN: the H3 pin has no scripts/quantize_stream.py - the Q8 build cannot run from this tree."
   exit 1
 fi
-# The branch move can change requirements; uv is a no-op when nothing did.
-if [ -x .venv/bin/python ]; then
-  uv pip install --python .venv/bin/python -r requirements.txt \
-    || echo 'WARN: H3 requirements re-sync failed - re-run the H3 engine Install.'
-fi
+# The venv's packages are NOT installed here any more (4.19.5). This used to
+# finish with a bare `uv pip install -r requirements.txt` - floors only, no
+# lock - so every caller now runs scripts/pinokio/h3_deps.sh itself, after
+# this move: install_h3.js as its own step once the venv exists, Update in
+# post_update.sh 8b whether or not this move worked. One install into the H3
+# venv, always under scripts/pinokio/h3_constraints.txt.

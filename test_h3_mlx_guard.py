@@ -103,7 +103,10 @@ class TheGuard(unittest.TestCase):
         """Ordering is the point: the check has to run before the LTX helper
         is killed and before any GPU time is spent."""
         src = Path(__file__).with_name("mlx_ltx_panel.py").read_text()
-        guard = src.index("_mlx_fault = h3_mlx_fault()")
+        # 4.19.5: h3_env_fault() is h3_mlx_fault() plus the known-good-set
+        # checks (test_h3_env_lock.py); the ordering contract is unchanged.
+        guard = src.index("_h3_env = h3_env_fault()")
+        self.assertIn("fault = h3_mlx_fault()", src[src.index("def h3_env_fault"):][:800])
         helper_kill = src.index("stopping the LTX warm helper", guard - 4000)
         self.assertLess(guard, helper_kill)
 

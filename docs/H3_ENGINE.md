@@ -107,6 +107,28 @@ Phosphene pins `mlx==0.31.1` — `0.31.2` regresses LTX audio by 22 dB. The H3
 port needs `mlx>=0.32`. A separate venv means installing H3 can never break LTX
 rendering, and uninstalling H3 is `rm -rf`.
 
+### Its package set is locked (4.19.5)
+
+`scripts/pinokio/h3_constraints.txt` is the H3 venv's known-good set - every
+package, exact - captured from a from-zero install and validated with H3
+renders. `scripts/pinokio/h3_deps.sh` is the one install into the venv and
+always passes it with `-c`: Install / Repair Hailuo H3 / Update Hailuo H3
+runner (`install_h3.js`), every Update (`post_update.sh` 8b) and the panel's
+`POST /h3/repair`. uv moves a package already outside the set back into it,
+so the same script is the repair. Before every H3 render the panel compares
+the packages the runner is built on (`H3_ENV_JUDGED`) with the set, plus
+transformers' own import-time dependency check, and refuses in a second with
+**Repair Hailuo H3** on the card when they disagree. Through 4.19.4 the venv
+was resolved from `requirements.txt` floors alone, so each new install got
+whatever PyPI held that day.
+
+Not judged: an `LTX_H3_PYTHON` interpreter (a developer's own), Linux
+(`scripts/linux/install_h3.sh` builds that venv with its own mlx wheel), and
+any panel started with `LTX_H3_ENV_CHECK=0` - for a dev box whose
+`LTX_H3_ROOT` is a runner checkout you manage yourself. Moving the set:
+regenerate the whole file from a from-zero install's venv, then a from-zero
+install and H3 renders on it.
+
 ---
 
 ## Paths
@@ -119,6 +141,7 @@ duplicating 75 GB.
 | `LTX_H3_ROOT` | `<install>/minimax-h3-mlx` | the engine checkout (`scripts/generate_staged.py`, `.venv/`) |
 | `LTX_H3_MODELS` | `<install>/mlx_models/hailuo-h3` | the three weight components |
 | `LTX_H3_PYTHON` | `<H3_ROOT>/.venv/bin/python3.11` → `python` | interpreter override (a checkout without its own venv) |
+| `LTX_H3_ENV_CHECK` | unset (on) | `0` stops the pre-render check of the H3 venv against `h3_constraints.txt` - for a dev checkout whose venv you manage yourself |
 | `LTX_H3_FORCE_CAPABLE` | unset | test-only: stop the UI hiding the pill on a small Mac. Does **not** make it render. |
 | `LTX_H3_DENSE_10S` | **dead — not read anywhere in the code (H3-15)** | the dense 10 s tier ("10s single pass") ships `"offered": True` unconditionally; this var does nothing. Kept documented so a future re-gate has somewhere to land, not because it currently works. |
 | `LTX_H3_WIDE_DRAFT` | unset | adds an experimental **512×288 16:9 draft** (~2 min). Off because 0.15 MP is below anything this campaign has measured — see Tiers. |

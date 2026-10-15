@@ -342,6 +342,28 @@ if { [ -f "$H3_MODELS_ROOT/models/$H3_DIT_REL" ] || [ -f "$H3_MODELS_ROOT/$H3_DI
   echo 'Ensuring the H3 engine checkout is on the pinned branch…'
   bash "$ROOT/scripts/pinokio/h3_checkout.sh" "$H3_CHECKOUT" \
     || echo 'WARN: could not move the H3 checkout to its pinned branch — the Q8 build below may not run; re-run the H3 engine Install to retry.'
+  # 4.19.5: THE H3 VENV'S KNOWN-GOOD SET. Through 4.19.4 the H3 venv was the
+  # one engine venv with no lock (requirements.txt floors only), so whatever
+  # PyPI held on the day decided what a new H3 install ran. h3_deps.sh is the
+  # one install into that venv: it resolves under h3_constraints.txt, and uv
+  # MOVES anything already outside the set back into it - so this is the step
+  # that repairs a drifted H3 venv on Update (a 4.19.4 install that resolved a
+  # newer transformers / mlx-vlm / tokenizers, a stray pip install). Run
+  # whether or not the pin move above worked: a venv off its set is its own
+  # fault. Best-effort like the rest of H3 here - LTX renders do not depend on
+  # it, the panel refuses an H3 render on a venv off its set and offers the
+  # same repair in one click (POST /h3/repair). Its output goes through the
+  # same "error:" defang as 8c: h3_deps.sh (and uv, on a network failure)
+  # print "error:", which Pinokio 8.2.0 reads as a failed step and would end
+  # the Update here - before the LTX import gate - over an optional engine.
+  # pipefail so the WARN still fires on h3_deps.sh's own exit code.
+  if "$H3_CHECKOUT/.venv/bin/python" -c 'import sys' >/dev/null 2>&1; then
+    echo 'Ensuring the H3 venv is on its known-good set (repairs a drifted one)…'
+    ( set -o pipefail
+      bash "$ROOT/scripts/pinokio/h3_deps.sh" "$H3_CHECKOUT" 2>&1 \
+        | sed -u -e 's/[Ee][Rr][Rr][Oo][Rr]:/problem -/g' -e 's/[Ee]rrno /errno-/g' ) \
+      || echo 'WARN: the H3 venv could not be put on its known-good set — press Repair Hailuo H3 in the panel, or run "Update Hailuo H3 runner" from the sidebar.'
+  fi
   echo 'Ensuring the H3 compact (Q8) engine is built (halves H3 render memory)…'
   ( cd "$H3_CHECKOUT" && bash "$ROOT/scripts/pinokio/h3_build_q8.sh" "$ROOT" ) \
     || echo 'WARN: H3 Q8 build failed — H3 keeps the full bf16 engine for now; re-run the H3 engine Install to retry.'

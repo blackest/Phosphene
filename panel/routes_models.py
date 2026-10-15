@@ -319,6 +319,20 @@ def post_engine_repair(h, path, qs, ctype) -> None:
     h._json(payload, code); return
 
 
+@post("/h3/repair")
+def post_h3_repair(h, path, qs, ctype) -> None:
+    # 4.19.5: "Repair Hailuo H3" on an H3 failure card. Re-runs ONLY
+    # scripts/pinokio/h3_deps.sh - the H3 venv's packages at the known-good set
+    # (scripts/pinokio/h3_constraints.txt), the same install Install and Update
+    # run - in the background; progress rides /status.h3_env. No weights, no
+    # Stop: the panel never imports the H3 venv.
+    _rb = h._read_form_body()
+    if _rb is None:
+        return
+    code, payload = P.h3_env_repair_start()
+    h._json(payload, code); return
+
+
 @post("/music/cover/install")
 def post_music_cover_install(h, path, qs, ctype) -> None:
     # The opt-in ~2.8 GB that lets YuE2 read a score off a real recording.

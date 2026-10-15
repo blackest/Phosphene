@@ -939,6 +939,18 @@ Answers `202` (started), `200 {nothing_to_do}` (the engine is fine), or `409`
 writing the venv). Progress and outcome ride `GET /status` -> `engine_env`
 (`ok`, `fault`, `installing`, `repair.{state, active, log, error}`).
 
+### `POST /h3/repair`
+
+4.19.5. Re-runs only `scripts/pinokio/h3_deps.sh` on the Hailuo H3 checkout:
+re-installs H3's Python packages into its own venv at the set this release
+was tested with (`scripts/pinokio/h3_constraints.txt`, passed with `-c`; uv
+moves anything already outside it back). No weights, no Stop - the panel never
+imports the H3 venv. Answers `202` (started) or `409` (H3 is not installed, an
+H3 render is running, or a repair is already running). Progress and outcome
+ride `GET /status` -> `h3_env` (`ok`, `fault`, `repair.{state, active, log,
+error}`). An H3 render on a venv off the set is refused at its start with
+`H3 cannot start: the Hailuo H3 venv ...` and this repair on the card.
+
 ## Push alerts — the completion alert for a closed tab
 
 The in-tab chime and browser alert (Settings → Completion alerts) need the page
