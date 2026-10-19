@@ -748,6 +748,86 @@ def _resolve_mflux_bin(config: ImageEngineConfig) -> str | None:
     return shutil.which(bin_name)
 
 
+# ---- The engine venv's Pillow (4.19.6 fleet fix) ----------------------------
+# Pillow 13.0.0 shipped on 2026-10-16. Its PIL/_typing.py now imports
+# `from numbers import _IntegralLike` at module level and relies on Python
+# 3.15's lazy imports (`__lazy_modules__`) to never execute it. The engine venv
+# is Python 3.11, where the import runs and fails. mflux 0.18.0 imports
+# `from PIL._typing import StrOrBytesPath` (mflux/utils/image_util.py), so every
+# FLUX.2 / Qwen-Edit render on a venv that resolved Pillow 13 died with
+#     ImportError: cannot import name '_IntegralLike' from 'numbers'
+# Fleet 2026-10-17..19: 9 fresh 4.19.5 installs, every one installed after
+# Pillow 13 was released; video was unaffected (nothing else imports _typing).
+# mflux itself only asks for pillow>=12.1.1, so no resolver could know.
+# scripts/pinokio/engine_constraints.txt now caps Pillow below 13 for every
+# install into the engine venv and post_update.sh moves an existing 13 back.
+# This check is the in-panel half: an image job on a venv outside that range
+# stops before the subprocess, naming the cause and the way out.
+MFLUX_JUDGED_PACKAGES = ("pillow",)
+_REPO_ROOT = Path(__file__).resolve().parent     # tests point this at a fake tree
+
+
+def _engine_constraint_specs(names=MFLUX_JUDGED_PACKAGES) -> dict:
+    """{name: specifier string} for `names` from engine_constraints.txt."""
+    out: dict = {}
+    path = _REPO_ROOT / "scripts" / "pinokio" / "engine_constraints.txt"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    for raw in lines:
+        line = raw.split("#", 1)[0].strip()
+        m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(.*)$", line)
+        if not m:
+            continue
+        name = re.sub(r"[-_.]+", "-", m.group(1)).lower()
+        if name in names and m.group(2):
+            out[name] = m.group(2).strip()
+    return out
+
+
+def mflux_env_fault(bin_path) -> str:
+    """"" when the venv that holds `bin_path` can import mflux's image code,
+    else the reason and the way out. Judges only the panel's own venvs (the
+    bundled ltx-2-mlx/env and image-gen/env); a custom mflux binary somewhere
+    else is not ours to judge. Fails open: anything unreadable is ""."""
+    try:
+        repo_root = _REPO_ROOT
+        venv = Path(bin_path).parent.parent
+        if venv.resolve().parent.name not in ("ltx-2-mlx", "image-gen"):
+            return ""
+        if venv.resolve().parent.parent != repo_root.resolve():
+            return ""
+        if not (venv / "pyvenv.cfg").is_file():
+            return ""
+        specs = _engine_constraint_specs()
+        if not specs:
+            return ""
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+        have: dict = {}
+        for site in venv.glob("lib/python*/site-packages"):
+            for d in site.iterdir():
+                if not d.name.endswith(".dist-info"):
+                    continue
+                name, _, ver = d.name[:-len(".dist-info")].rpartition("-")
+                key = re.sub(r"[-_.]+", "-", name).lower()
+                if key in specs and ver:
+                    have[key] = ver
+        for key, spec in specs.items():
+            ver = have.get(key)
+            if ver and not SpecifierSet(spec).contains(Version(ver), prereleases=True):
+                return (f"The image engine cannot start: its venv has {key.capitalize()} "
+                        f"{ver}, and mflux works only with {key.capitalize()} {spec} "
+                        f"(it stops with \"cannot import name '_IntegralLike'\"). "
+                        f"Press Update in Pinokio, then restart - Update puts it back "
+                        f"in about a minute and keeps every model. Video renders are "
+                        f"not affected.")
+    except Exception:                                          # noqa: BLE001
+        return ""
+    return ""
+
+
 # ---- Backends ---------------------------------------------------------------
 def _generate_mock(prompt: str, n: int, width: int, height: int,
                    output_dir: Path, base_seed: int | None,
@@ -906,6 +986,12 @@ def _generate_mflux(prompt: str, n: int, width: int, height: int,
             f"First-run model download is 4-34 GB to ~/.cache/huggingface "
             f"depending on family."
         )
+
+    # 4.19.6: a Pillow the engine cannot import stops HERE, in a second, with
+    # the way out - not 30 s later as an ImportError from inside mflux.
+    _env_fault = mflux_env_fault(bin_path)
+    if _env_fault:
+        raise RuntimeError(_env_fault)
 
     # qwen_edit and flux2_edit BOTH refuse to start without --image-paths
     # (mflux argparse marks it required on both edit-flavored CLIs).

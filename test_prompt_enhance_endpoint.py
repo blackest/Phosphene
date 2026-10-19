@@ -277,8 +277,13 @@ class PromptEnhanceEndpointTest(unittest.TestCase):
             # copy — its own OUTPUT/STATE patches invisible, 404s all round
             # (test_routes' wiring check, the room-tone/uploads/new-take
             # route suites). Snapshot and restore the binding.
+            # 4.19.6: the modules split out of the panel (#110-#112) are
+            # handed P the same way and need the same restore - without it a
+            # whole-suite run failed 17 stats/CivitAI/Train tests downstream.
             bound_p = {name: mod.P for name, mod in list(sys.modules.items())
-                       if name.startswith("panel.routes_") and hasattr(mod, "P")}
+                       if (name.startswith("panel.routes_")
+                           or name in ("civitai_client", "usage_stats", "train_support"))
+                       and hasattr(mod, "P")}
             try:
                 spec = importlib.util.spec_from_file_location(
                     "prompt_enhance_panel_under_test", ROOT / "mlx_ltx_panel.py"

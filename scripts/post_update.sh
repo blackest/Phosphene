@@ -161,6 +161,22 @@ require "the mlx 0.31.1 pin" -- uv pip install --python "$VENV_PY" -c "$EC" --re
 require "the transformers <5.13.0 cap (5.13.0 breaks every generation)" -- \
   uv pip install --python "$VENV_PY" -c "$EC" 'mlx==0.31.1' 'mlx-lm==0.31.1' 'mlx-metal==0.31.1' 'transformers>=5.0.0,<5.13.0'
 
+# ---- 2c. Pillow below 13 (4.19.6) --------------------------------------------
+# Every install made after 2026-10-16 resolved Pillow 13.0.0, whose PIL/_typing
+# cannot be imported on this venv's Python 3.11 - and mflux imports it, so
+# FLUX.2 and Qwen-Edit died at start ("cannot import name '_IntegralLike'").
+# engine_constraints.txt now holds Pillow below 13; asking for the range here
+# makes uv move an installed 13.x back (12.x has the same API) and is a no-op
+# on a healthy venv. Not FATAL: video renders do not need it, and step 3 and
+# step 7 resolve Pillow under the same constraint again. Output defanged like
+# 8b (Codex 4.19.6): a uv network failure prints "error:", which Pinokio reads
+# as a failed step and would end the Update here, before the vendored reinstall
+# and the codec patch, over a best-effort step. pipefail keeps the WARN.
+( set -o pipefail
+  uv pip install --python "$VENV_PY" -c "$EC" 'pillow>=12.1.1,<13' 2>&1 \
+    | sed -u -e 's/[Ee][Rr][Rr][Oo][Rr]:/problem -/g' -e 's/[Ee]rrno /errno-/g' ) \
+  || echo 'WARN: Pillow could not be moved below 13 - image renders (FLUX.2, Qwen-Edit) may not start; re-run Update.'
+
 # ---- 3. Re-install the three vendored packages ------------------------------
 # This is what actually moves an existing user's RUNTIME: a bare git checkout
 # leaves the previous copy in site-packages. `--reinstall` also replaces the

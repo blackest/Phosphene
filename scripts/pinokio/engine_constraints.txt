@@ -35,3 +35,12 @@ huggingface-hub>=1.5.0,<2.0
 mlx==0.31.1
 mlx-lm==0.31.1
 mlx-metal==0.31.1
+# Pillow below 13 (4.19.6). Pillow 13.0.0 (2026-10-16) made PIL/_typing.py
+# import `from numbers import _IntegralLike` at module level, leaning on Python
+# 3.15's lazy imports to never run it. This venv is Python 3.11, where it runs
+# and fails, and mflux 0.18.0 imports PIL._typing (mflux/utils/image_util.py):
+# every FLUX.2 / Qwen-Edit render on an install that resolved Pillow 13 died
+# with "ImportError: cannot import name '_IntegralLike' from 'numbers'". mflux
+# itself asks only for pillow>=12.1.1, which is the floor here. Video was not
+# affected. image_engine.mflux_env_fault() reads this line.
+pillow>=12.1.1,<13

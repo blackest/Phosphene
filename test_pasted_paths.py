@@ -215,6 +215,9 @@ SHIPPED = [
     "mlx_ltx_panel.py", "mlx_warm_helper.py", "image_engine.py", "storyboard_edit.py",
     "storyboard_planner.py", "panel/routes_meta.py", "panel/routes_train.py",
     "scripts/check_output_codec.py", "scripts/join_smooth.py", "scripts/publish_pack_release.py",
+    # Split out of mlx_ltx_panel.py in 4.19.6 (#110-#112): the code that moved
+    # keeps the guard it had while it lived in the panel.
+    "civitai_client.py", "usage_stats.py", "train_support.py",
 ]
 
 

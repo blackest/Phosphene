@@ -3311,10 +3311,36 @@ def _new_train_job_id() -> str:
     return f"trn-{ts}-{suffix}"
 
 
-def _train_dataset_dir(job_id: str) -> Path:
-    """Per-job dataset folder. Holds images/, captions/, spec.json."""
-    p = TRAIN_DIR / job_id
-    return p
+# ---- LoRA training support: dataset and caption-map helpers, completed-run listing, model preflight, failure classification. (moved to train_support.py) ---------------------------------
+# The helpers around a training job (the job itself, run_train_job_inner, stays in the panel): dataset folders and caption maps, the dev-transformer install, time estimates, advice, and turning a runner event or exit code into a plain-English error.
+# The names stay importable from here: routes and tests reach them as P.<name>.
+# P is handed over right here (not in the route-wiring loop below) because this
+# module has no routes of its own; sys.modules[__name__] is the running panel
+# even while it is still importing.
+import train_support as _train_support
+from train_support import (  # noqa: F401  (re-exported on purpose)
+    _train_caption_map_path,
+    _train_dataset_dir,
+    _train_encode_retry_wanted,
+    _train_estimate_seconds,
+    _train_gemma_fallback_max_length,
+    _train_install_dev_transformer,
+    _train_list_completed,
+    _train_phase_from_line,
+    _train_read_caption_map,
+    _train_reconcile_captions,
+    _train_reconcile_one,
+    _train_release_render_memory,
+    _train_required_models,
+    _train_set_caption_map_entry,
+    _train_weak_advice,
+    _train_wipe_caption_conditions,
+    _train_write_caption_map,
+    train_error_for_exit,
+    train_error_from_event,
+)
+_train_support.P = sys.modules[__name__]
+
 
 
 def _safe_job_id(job_id: str) -> str:
@@ -3394,92 +3420,16 @@ def _caption_word_count(text: str) -> int:
 _TRAIN_CAPTION_MAP_NAME = "caption_map.json"
 
 
-def _train_caption_map_path(dataset_dir: Path) -> Path:
-    return dataset_dir / _TRAIN_CAPTION_MAP_NAME
 
 
-def _train_read_caption_map(dataset_dir: Path) -> dict[str, str]:
-    p = _train_caption_map_path(dataset_dir)
-    if not p.is_file():
-        return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items()
-                    if isinstance(k, str) and isinstance(v, str)}
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {}
 
 
-def _train_write_caption_map(dataset_dir: Path, mapping: dict[str, str]) -> None:
-    p = _train_caption_map_path(dataset_dir)
-    try:
-        p.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
-    except OSError:
-        pass
 
 
-def _train_set_caption_map_entry(dataset_dir: Path,
-                                 original_stem: str,
-                                 saved_stem: str) -> None:
-    m = _train_read_caption_map(dataset_dir)
-    m[original_stem] = saved_stem
-    _train_write_caption_map(dataset_dir, m)
 
 
-def _train_reconcile_one(dataset_dir: Path,
-                         original_stem: str,
-                         saved_stem: str) -> bool:
-    """If a caption file exists under `original_stem.txt`, rename it to
-    `saved_stem.txt`. Used when the user uploads `image_001.txt` BEFORE its
-    matching `image_001.png` arrives. Returns True if a paired caption now
-    sits under `<captions>/<saved_stem>.txt`."""
-    captions_dir = dataset_dir / "captions"
-    saved_path = captions_dir / f"{saved_stem}.txt"
-    if saved_path.is_file():
-        return True
-    if original_stem == saved_stem:
-        return False
-    parked = captions_dir / f"{original_stem}.txt"
-    if parked.is_file():
-        try:
-            parked.rename(saved_path)
-            return True
-        except OSError:
-            return False
-    return False
 
 
-def _train_reconcile_captions(dataset_dir: Path) -> tuple[int, int, list[str]]:
-    """Called on training start. Walks images/ + captions/, ensures every
-    caption under an *original* stem in caption_map.json is moved to its
-    saved stem so the trainer's per-image lookup hits. Returns
-    (paired_count, total_images, warnings)."""
-    images_dir = dataset_dir / "images"
-    captions_dir = dataset_dir / "captions"
-    cmap = _train_read_caption_map(dataset_dir)
-    if not images_dir.is_dir():
-        return 0, 0, ["images dir missing"]
-    images = [p for p in sorted(images_dir.iterdir())
-              if p.is_file() and p.suffix.lower() in TRAIN_IMAGE_EXTS]
-    total = len(images)
-    warnings: list[str] = []
-    if not captions_dir.is_dir():
-        return 0, total, warnings
-    for original, saved in cmap.items():
-        if original == saved:
-            continue
-        parked = captions_dir / f"{original}.txt"
-        target = captions_dir / f"{saved}.txt"
-        if parked.is_file() and not target.is_file():
-            try:
-                parked.rename(target)
-            except OSError as e:
-                warnings.append(f"could not move {parked.name} → {target.name}: {e}")
-    paired = sum(1 for img in images
-                 if (captions_dir / f"{img.stem}.txt").is_file())
-    return paired, total, warnings
 
 
 def _suggest_trigger_token() -> str:
@@ -3565,97 +3515,8 @@ def _caption_trigger_mismatches(
     return mismatched, (dominant[0] if dominant else None)
 
 
-def _train_estimate_seconds(preset: str, image_count: int, *,
-                            steps_override: int | None = None,
-                            is_style: bool = False) -> int:
-    """Wall-time estimate in seconds for a training run. The image count
-    has a small overhead for the preprocess pass (image → VAE latent
-    cache, ~3 s/image on M4 Max), then `steps * seconds_per_step` for
-    the train loop itself.
-
-    `is_style` switches the preset lookup table — style training pulls
-    its seconds_per_step from TRAIN_STYLE_PRESETS, not TRAIN_PRESETS."""
-    table = TRAIN_STYLE_PRESETS if is_style else TRAIN_PRESETS
-    cfg = table.get(preset) or table["quick"]
-    # Steps derive from epochs × image_count; advanced override wins.
-    steps = steps_override if steps_override else _preset_steps_for(cfg, image_count)
-    preprocess = 3.0 * max(0, image_count)
-    train = float(steps) * float(cfg["seconds_per_step"])
-    return int(preprocess + train + 30)  # +30 s for setup + checkpoint write
 
 
-def _train_list_completed() -> list[dict]:
-    """Scan mlx_models/loras/ for .safetensors with a Phosphene-trained
-    sidecar (`kind=train_character` OR `kind=train_style`) and return one
-    record per discovered run for the Trained-LoRAs list in the Train tab.
-    Surfacing both kinds in a single list lets the user see their full
-    training inventory in one place; the UI filters by `train_type` to show
-    the kind that matches the active train-type toggle (and lists everything
-    when "All" is selected)."""
-    out: list[dict] = []
-    if LORAS_DIR.exists():
-        for p in sorted(LORAS_DIR.iterdir(),
-                        key=lambda x: x.stat().st_mtime if x.exists() else 0,
-                        reverse=True):
-            if p.suffix.lower() != ".safetensors":
-                continue
-            # Style LoRAs use a `.style.safetensors` suffix, so the sidecar
-            # is `.style.json` not `.json`. Probe both paths.
-            sidecar_candidates = [p.with_suffix(".json")]
-            if p.name.endswith(".style.safetensors"):
-                sidecar_candidates.insert(
-                    0, p.with_name(p.name[: -len(".safetensors")] + ".json")
-                )
-            sidecar = next((s for s in sidecar_candidates if s.is_file()), None)
-            if sidecar is None:
-                continue
-            try:
-                meta = json.loads(sidecar.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            kind = meta.get("kind")
-            if kind not in ("train_character", "train_style"):
-                continue
-            try:
-                stat = p.stat()
-            except OSError:
-                continue
-            verdict = _adapter_verdict(meta)
-            out.append({
-                "id": meta.get("job_id") or p.stem,
-                "name": meta.get("name") or p.stem,
-                "trigger": meta.get("trigger") or "",
-                "preset": meta.get("preset") or "",
-                "kind": kind,
-                "train_type": meta.get("train_type")
-                                or ("style" if kind == "train_style"
-                                    else "character"),
-                "path": str(p),
-                "filename": p.name,
-                "size_mb": round(stat.st_size / (1024 * 1024), 1),
-                "created_at": meta.get("created_at") or stat.st_mtime,
-                "image_count": meta.get("image_count") or 0,
-                # WHETHER THIS FILE CAN DO ANYTHING, carried out of the
-                # sidecar so the library can warn before somebody spends a
-                # render finding out. "unknown" for anything trained by a
-                # build that did not measure — silence is not weakness, and a
-                # chip on every older LoRA would be noise nobody could act on.
-                "adapter_verdict": verdict,
-                # AND WHAT TO DO ABOUT IT. A verdict the user cannot act on
-                # sends them to a GitHub thread to find out what their own
-                # number meant (#62); the remedy travels with the verdict, and
-                # is hardware-aware because on a sub-64 GB Mac "use High" is
-                # not a thing that machine can do.
-                "adapter_advice": (
-                    _train_weak_advice(
-                        verdict,
-                        str(meta.get("preset") or ""),
-                        kind == "train_style",
-                    )
-                    if verdict not in ("ok", "unknown") else ""
-                ),
-            })
-    return out
 
 
 def _adapter_verdict(meta: dict) -> str:
@@ -3673,295 +3534,10 @@ def _adapter_verdict(meta: dict) -> str:
     return "unknown"
 
 
-def _train_weak_advice(verdict: str, preset: str = "", is_style: bool = False) -> str:
-    """One sentence a user can ACT on when their adapter measures weak/inert.
-
-    The measurement shipped in v4.6.0 and the number was correct; what it did
-    not do was tell anyone what to do about it. A first-time user on the Quick
-    preset read "1.98e-04", found nothing in the panel that explained it, and
-    ended up reading a 21-comment GitHub thread to learn that rank 8 has never
-    carried a face (#62). The verdict without the remedy is the actual product
-    failure in that issue.
-
-    The remedy is hardware-dependent, which is why this is a function and not
-    a constant: on a Mac under 64 GB `_select_train_profile` rewrites the whole
-    table and *High is rank 8 at 500 steps on two projections*, so "train again
-    on High" would be advice that machine cannot honour.
-    """
-    verdict = (verdict or "").lower()
-    if verdict == "inert":
-        return (
-            "This adapter carries no weight delta at all — every low-rank "
-            "product is exactly zero, so it cannot change a single pixel. "
-            "Treat the run as failed rather than as a weak result: nothing "
-            "was learned. Check the Logs for a trainer error, then train "
-            "again."
-        )
-    compact = bool(TRAIN_PROFILE.get("compact"))
-    if is_style:
-        head = ("This style adapter came out weak: the deltas it learned may "
-                "be too small to visibly change a render.")
-    else:
-        head = ("This character came out weak: the deltas it learned are "
-                "below the level any adapter that has carried a face here "
-                "has ever measured, so renders will most likely look "
-                "LoRA-free.")
-    if compact:
-        ram = TRAIN_PROFILE.get("ram_gb")
-        where = f"{ram} GB" if ram else "under 64 GB"
-        return (
-            f"{head} This Mac has {where}, so training runs the compact "
-            "profile — even High is rank 8 / 500 steps / 448px on two of the "
-            "four attention projections, not the rank-32 recipe that was "
-            "graded on a face. No preset on this machine reaches that recipe, "
-            "so this is the hardware and not your photos. More images and "
-            "sharper, more varied ones still help; a 64 GB-class Mac is what "
-            "unlocks the graded recipe."
-        )
-    if (preset or "").lower() != "high":
-        return (
-            f"{head} Train again on the High preset — rank 8 (Quick) and "
-            "rank 16 (Medium) have never carried an identity here, and High "
-            "is the only recipe that has. Raising the character strength "
-            "toward 2.0 helps a weak adapter a little; it cannot rescue one "
-            "this far under the floor."
-        )
-    return (
-        f"{head} This was already the High preset, so the next levers are the "
-        "dataset rather than the recipe: more images (20-40), sharper and more "
-        "varied in pose and lighting, and captions that name the trigger plainly. "
-        "Please attach the training log to https://github.com/mrbizarro/phosphene/issues/62 "
-        "— a weak High run is the case that issue is still open on."
-    )
 
 
-def _train_required_models() -> list[dict]:
-    """Return the list of model files Train Character needs and whether each
-    is present locally. Surfaces missing models to the UI so the user can
-    one-click download them via the existing hf flow.
-
-    Train Character requires the FULL-PRECISION `transformer-dev.safetensors`
-    from the LTX-2.3 Q8 repo (~21 GB). The dev base is required because
-    distilled is structurally wrong for training (different sigma schedule
-    than the trainer's flow-matching objective) — and it must be the Q8
-    repo's full-precision copy because the Q4 repo's transformer-dev is
-    QUANTIZED (~11 GB): the trainer refuses it (train.py's
-    FULL_DEV_MIN_BYTES) since it silently trains a near-zero LoRA (#35).
-    The default install ships neither, to save disk for inference-only
-    users.
-
-    Gemma + the rest of the Q4 stack (vae, audio, etc.) are already required
-    for inference so they should already be present, but we check anyway.
-    """
-    q4_local_dir = ROOT / "mlx_models" / "ltx-2.3-mlx-q4"
-    q8_local_dir = ROOT / "mlx_models" / "ltx-2.3-mlx-q8"
-    gemma_local_dir = ROOT / "mlx_models" / "gemma-3-12b-it-4bit"
-    gemma_repo_id = "mlx-community/gemma-3-12b-it-4bit"
-
-    def _file_present(local_dir: Path, repo_id: str, filename: str,
-                      *, extra_dirs: list[Path] | None = None,
-                      min_bytes: int = _MIN_FILE_BYTES) -> bool:
-        """Check known locations for a model file in this order:
-
-          1. The primary local_dir (where the helper expects it by default).
-          2. Any `extra_dirs` callers list explicitly — used for files that
-             can legitimately live in more than one place. The dev
-             transformer is the canonical example: original downloads
-             land in mlx_models/ltx-2.3-mlx-q4/ but Phosphene also ships
-             a Q8-friendly copy under mlx_models/ltx-2.3-mlx-q8/, and the
-             trainer happily loads either. Without this fallback the
-             preflight reports "missing" on installs that only have the
-             Q8-side copy and prompts an unnecessary 11 GB redownload.
-          3. The configured HF_HOME hub for repo_id.
-          4. The user-default HF cache (~/.cache/huggingface/hub) — covers
-             installs where HF_HOME wasn't set at first download time and
-             weights landed in the default location.
-        """
-        candidates: list[Path] = [local_dir / filename]
-        for d in (extra_dirs or []):
-            candidates.append(d / filename)
-        cache_dir = _repo_hf_cache_dir(repo_id)
-        if cache_dir is not None:
-            candidates.append(cache_dir / filename)
-        # Last-resort: default HF cache, regardless of HF_HOME. Matches what
-        # huggingface_hub does when neither env var is set. Old downloads
-        # often live here even when HF_HOME is now pointing elsewhere.
-        safe = repo_id.replace("/", "--")
-        default_root = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{safe}" / "snapshots"
-        try:
-            if default_root.is_dir():
-                snaps = sorted(default_root.iterdir(),
-                               key=lambda d: d.stat().st_mtime, reverse=True)
-                if snaps:
-                    candidates.append(snaps[0] / filename)
-        except OSError:
-            pass
-        for c in candidates:
-            try:
-                if c.exists() and c.stat().st_size >= min_bytes:
-                    return True
-            except OSError:
-                continue
-        return False
-
-    # Mirror of lora_lab/train.py FULL_DEV_MIN_BYTES: anything smaller is a
-    # quantized transformer-dev, which the trainer refuses. The preflight
-    # must not show green on a file the trainer will reject (#35).
-    _FULL_DEV_MIN_BYTES = 15 * 1000**3
-
-    items = [
-        {
-            # THE ASSUMPTION THAT EXPIRED. This function's own docstring says
-            # "the rest of the Q4 stack (vae, audio, etc.) are already required
-            # for inference so they should already be present" — true right up
-            # until v4.0, when a fresh install stopped fetching LTX-2.3 at all.
-            # The trainer runs against 2.3 and needs its VAE, audio VAE and
-            # vocoder; without this row the Train tab would have looked ready
-            # and failed at load time on a pack nobody told the user about.
-            "key": "ltx23_base",
-            "label": "LTX-2.3 base pack (training runs against 2.3)",
-            "blurb": "The trainer runs against LTX-2.3, not 2.5 — it needs 2.3's "
-                     "VAE, audio VAE and vocoder. Your clips still render on "
-                     "LTX-2.5; this is training-only. A fresh v4.0 install does "
-                     "not download it, so it is fetched when you want to train.",
-            "repo_id": "dgrauet/ltx-2.3-mlx-q4",
-            "filename": "vae_decoder.safetensors",
-            "local_dir": str(q4_local_dir),
-            "size_gb": 20.48,
-            "ready": _file_present(q4_local_dir, "dgrauet/ltx-2.3-mlx-q4",
-                                   "vae_decoder.safetensors"),
-        },
-        {
-            "key": "ltx_dev_transformer",
-            "label": "LTX-2.3 dev transformer (training-only, full precision)",
-            # SYS-15/SYS-42: "the dev transformer has the right flow-matching
-            # schedule for LoRA-from-images training" was lab jargon a
-            # creator can't act on. Outcome language: what it's for, and
-            # what goes wrong if the wrong copy is used.
-            "blurb": "Required for training — a different file from the one "
-                     "your renders already use. Must be the full-precision "
-                     "copy (~21 GB): a smaller, compressed copy trains a "
-                     "LoRA that looks fine in the log and does nothing when "
-                     "you use it.",
-            "repo_id": "dgrauet/ltx-2.3-mlx-q8",
-            "filename": "transformer-dev.safetensors",
-            "local_dir": str(q8_local_dir),
-            "size_gb": 20.6,
-            # Size-gated: an 11 GB quantized dev (the old preflight's Q4
-            # download, still on many disks) must show NOT-ready, because
-            # the trainer refuses it and the LoRA comes out dead (#35).
-            "ready": _file_present(q8_local_dir, "dgrauet/ltx-2.3-mlx-q8",
-                                   "transformer-dev.safetensors",
-                                   extra_dirs=[q4_local_dir],
-                                   min_bytes=_FULL_DEV_MIN_BYTES),
-        },
-        {
-            "key": "gemma_text_encoder",
-            "label": "Gemma 3 12B (text encoder)",
-            "blurb": "Encodes prompts for both inference and training. Already "
-                     "required by Phosphene's renderer, so this is usually green.",
-            "repo_id": gemma_repo_id,
-            "filename": "config.json",
-            "local_dir": str(gemma_local_dir),
-            "size_gb": 6.0,
-            "ready": _file_present(gemma_local_dir, gemma_repo_id, "config.json"),
-        },
-    ]
-    return items
 
 
-def _train_install_dev_transformer(push_log) -> dict:
-    """Trigger an hf download for just `transformer-dev.safetensors` from
-    the LTX-2.3 Q8 repo — the FULL-PRECISION copy the trainer requires.
-    (Until v3.4.1 this pulled the Q4 repo's transformer-dev, which is
-    quantized: the trainer refuses it and the LoRA trains dead — #35.)
-    Reuses the same `hf download` binary the existing
-    HF download flow uses; runs synchronously in a worker thread so the
-    caller can stream progress (the panel currently invokes this from a
-    /train/install endpoint that returns quickly + then polls /status).
-
-    Returns {"ok": True, "started": True, "repo_id": ...} or {"ok": False,
-    "error": "..."} if the download couldn't be started (already running,
-    binary missing, etc.).
-    """
-    import subprocess
-    if DOWNLOAD["active"]:
-        return {"ok": False,
-                "error": f"another download is already active "
-                         f"({DOWNLOAD.get('repo_id', '?')})."}
-
-    repo_id = "dgrauet/ltx-2.3-mlx-q8"
-    local_dir = ROOT / "mlx_models" / "ltx-2.3-mlx-q8"
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    hf_bin = HF_BIN if HF_BIN is not None else _resolve_hf()
-    if hf_bin is None:
-        return {"ok": False, "error": "hf CLI not found on PATH."}
-
-    cmd = [str(hf_bin), "download", repo_id,
-           "--include", "transformer-dev.safetensors",
-           "--local-dir", str(local_dir)]
-
-    env = dict(os.environ)
-    hf_token = _active_hf_token()
-    if hf_token:
-        env["HF_TOKEN"] = hf_token
-        env["HUGGING_FACE_HUB_TOKEN"] = hf_token
-
-    with DOWNLOAD_LOCK:
-        DOWNLOAD["active"] = True
-        DOWNLOAD["key"] = "ltx_dev_transformer"
-        DOWNLOAD["repo_id"] = repo_id
-        DOWNLOAD["started_ts"] = time.time()
-        DOWNLOAD["last_line"] = ""
-
-    def _runner():
-        try:
-            push_log(f"[hf] dev transformer download started "
-                     f"({repo_id} / transformer-dev.safetensors, ~21 GB — "
-                     f"the full-precision copy training requires).")
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, errors="replace", bufsize=1, env=env, start_new_session=True)
-            if not _download_register(proc):
-                push_log("[hf] dev transformer download cancelled.")
-                return
-            buf = ""
-            assert proc.stdout is not None
-            while True:
-                ch = proc.stdout.read(1)
-                if not ch:
-                    break
-                if ch in ("\n", "\r"):
-                    line = buf.strip()
-                    buf = ""
-                    if line:
-                        with DOWNLOAD_LOCK:
-                            DOWNLOAD["last_line"] = line[:200]
-                        push_log(f"[hf:dev] {line[:300]}")
-                else:
-                    buf += ch
-            rc = proc.wait()
-            if rc == 0:
-                push_log("[hf] dev transformer downloaded successfully.")
-            else:
-                push_log(f"[hf] dev transformer download exited with code {rc}.")
-        except Exception as exc:
-            push_log(f"[hf] dev transformer crashed: {exc}")
-        finally:
-            with DOWNLOAD_LOCK:
-                DOWNLOAD["active"] = False
-                DOWNLOAD["key"] = None
-                DOWNLOAD["repo_id"] = None
-                DOWNLOAD["started_ts"] = None
-                DOWNLOAD["last_line"] = ""
-                DOWNLOAD["proc"] = None
-                DOWNLOAD["pgid"] = None
-                DOWNLOAD["cancelled"] = False
-
-    threading.Thread(target=_runner, daemon=True, name="hf-dev-download").start()
-    return {"ok": True, "started": True, "repo_id": repo_id,
-            "filename": "transformer-dev.safetensors"}
 
 
 # One in-flight Turbo fetch at a time, mirroring the sample-character lane:
@@ -7889,334 +7465,50 @@ atexit.register(_kill_active_download)
 # https://github.com/civitai/civitai/wiki/REST-API-Reference but we trim
 # the response server-side so the panel only ships what the UI needs.
 
-CIVITAI_API_BASE = "https://civitai.com/api/v1"
-CIVITAI_USER_AGENT = "phosphene/1.0 (https://github.com/mrbizarro/phosphene)"
+# ---- CivitAI client (moved to civitai_client.py) -----------------------------
+# The search, host allowlist and download code lives in civitai_client.py now.
+# These names stay importable from here: panel/routes_loras.py and the tests
+# reach them as P.<name>, and the module is handed P at wiring time below.
+import civitai_client as _civitai_client
+from civitai_client import (  # noqa: F401  (re-exported on purpose)
+    CIVITAI_API_BASE,
+    CIVITAI_DL,
+    CIVITAI_DL_LOCK,
+    CIVITAI_USER_AGENT,
+    CivitaiDownloadCancelled,
+    _CIVITAI_BASE_MODELS_BY_CONTEXT,
+    _CIVITAI_DL_TOKEN_RE,
+    _CIVITAI_FAMILIES_BY_CONTEXT,
+    _CIVITAI_IMAGE_FAMILIES,
+    _CIVITAI_VIDEO_FAMILIES,
+    _civitai_dl_commit,
+    _civitai_dl_tick,
+    _civitai_download,
+    _civitai_host_allowed,
+    _civitai_opener,
+    _civitai_request,
+    _civitai_search,
+    civitai_dl_begin,
+    civitai_dl_cancel,
+    civitai_dl_end,
+    civitai_dl_state,
+    civitai_dl_token,
+)
 
 
-# 2026-05-31 security fix (deep-review). The CivitAI download path takes a
-# `download_url` from model metadata (attacker-influenceable) and sends the
-# user's API token in BOTH the URL (`?token=`) and an `Authorization: Bearer`
-# header. Two holes were closed:
-#   1. The old host gate was `netloc.endswith("civitai.com")` — which also
-#      matches `evilcivitai.com`. Now an EXACT host allowlist.
-#   2. Python's default HTTPRedirectHandler re-attaches the Authorization
-#      header across redirects to ANY host, so a crafted/compromised download
-#      that 30x-redirects off-domain would exfiltrate the token. The handler
-#      below strips Authorization on any cross-host redirect.
-def _civitai_host_allowed(netloc: str) -> bool:
-    """True only for civitai.com itself or a real *.civitai.com subdomain."""
-    host = (netloc or "").split("@")[-1].split(":")[0].strip().lower()
-    return host == "civitai.com" or host.endswith(".civitai.com")
 
 
-def _civitai_opener():
-    """A urllib opener that strips the Authorization header on any cross-host
-    redirect, so the CivitAI token never travels to a host the user didn't
-    authenticate to. Built lazily so urllib.request is imported before the
-    handler subclass is defined (no module-load import-order coupling)."""
-    import urllib.request
-    import urllib.parse
-
-    class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
-            if new_req is None:
-                return None
-            try:
-                # Keep Authorization only while staying inside the civitai.com
-                # domain (civitai.com -> images.civitai.com is legit). Strip it
-                # the moment a redirect leaves the domain — e.g. to a pre-signed
-                # CDN (which needs no auth anyway) or to an attacker's host.
-                new_netloc = urllib.parse.urlparse(newurl).netloc
-                if not _civitai_host_allowed(new_netloc):
-                    hdrs = {k: v for k, v in new_req.header_items()
-                            if k.lower() != "authorization"}
-                    new_req = urllib.request.Request(
-                        new_req.full_url, headers=hdrs, method=new_req.get_method())
-            except Exception:
-                # Reasoning about the redirect failed — fail closed.
-                try:
-                    new_req.remove_header("Authorization")
-                except Exception:
-                    pass
-            return new_req
-
-    return urllib.request.build_opener(_AuthStrippingRedirectHandler())
 
 
-def _civitai_request(path: str, params: dict | None = None,
-                     timeout: float = 20.0) -> dict:
-    """Minimal stdlib HTTP client for the CivitAI API. No third-party
-    deps so we don't pin requests / httpx into the install. Returns the
-    decoded JSON body or raises RuntimeError on non-2xx."""
-    import urllib.parse, urllib.request
-    url = f"{CIVITAI_API_BASE}{path}"
-    if params:
-        # urlencode handles the URL-quoting (spaces → %20 etc.) so
-        # baseModels=LTXV 2.3 makes it through unmangled.
-        url = url + "?" + urllib.parse.urlencode(params, doseq=True)
-    req = urllib.request.Request(url, headers={
-        "Accept": "application/json",
-        "User-Agent": CIVITAI_USER_AGENT,
-    })
-    api_key = _active_civitai_key()
-    if api_key:
-        req.add_header("Authorization", f"Bearer {api_key}")
-    # CivitAI's API throws the occasional 502/503/504 on a perfectly good
-    # request (owner hit "HTTP error 503" mid-search). Three attempts with a
-    # short back-off turn that into a pause instead of a dead search, and
-    # the message a user finally sees says what to do, not a status code.
-    import urllib.error
-    last: Exception | None = None
-    for attempt in range(3):
-        try:
-            with _civitai_opener().open(req, timeout=timeout) as resp:
-                body = resp.read().decode("utf-8", "replace")
-                return json.loads(body)
-        except urllib.error.HTTPError as exc:
-            last = exc
-            if exc.code in (500, 502, 503, 504, 429) and attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            if exc.code in (500, 502, 503, 504):
-                raise RuntimeError("CivitAI is busy right now (it answered "
-                                   f"{exc.code}). Try again in a few seconds.") from exc
-            if exc.code == 429:
-                raise RuntimeError("CivitAI is rate-limiting this Mac — wait a minute "
-                                   "and search again.") from exc
-            if exc.code in (401, 403):
-                raise RuntimeError("CivitAI refused the request (401/403) — check the "
-                                   "CivitAI API key in Settings.") from exc
-            raise RuntimeError(f"CivitAI answered HTTP {exc.code}.") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            last = exc
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            raise RuntimeError("Could not reach civitai.com — check the connection "
-                               "and try again.") from exc
-        except Exception as exc:                               # noqa: BLE001
-            raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
-    raise RuntimeError(f"{type(last).__name__}: {last}")
 
 
-# Sub-families for the image context. Each entry maps a UI family-pill id
-# to the list of CivitAI baseModel strings it covers. The "all" pill is
-# the union of every list below — built dynamically so adding a new
-# family stays a one-line edit. Probed against the live CivitAI API
-# 2026-05-20; CivitAI's taxonomy uses different names than what their
-# own model-card UI shows.
-#
-# Flux LoRAs are intentionally excluded — Phosphene's image engines are
-# Qwen-Image-Edit-2511 (via mflux) and HiDream-O1-Image-Dev. There's no
-# Flux engine exposed today, so surfacing Flux LoRAs in the browser
-# would just create install candidates that no engine can run.
-_CIVITAI_IMAGE_FAMILIES: dict[str, list[str]] = {
-    "qwen":    ["Qwen 2", "Qwen"],   # Qwen-Image-Edit-2511 + Qwen-Image (2509)
-    "hidream": ["HiDream-O1"],       # HiDream-O1-Image-Dev
-}
-# Sub-families for the VIDEO context — one per video ENGINE. Same mechanism
-# the image context uses, and for a stronger reason: LTX and H3 don't merely
-# prefer different LoRAs, they cannot load each other's at all (different
-# module tree, different runner, different loader). The family pill is
-# therefore not a convenience filter here, it is the lane selector, and
-# openCivitaiModal() preselects it from the ACTIVE engine so an LTX user's
-# default view is byte-for-byte what it was before H3 LoRAs existed.
-#
-# Both strings probed against the live CivitAI API rather than guessed:
-#   "LTXV 2.3"    verified 2026-05-20 — "LTX 2.3", "LTX-Video 2.3" and
-#                 "LTXV2.3" all return zero.
-#   "MiniMax H3"  verified 2026-08-09 — "MiniMax", "Hailuo" and "Hailuo H3"
-#                 all return zero; "MiniMax H3" is the only spelling with hits.
-_CIVITAI_VIDEO_FAMILIES: dict[str, list[str]] = {
-    "ltx": ["LTXV 2.3"],
-    "h3":  ["MiniMax H3"],
-}
-# family-map per context, so the `family` query param means the same thing on
-# both surfaces and adding a family stays a one-line edit in ONE of the two
-# dicts above.
-_CIVITAI_FAMILIES_BY_CONTEXT: dict[str, dict[str, list[str]]] = {
-    "video": _CIVITAI_VIDEO_FAMILIES,
-    "image": _CIVITAI_IMAGE_FAMILIES,
-}
-_CIVITAI_BASE_MODELS_BY_CONTEXT = {
-    # Video LoRAs — the default. Union of every video family; the `family`
-    # query param on /civitai/search narrows it to one engine's lane.
-    "video": [bm for bms in _CIVITAI_VIDEO_FAMILIES.values() for bm in bms],
-    # Image LoRAs — union of every family in _CIVITAI_IMAGE_FAMILIES.
-    # Sub-filtering happens via the `family` query param on /civitai/search.
-    "image": [bm for bms in _CIVITAI_IMAGE_FAMILIES.values() for bm in bms],
-}
+
 
 def spicy_mode_enabled() -> bool:
     """Return the single server-side authorization predicate for NSFW UI/data."""
     return bool(get_settings().get("spicy_mode", False))
 
 
-def _civitai_search(query: str = "", nsfw: bool = False,
-                    cursor: str = "", limit: int = 20,
-                    context: str = "video", family: str = "") -> dict:
-    """Search LoRAs. Returns the trimmed shape:
-        { "items": [{
-            "id", "name", "creator", "description", "tags", "downloads",
-            "rating", "nsfw", "preview_url", "version_id",
-            "download_url", "trigger_words", "recommended_strength",
-            "size_kb", "base_model"
-          }, ...],
-          "total_pages", "current_page" }
-    Each item carries everything the front end needs to render a card
-    AND everything the download endpoint needs to write a sidecar — no
-    second round-trip required to install."""
-    # Spicy mode gate (v2.0 — server-side authoritative). When the user
-    # hasn't enabled Spicy mode in Settings, force nsfw=False regardless
-    # of what the client sent. This keeps NSFW results out of casual /
-    # kid-accessible installs even if someone fiddles the client param.
-    spicy_on = spicy_mode_enabled()
-    if not spicy_on:
-        nsfw = False
-    # CivitAI's /models endpoint uses cursor-style pagination
-    # (`nextCursor` in the response → pass back as `cursor` on the next
-    # request). Page numbers are deprecated for this endpoint. We expose
-    # the same cursor flow to the panel UI so it can render a "Load more"
-    # affordance without faking pagination on top of cursors.
-    # Context-aware baseModels (2026-05-18). The Images workflow needs to
-    # see Flux / Qwen / HiDream LoRAs, NOT LTX-2.3 video LoRAs. Unknown
-    # contexts silently fall back to the video default so any caller that
-    # forgets to set context still gets sensible results.
-    base_models_filter = _CIVITAI_BASE_MODELS_BY_CONTEXT.get(
-        context, _CIVITAI_BASE_MODELS_BY_CONTEXT["video"]
-    )
-    # Sub-family narrowing. The browser exposes pills per context — "LTX-2.3"
-    # / "Hailuo H3" on video, "Qwen-Image" / "HiDream" on image — so users can
-    # scope the result set to the engine they're about to use. family=""
-    # (or missing, or "all") leaves the full context list active.
-    fam = (family or "").strip().lower()
-    _fam_map = _CIVITAI_FAMILIES_BY_CONTEXT.get(context) or {}
-    if fam and fam in _fam_map:
-        base_models_filter = _fam_map[fam]
-    # The CivitAI API accepts multi-value baseModels as repeated query
-    # params (`baseModels=X&baseModels=Y`), not comma-separated. Passing
-    # a list here triggers `urlencode(..., doseq=True)` in _civitai_request
-    # to emit the repeated form.
-    params: dict[str, object] = {
-        "types": "LORA",
-        "baseModels": base_models_filter,
-        "limit": limit,
-        "sort": "Most Downloaded",
-        "nsfw": "true" if nsfw else "false",
-    }
-    q = query.strip()
-    if q:
-        # CivitAI's text search (`query`) is a different backend from the
-        # browse listing and it does NOT honour `baseModels`: the two
-        # together return an empty page for every word ("turbo" → 0 while
-        # "Minimax H3 Turbo Loras" sits on page one of the un-queried list).
-        # So a typed search drops the server-side base filter, nudges the
-        # search with the engine's own word (the backend ranks "minimax
-        # turbo" all-H3), and the base-model filter is applied HERE on the
-        # results, paging until the page is full or the well runs dry.
-        _hint_words = {"h3": "minimax", "ltx": "ltx", "qwen": "qwen",
-                       "hidream": "hidream"}
-        # One engine → one hinted search. "All" → one hinted search per
-        # engine in the context, merged (a bare "anime" search fills its
-        # pages with SDXL LoRAs and the base filter leaves nothing).
-        _hints = ([_hint_words.get(fam, "")] if fam
-                  else [_hint_words.get(k, "") for k in (_fam_map or {}).keys()] or [""])
-        params.pop("baseModels", None)
-        params["limit"] = 50
-        _want = {bm.lower() for bm in base_models_filter}
-        raw_items: list[dict] = []
-        _seen: set = set()
-        raw = {}
-        for _hint in _hints:
-            _p = dict(params)
-            _p["query"] = (f"{_hint} {q}" if _hint and _hint not in q.lower() else q)
-            if cursor:
-                _p["cursor"] = cursor
-            for _page in range(4):
-                raw = _civitai_request("/models", params=_p)
-                for m in (raw.get("items") or []):
-                    _bm = str(((m.get("modelVersions") or [{}])[0]).get("baseModel") or "").lower()
-                    if _bm in _want and m.get("id") not in _seen:
-                        _seen.add(m.get("id"))
-                        raw_items.append(m)
-                _next = (raw.get("metadata") or {}).get("nextCursor")
-                if len(raw_items) >= limit or not _next:
-                    break
-                _p["cursor"] = _next
-            if len(raw_items) >= limit:
-                break
-        raw = {**raw, "items": raw_items[:limit]}
-    else:
-        if cursor:
-            params["cursor"] = cursor
-        raw = _civitai_request("/models", params=params)
-    items = []
-    for m in (raw.get("items") or []):
-        versions = m.get("modelVersions") or []
-        if not versions:
-            continue
-        v = versions[0]
-        files = v.get("files") or []
-        # Pick the first .safetensors file. CivitAI sometimes hosts
-        # multiple file variants (pruned, full, etc.); prefer the one
-        # marked `primary: true` if present, otherwise fall back to the
-        # first .safetensors.
-        primary = next((f for f in files if f.get("primary") and
-                        f.get("name", "").lower().endswith(".safetensors")),
-                       None) or next((f for f in files if
-                       f.get("name", "").lower().endswith(".safetensors")),
-                       None)
-        if not primary:
-            continue
-        images = v.get("images") or []
-        # Prefer the first image-type preview if any exist (some LTX LoRAs
-        # ship both video MP4s AND still images). Fall back to the first
-        # entry of any type. We pass the type back to the client so the
-        # renderer can pick <img> vs <video> appropriately — for LTX
-        # video LoRAs the previews are usually MP4s, which would just
-        # 404 inside an <img> tag.
-        preview_obj = (
-            next((img for img in images if img.get("type") == "image" and img.get("url")), None)
-            or next((img for img in images if img.get("url")), None)
-        )
-        preview = preview_obj.get("url") if preview_obj else None
-        preview_type = preview_obj.get("type") if preview_obj else None
-        creator = (m.get("creator") or {}).get("username") or "unknown"
-        # CivitAI puts trigger words on the version (`trainedWords`).
-        trigger = list(v.get("trainedWords") or [])
-        items.append({
-            "id": m.get("id"),
-            "version_id": v.get("id"),
-            "name": m.get("name") or f"model-{m.get('id')}",
-            "creator": creator,
-            "description": (m.get("description") or "")[:600],
-            "tags": list(m.get("tags") or []),
-            "downloads": (m.get("stats") or {}).get("downloadCount"),
-            "rating": (m.get("stats") or {}).get("rating"),
-            "nsfw": bool(m.get("nsfw")),
-            "preview_url": preview,
-            "preview_type": preview_type,        # "image" | "video" | None
-            "filename": primary.get("name"),
-            "size_kb": primary.get("sizeKB"),
-            "download_url": primary.get("downloadUrl"),
-            "trigger_words": trigger,
-            "recommended_strength": 1.0,    # CivitAI doesn't expose this; default
-            "base_model": v.get("baseModel"),
-            "civitai_url": f"https://civitai.com/models/{m.get('id')}",
-        })
-    # Defense-in-depth: when Spicy mode is off, also drop any items the
-    # API returned with nsfw=true. CivitAI's `nsfw=false` request param
-    # filters by image-tier (Soft/Mature/X) but model cards have a
-    # separate boolean we re-check here so nothing slips through.
-    if not spicy_on:
-        items = [it for it in items if not it.get("nsfw")]
-    metadata = raw.get("metadata") or {}
-    return {
-        "items": items,
-        "next_cursor": metadata.get("nextCursor"),
-        "has_more": bool(metadata.get("nextCursor")),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -8443,276 +7735,24 @@ def _hf_lora_download(repo_id: str, filename: str, meta: dict) -> dict:
             "layout": layout_info.get("layout"), "converted": bool(layout_info.get("converted"))}
 
 
-# ---- CivitAI download progress + cancel (4.18.0) ------------------------------
-# The browser's Install button used to say "Downloading…" for the whole of a
-# 300 MB-2 GB download with no number and no way out. The download still runs
-# inside its own POST (the server is threaded); the browser names it with a
-# random token, polls GET /civitai/download/state for bytes, and can POST
-# /civitai/download/cancel. A cancel stops the stream at the next chunk and
-# the existing .partial cleanup removes what had arrived — nothing half-
-# downloaded is ever registered as a LoRA.
-CIVITAI_DL: dict[str, dict] = {}
-CIVITAI_DL_LOCK = threading.Lock()
-_CIVITAI_DL_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
-class CivitaiDownloadCancelled(RuntimeError):
-    """The person pressed Cancel; the partial file is already gone."""
 
 
-def civitai_dl_token(raw) -> str:
-    t = str(raw or "").strip()
-    return t if _CIVITAI_DL_TOKEN_RE.match(t) else ""
 
 
-def civitai_dl_begin(token: str, name: str) -> None:
-    if not token:
-        return
-    with CIVITAI_DL_LOCK:
-        # A crashed tab never polls its entry away; keep the table small.
-        if len(CIVITAI_DL) > 32:
-            for k in list(CIVITAI_DL)[:-16]:
-                CIVITAI_DL.pop(k, None)
-        CIVITAI_DL[token] = {"state": "running", "bytes": 0, "total": 0,
-                             "name": str(name or "")[:120], "cancel": False}
 
 
-def civitai_dl_state(token: str) -> dict | None:
-    with CIVITAI_DL_LOCK:
-        e = CIVITAI_DL.get(token)
-        return dict(e) if e else None
 
 
-def civitai_dl_cancel(token: str) -> bool:
-    """True when the download will stop. False once it has passed the commit
-    point (every byte arrived, the file is being put in place) — a Cancel
-    then would answer "cancelled" for a LoRA that still installs."""
-    with CIVITAI_DL_LOCK:
-        e = CIVITAI_DL.get(token)
-        if not e or e.get("state") != "running":
-            return False
-        e["cancel"] = True
-        return True
 
 
-def _civitai_dl_commit(token: str) -> None:
-    """The commit point: honour a Cancel that arrived after the last chunk,
-    else close the door on any later one (state -> "installing")."""
-    if not token:
-        return
-    with CIVITAI_DL_LOCK:
-        e = CIVITAI_DL.get(token)
-        if not e:
-            return
-        if e.get("cancel"):
-            e["state"] = "cancelled"
-            raise CivitaiDownloadCancelled("Download cancelled — nothing was kept.")
-        e["state"] = "installing"
 
 
-def civitai_dl_end(token: str) -> None:
-    with CIVITAI_DL_LOCK:
-        CIVITAI_DL.pop(token, None)
 
 
-def _civitai_dl_tick(token: str, written: int, total: int) -> None:
-    """Record progress; raise when the person asked to stop."""
-    if not token:
-        return
-    with CIVITAI_DL_LOCK:
-        e = CIVITAI_DL.get(token)
-        if not e:
-            return
-        e["bytes"], e["total"] = int(written), int(total or 0)
-        if e.get("cancel"):
-            e["state"] = "cancelled"
-            raise CivitaiDownloadCancelled("Download cancelled — nothing was kept.")
 
 
-def _civitai_download(download_url: str, meta: dict, token: str = "") -> dict:
-    """Download a CivitAI .safetensors into the right LoRA dir for its base
-    model and write a sidecar JSON. Returns
-    { name, path, sidecar_path, size_bytes, lane }.
-    Streams to a .partial file then renames atomically — a Pinokio kill
-    mid-download leaves nothing the next scan would mistake for a
-    complete LoRA.
-
-    Lane routing (2026-08-09) is decided from the ITEM's own `base_model`,
-    not from which browser context the click came from. A MiniMax H3 LoRA
-    lands in the H3 weights tree even if the user found it while the browser
-    was showing "All", because the file's family is a property of the file,
-    and mis-filing it would put an unloadable adapter in the LTX picker."""
-    import urllib.parse, urllib.request
-    if not download_url:
-        raise RuntimeError("download_url required")
-    # Restrict to civitai.com to prevent the endpoint being used as a
-    # generic HTTP fetcher. Subdomains (e.g. images.civitai.com) are
-    # also OK because CivitAI sometimes redirects there.
-    parsed = urllib.parse.urlparse(download_url)
-    if parsed.scheme != "https" or not _civitai_host_allowed(parsed.netloc):
-        raise RuntimeError(f"refusing to download from {parsed.netloc}; "
-                           f"only civitai.com (and *.civitai.com) is allowed")
-    # CivitAI's download endpoint started requiring auth for many models
-    # in 2025+. The Authorization header sometimes works, but the
-    # canonical path is `?token=<key>` on the URL — and many CDN hops
-    # only honour the token in the URL. Try the URL form first when a
-    # key is available.
-    api_key_env = _active_civitai_key()
-    if api_key_env and "token=" not in (parsed.query or ""):
-        sep = "&" if parsed.query else "?"
-        download_url = download_url + sep + "token=" + urllib.parse.quote(api_key_env)
-    # Which engine's library does this belong to? _classify_lora_modes is the
-    # single source for that mapping — the picker filter, the sidecar and this
-    # router all read the same function, so a new family is one edit there.
-    lane = ("h3" if "video:h3" in _classify_lora_modes(meta.get("base_model"))
-            else "ltx")
-    loras_dir = _safe_h3_loras_dir() if lane == "h3" else _safe_loras_dir()
-    # Filename from meta (preferred — preserves CivitAI's name) or fall
-    # back to the URL's last path segment.
-    fname = (meta.get("filename") or
-             os.path.basename(parsed.path) or
-             f"civitai_{meta.get('id', 'unknown')}.safetensors")
-    if not fname.lower().endswith(".safetensors"):
-        fname += ".safetensors"
-    # Sanitize aggressively — CivitAI names can contain spaces and
-    # weirder characters; the helper later passes this filename through
-    # the safetensors loader which is filesystem-only and fine with
-    # spaces, but the picker UI is calmer with snake_case.
-    safe_fname = re.sub(r"[^A-Za-z0-9._-]+", "_", fname).strip("_")
-    target = loras_dir / safe_fname
-    if target.exists():
-        # Don't silently re-download. Surface the conflict so the user
-        # can decide (the UI will offer a choice; for now just skip).
-        return {
-            "name": meta.get("name") or target.stem,
-            "path": str(target),
-            "size_bytes": target.stat().st_size,
-            "lane": lane,
-            "skipped": True,
-            "reason": "already exists",
-        }
-    tmp = target.with_suffix(target.suffix + ".partial")
-    push(f"[civitai] downloading {meta.get('name') or safe_fname}")
-    api_key = _active_civitai_key()
-    headers = {"User-Agent": CIVITAI_USER_AGENT}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    req = urllib.request.Request(download_url, headers=headers)
-    bytes_written = 0
-    last_log = 0.0
-    _opener = _civitai_opener()  # strips Authorization on cross-host redirect
-    try:
-        try:
-            resp_ctx = _opener.open(req, timeout=60)
-        except urllib.request.HTTPError as he:
-            # Surface the 401 case with a clear remediation. CivitAI now
-            # requires API tokens for most LoRA downloads, even SFW ones,
-            # but the API key for the search endpoint is optional — so a
-            # user can browse without setting up auth and only hit this
-            # wall on first install.
-            if he.code == 401:
-                raise RuntimeError(
-                    "CivitAI returned 401 Unauthorized. CivitAI requires an "
-                    "API token for LoRA downloads. Get one at "
-                    "https://civitai.com/user/account, then set the "
-                    "CIVITAI_API_KEY environment variable before launching "
-                    "the panel (or in Pinokio's Phosphene start script). "
-                    "Restart Pinokio's Phosphene to pick it up."
-                )
-            raise
-        with resp_ctx as resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            _civitai_dl_tick(token, 0, total)
-            with tmp.open("wb") as fh:
-                while True:
-                    chunk = resp.read(1024 * 256)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    bytes_written += len(chunk)
-                    _civitai_dl_tick(token, bytes_written, total)
-                    now = time.time()
-                    if now - last_log > 1.0:
-                        if total:
-                            pct = int(100 * bytes_written / total)
-                            push(f"[civitai] {pct}% · "
-                                 f"{bytes_written // (1024*1024)}/"
-                                 f"{total // (1024*1024)} MB")
-                        else:
-                            push(f"[civitai] {bytes_written // (1024*1024)} MB")
-                        last_log = now
-        _civitai_dl_commit(token)
-        os.replace(tmp, target)
-    except CivitaiDownloadCancelled:
-        try: tmp.unlink()
-        except OSError: pass
-        push(f"[civitai] cancelled {meta.get('name') or safe_fname} — partial file removed")
-        raise
-    except Exception:
-        try: tmp.unlink()
-        except OSError: pass
-        raise
-    push(f"[civitai] saved {target.name} ({bytes_written // (1024*1024)} MB)")
-    # ---- H3 lane: classify the key layout NOW, at install time --------------
-    # Doing it here rather than at render time means the ComfyUI rename happens
-    # once, in front of the user, with the log open — and a diffusers-namespace
-    # LoRA is refused at the moment they clicked Install instead of 30 s into a
-    # 20-minute render. The file is REMOVED on refusal: leaving an unloadable
-    # adapter in the library would put a permanently-failing entry in the
-    # picker, which is worse than the wasted download it cost to find out.
-    layout_info = {"layout": None, "converted": False, "prefix": ""}
-    if lane == "h3":
-        try:
-            layout_info = _h3_lora_prepare(target)
-        except Exception as exc:
-            try:
-                target.unlink()
-            except OSError:
-                pass
-            push(f"[civitai] refused {target.name}: {exc}")
-            raise RuntimeError(str(exc)) from exc
-    strength = (_h3_lora_browser_strength(target, meta, "civitai") if lane == "h3"
-                else float(meta.get("recommended_strength") or 1.0))
-    # Write the sidecar — kept tolerant of meta gaps so a partial
-    # payload still produces a usable picker entry.
-    sidecar = target.with_suffix(".json")
-    sidecar_data = {
-        "name": meta.get("name") or target.stem,
-        "description": meta.get("description") or "",
-        "trigger_words": (list(meta.get("trigger_words") or [])
-                          or list(layout_info.get("trigger_words") or [])),
-        "recommended_strength": strength,
-        "preview_url": meta.get("preview_url"),
-        "base_model": (meta.get("base_model")
-                       or ("MiniMax H3" if lane == "h3" else "LTXV 2.3")),
-        "civitai_id": meta.get("id"),
-        "civitai_version_id": meta.get("version_id"),
-        "civitai_url": meta.get("civitai_url"),
-        "downloaded_at": iso_now(),
-        "downloaded_size_bytes": bytes_written,
-        # What we found, and what we did about it. Written for both lanes so
-        # the field means the same thing everywhere; None on LTX, where the
-        # panel does no layout surgery.
-        "lora_layout": layout_info.get("layout"),
-        "lora_converted_prefix": (layout_info.get("prefix") or None
-                                  if layout_info.get("converted") else None),
-    }
-    try:
-        atomic_write_text(sidecar, json.dumps(sidecar_data, indent=2))
-    except Exception as exc:
-        push(f"[civitai] WARN: could not write sidecar ({exc})")
-    return {
-        "name": sidecar_data["name"],
-        "path": str(target),
-        "sidecar_path": str(sidecar),
-        "size_bytes": bytes_written,
-        # "ltx" | "h3" — the client uses this to decide whether it may
-        # auto-enable the new LoRA on the currently-selected engine.
-        "lane": lane,
-        "layout": layout_info.get("layout"),
-        "converted": bool(layout_info.get("converted")),
-        "skipped": False,
-    }
 
 
 # Aspect presets — width × height (model-safe, multiples of 32)
@@ -10653,6 +9693,14 @@ _CRASH_LINE_CLASSES = (
     ("assertion", ("assertion failed",)),
 )
 CRASH_LINES = tuple(c for c, _ in _CRASH_LINE_CLASSES) + ("none",)
+# 4.19.6: the non-watchdog GPU aborts in prompt encoding that pass on a later,
+# fresh start (fleet 4.19.2+: M2 Max / macOS 15.x, M1 Max / macOS 26.6) - see
+# WarmHelper.run. Re-run once, in a fresh helper, after this pause.
+METAL_ABORT_RETRY_LINES = ("gpu_internal", "gpu_victim", "gpu_other")
+try:
+    METAL_ABORT_COOLDOWN_SEC = max(0, int(os.environ.get("LTX_METAL_ABORT_COOLDOWN_SEC") or 45))
+except ValueError:
+    METAL_ABORT_COOLDOWN_SEC = 45
 
 
 #: 4.19.4 (Codex): the plain-language names below are GPU errors only on a
@@ -18500,40 +17548,32 @@ def _analytics_pack_state() -> dict:
     }
 
 
-def _usage_log_rotate() -> None:
-    """Halve the local mirror when it hits the cap. Keeps the NEWEST half —
-    the dashboard's windows are all 7/14-day, so old lines have no readers.
-    Rewrites in place via the same temp+replace shape the rest of the panel
-    uses so a kill mid-rotate can't truncate the log to nothing."""
-    try:
-        lines = USAGE_LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return
-    keep = lines[len(lines) // 2:]
-    tmp = USAGE_LOG_FILE.with_name(f".{USAGE_LOG_FILE.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
-        os.replace(tmp, USAGE_LOG_FILE)
-    except OSError:
-        try: tmp.unlink()
-        except OSError: pass
+# ---- Usage log and stats report: the local usage log, the local report and the fleet (PostHog) report. (moved to usage_stats.py) ---------------------------------
+# Reads and writes state/usage-log.jsonl and builds the numbers behind the stats dashboard; the event contract is docs/ANALYTICS.md.
+# The names stay importable from here: routes and tests reach them as P.<name>.
+# P is handed over right here (not in the route-wiring loop below) because this
+# module has no routes of its own; sys.modules[__name__] is the running panel
+# even while it is still importing.
+import usage_stats as _usage_stats
+from usage_stats import (  # noqa: F401  (re-exported on purpose)
+    _usage_attach_local,
+    _usage_fleet_query_one,
+    _usage_fleet_report,
+    _usage_growth_block,
+    _usage_local_report,
+    _usage_log_append,
+    _usage_log_read,
+    _usage_log_rotate,
+    _usage_pack_loss_summary,
+    _usage_parse_ts,
+    _usage_rank,
+    _usage_report,
+    _usage_rolling_weeks,
+)
+_usage_stats.P = sys.modules[__name__]
 
 
-def _usage_log_append(record: dict) -> None:
-    """Append one JSON line to the local mirror. Never raises."""
-    try:
-        _ensure_state_dir()
-        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-        with _USAGE_LOG_LOCK:
-            try:
-                if USAGE_LOG_FILE.stat().st_size + len(line) > USAGE_LOG_MAX_BYTES:
-                    _usage_log_rotate()
-            except OSError:
-                pass  # missing file is the normal first-write case
-            with USAGE_LOG_FILE.open("a", encoding="utf-8") as fh:
-                fh.write(line)
-    except Exception:
-        pass
+
 
 
 def _analytics_post(payload: dict) -> None:
@@ -19433,6 +18473,14 @@ def _analytics_render_event(job: dict) -> None:
             props["watchdog_retry"] = True
         if job.get("watchdog_phase") in WATCHDOG_PHASES:
             props["watchdog_phase"] = job["watchdog_phase"]
+        # 4.19.6: a non-watchdog GPU abort in prompt encoding re-run after a
+        # pause, and whether the (last) run started in a helper that had
+        # already finished a render - the two facts that confirm or refute
+        # the prompt-encoding abort fix (WarmHelper.run).
+        if job.get("gpu_abort_retry"):
+            props["gpu_abort_retry"] = True
+        if isinstance(job.get("helper_warm"), bool):
+            props["helper_warm"] = job["helper_warm"]
         # 4.19.2: a helper that died from a signal - what its last native
         # line was (closed class) and how far it got. Failures only.
         if status != "done":
@@ -19528,232 +18576,10 @@ def _analytics_render_event(job: dict) -> None:
 _USAGE_FLEET_LOCK = threading.Lock()
 
 
-def _usage_log_read(max_age_days: float | None = None) -> list[dict]:
-    """Parse the local mirror. Bad lines are skipped, not fatal — this file
-    is append-only from several threads and a torn last line is possible."""
-    out: list[dict] = []
-    try:
-        raw = USAGE_LOG_READ_FILE.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return out
-    cutoff = (time.time() - max_age_days * 86400) if max_age_days else None
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(rec, dict) or "event" not in rec:
-            continue
-        if cutoff is not None:
-            try:
-                if float(rec.get("ts") or 0) < cutoff:
-                    continue
-            except (TypeError, ValueError):
-                continue
-        out.append(rec)
-    return out
 
 
-def _usage_rank(counter: dict, key_name: str, limit: int = 12) -> list[dict]:
-    """{value: count} -> sorted [{<key_name>: value, "count": n}] rows."""
-    rows = sorted(counter.items(), key=lambda kv: (-kv[1], str(kv[0])))
-    return [{key_name: k, "count": v} for k, v in rows[:limit]]
 
 
-def _usage_local_report(range_key: str = STATS_RANGE_DEFAULT) -> dict:
-    """Aggregate the local mirror into the dashboard's payload shape.
-
-    Deliberately the SAME shape the fleet path produces, so stats.html has
-    exactly one renderer and the only difference the user sees is the
-    `source` label and the note above the tiles.
-
-    Day buckets use UTC (time.gmtime), matching the fleet path's HogQL
-    `toDate(timestamp)` (ClickHouse dates are UTC by default) and the
-    GitHub-stats archive's UTC `date` field. This used to bucket by the
-    MACHINE's own local midnight — on Mr Bizarro's Mac that is UTC+2/+3, so
-    the same calendar day could show a different render count depending on
-    whether /stats/usage happened to be serving the local fallback or the
-    fleet view that day. A single-machine report has no meaningful "vs
-    prior period" delta at small counts (2 renders vs 3 reads as "+50%"),
-    so this path leaves deltas out rather than manufacture noise — the
-    fleet path is where deltas matter and where there's enough volume for
-    them to mean something."""
-    recs = _usage_log_read()
-    now = time.time()
-    days = STATS_RANGE_DAYS.get(range_key, STATS_RANGE_DAYS[STATS_RANGE_DEFAULT])
-    range_cutoff = (now - days * 86400) if days else 0.0
-    # Every windowed figure below (boots, engines/H3 share, error rate,
-    # versions/chips/RAM, pack flips) follows the selected range, same as
-    # the fleet path. Only renders_by_day keeps its fixed 30-day chart.
-    d30 = now - 30 * 86400
-
-    boots_by_day: dict[str, int] = {}
-    engines: dict[str, int] = {}
-    errors: dict[str, int] = {}
-    error_groups: dict[str, dict] = {}
-    versions: dict[str, int] = {}
-    chips: dict[str, int] = {}
-    rams: dict[str, int] = {}
-    flips: dict[tuple, int] = {}
-    refusals: dict[str, int] = {}
-    renders_in_range = ok_in_range = fail_in_range = 0
-    h3_in_range = tot_in_range = 0
-    refused_in_range = 0
-    active_in_range = False
-
-    total_renders = 0
-    renders_by_day: dict[str, int] = {}
-    first_boot_ts = None
-    pack_seq: dict[str, list] = {}
-    last_boot_ts = 0.0
-
-    for rec in recs:
-        try:
-            ts = float(rec.get("ts") or 0)
-        except (TypeError, ValueError):
-            continue
-        ev = str(rec.get("event") or "")
-        props = rec.get("props") if isinstance(rec.get("props"), dict) else {}
-        if ts >= range_cutoff:
-            active_in_range = True
-        if ev == "app_boot":
-            if first_boot_ts is None or ts < first_boot_ts:
-                first_boot_ts = ts
-            if ts >= range_cutoff:
-                day = time.strftime("%Y-%m-%d", time.gmtime(ts))
-                boots_by_day[day] = boots_by_day.get(day, 0) + 1
-                versions[str(props.get("version") or "unknown")] = \
-                    versions.get(str(props.get("version") or "unknown"), 0) + 1
-                chips[str(props.get("chip_family") or "unknown")] = \
-                    chips.get(str(props.get("chip_family") or "unknown"), 0) + 1
-                ram_key = str(props.get("ram_gb") or "unknown")
-                rams[ram_key] = rams.get(ram_key, 0) + 1
-        elif ev in ("render_completed", "render_failed"):
-            if ev == "render_completed":
-                total_renders += 1
-                if ts >= d30:
-                    day = time.strftime("%Y-%m-%d", time.gmtime(ts))
-                    renders_by_day[day] = renders_by_day.get(day, 0) + 1
-            if ts >= range_cutoff:
-                renders_in_range += 1
-            if ts >= range_cutoff:
-                tot_in_range += 1
-                eng = str(props.get("engine") or "unknown")
-                engines[eng] = engines.get(eng, 0) + 1
-                if eng == "h3":
-                    h3_in_range += 1
-                if ev == "render_completed":
-                    ok_in_range += 1
-                else:
-                    fail_in_range += 1
-            if ev == "render_failed" and ts >= range_cutoff:
-                sig = str(props.get("error_signature") or "unknown error")
-                errors[sig] = errors.get(sig, 0) + 1
-                cls = str(props.get("error_class") or "other")
-                g = error_groups.setdefault(cls, {
-                    "count": 0, "first_seen": ts, "last_seen": ts,
-                    "sigs": {},
-                })
-                g["count"] += 1
-                g["first_seen"] = min(g["first_seen"], ts)
-                g["last_seen"] = max(g["last_seen"], ts)
-                g["sigs"][sig] = g["sigs"].get(sig, 0) + 1
-        elif ev == "render_refused":
-            # DELIBERATELY OUTSIDE every render number above. A refusal did
-            # not render, did not fail and cost no GPU time, so it belongs
-            # in neither the numerator nor the denominator of the error
-            # rate — counting it in either is the bug this branch exists to
-            # prevent. It gets its own tile because "how often do we send
-            # someone into a wall" is a real question, just a different one.
-            if ts >= range_cutoff:
-                refused_in_range += 1
-                slug = str(props.get("refusal") or "unknown")
-                refusals[slug] = refusals.get(slug, 0) + 1
-        elif ev == "pack_state_change" and ts >= range_cutoff:
-            k = (str(props.get("pack") or "?"),
-                 bool(props.get("from")), bool(props.get("to")))
-            flips[k] = flips.get(k, 0) + 1
-            pack_seq.setdefault(k[0], []).append((ts, k[1], k[2]))
-        if ev == "app_boot":
-            last_boot_ts = max(last_boot_ts, ts)
-
-    flip_rows = [{"pack": p, "from": f, "to": t, "count": c}
-                 for (p, f, t), c in sorted(flips.items(), key=lambda kv: -kv[1])]
-    h3_lost = sum(r["count"] for r in flip_rows
-                  if r["pack"] == "h3" and r["from"] and not r["to"])
-    # Same per-install shape as the fleet's pack_losses (this Mac = 1 install).
-    _loss_rows, _boot_rows = [], [("local", last_boot_ts)] if last_boot_ts else []
-    for _pk, _seq in pack_seq.items():
-        _seq.sort()
-        _lost = [t for t, f, to in _seq if f and not to]
-        if _lost:
-            _loss_rows.append((_pk, "local", _seq[-1][2], max(_lost)))
-    pack_losses = _usage_pack_loss_summary(_loss_rows, _boot_rows)
-
-    error_group_rows = []
-    for cls, g in error_groups.items():
-        top_sig = max(g["sigs"].items(), key=lambda kv: kv[1])[0] if g["sigs"] else "unknown error"
-        error_group_rows.append({
-            "error_class": cls,
-            "count": g["count"],
-            "installs": 1,  # local mirror is always this one machine
-            # ISO 8601 with a Z suffix — same shape PostHog's timestamp
-            # column returns, so the dashboard's one JS date parser handles
-            # both sources identically.
-            "first_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(g["first_seen"])),
-            "last_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(g["last_seen"])),
-            "top_message": top_sig,
-            "signatures": len(g["sigs"]),
-        })
-    error_group_rows.sort(key=lambda r: (-r["installs"], -r["count"]))
-
-    return {
-        "ok": True,
-        "source": "local",
-        "generated_at": iso_now(),
-        "cached": False,
-        "range": range_key,
-        "note": ("this machine only - add a PostHog query key in Settings "
-                 "for fleet data"),
-        "tiles": {
-            "weekly_active_installs": 1 if active_in_range else 0,
-            # The stats-v2 tile reads active_in_range (the fleet path's
-            # name); without it the local fallback showed "—" (4.17.3 review).
-            "active_in_range": 1 if active_in_range else 0,
-            "total_renders": total_renders,
-            "total_installs": 1 if first_boot_ts else 0,
-            "rendered_installs": 1 if total_renders else 0,
-            "never_rendered_installs": 1 if (first_boot_ts and not total_renders) else 0,
-            "renders_in_range": renders_in_range,
-            "h3_share_pct": round(100.0 * h3_in_range / tot_in_range, 1) if tot_in_range else None,
-            "error_rate_pct": (round(100.0 * fail_in_range / (ok_in_range + fail_in_range), 1)
-                               if (ok_in_range + fail_in_range) else None),
-            "refusals_in_range": refused_in_range,
-        },
-        "deltas": {},  # single machine, small counts — see docstring
-        "growth": _usage_growth_block(
-            [(time.strftime("%Y-%m-%d", time.gmtime(first_boot_ts)), 1)] if first_boot_ts else [],
-            [(d, renders_by_day[d]) for d in sorted(renders_by_day)],
-            []),
-        "boots_by_day": [{"date": d, "count": boots_by_day[d]}
-                         for d in sorted(boots_by_day)],
-        "engines": _usage_rank(engines, "engine", 8),
-        "top_errors": [{"signature": k, "count": v} for k, v in
-                       sorted(errors.items(), key=lambda kv: (-kv[1], kv[0]))[:5]],
-        "error_groups": error_group_rows,
-        "top_refusals": [{"refusal": k, "count": v} for k, v in
-                         sorted(refusals.items(),
-                                key=lambda kv: (-kv[1], kv[0]))[:5]],
-        "versions": _usage_rank(versions, "version"),
-        "chips": _usage_rank(chips, "chip"),
-        "ram": _usage_rank(rams, "ram_gb"),
-        "pack_flips": {"h3_lost": h3_lost, "rows": flip_rows,
-                       "losses": pack_losses},
-        "events_logged": len(recs),
-    }
 
 
 # HogQL fragments for the fleet view. Built by a function, not a static
@@ -20033,124 +18859,14 @@ def _fleet_queries(range_key: str) -> dict[str, str]:
     }
 
 
-def _usage_growth_block(installs_by_day: list, renders_by_day: list,
-                        active_by_week: list) -> dict:
-    """The dashboard's growth series, one shape for fleet and local.
-
-    installs_by_day carries the cumulative count alongside the day's new
-    installs so the page draws the curve without re-summing; the last
-    cumulative value equals total installs by construction."""
-    inst, running = [], 0
-    for d, c in installs_by_day:
-        running += int(c)
-        inst.append({"date": str(d), "new": int(c), "cumulative": running})
-    return {
-        "installs_by_day": inst,
-        "renders_by_day": [{"date": str(d), "count": int(c)} for d, c in renders_by_day],
-        "active_by_week": [{"week": str(w), "installs": int(c)} for w, c in active_by_week],
-    }
 
 
-def _usage_parse_ts(v) -> float | None:
-    """A HogQL timestamp ('2026-10-09T08:42:11Z', '...+00:00', or with a
-    space) as epoch seconds, or None."""
-    if v is None or v == "":
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    from datetime import datetime, timezone
-    txt = str(v).strip().replace(" ", "T")
-    if txt.endswith("Z"):
-        txt = txt[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(txt)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.timestamp()
 
 
-def _usage_rolling_weeks(rows: list, now: float | None = None) -> list:
-    """active_by_week rows [(k, installs)] -> [(window_end_date, installs)],
-    oldest first. k is whole 7-day windows before now; the window k ends at
-    now - 7k days and is labelled by that end date (UTC)."""
-    now = time.time() if now is None else now
-    out = []
-    for r in rows:
-        try:
-            k, c = int(r[0]), int(r[1])
-        except (TypeError, ValueError, IndexError):
-            continue
-        if k < 0 or k > 11:
-            continue  # the 84-day window can spill one partial 13th bucket
-        out.append((time.strftime("%Y-%m-%d", time.gmtime(now - k * 7 * 86400)), c, k))
-    out.sort(key=lambda t: -t[2])
-    return [(d, c) for d, c, _k in out]
 
 
-def _usage_pack_loss_summary(loss_rows: list, last_boot_rows: list | None) -> dict:
-    """{pack: {"installs", "recovered", "still_missing", "not_seen_since",
-    "unconfirmed"}}.
-
-    One entry per install that LOST the pack (installed -> missing) in the
-    range. `recovered`: its latest pack change put the pack back — missing at
-    one launch, present at a later one (the launch-during-Update pattern).
-    `still_missing`: still gone, and the install has launched again since,
-    so a later boot confirmed it. `not_seen_since`: still gone at the last
-    launch we know of, which was the launch that noticed — nothing confirms
-    or clears it yet. `unconfirmed`: not recovered, and the last-launch query
-    failed (last_boot_rows is None) — never guessed into either bucket."""
-    last_boot: dict[str, float] = {}
-    for r in last_boot_rows or []:
-        try:
-            ts = _usage_parse_ts(r[1])
-        except (IndexError, TypeError):
-            continue
-        if ts is not None:
-            last_boot[str(r[0])] = ts
-    out: dict[str, dict] = {}
-    for r in loss_rows or []:
-        if not (isinstance(r, (list, tuple)) and len(r) >= 4):
-            continue
-        pack, did, last_to, lost_at = str(r[0] or "?"), str(r[1]), r[2], _usage_parse_ts(r[3])
-        b = out.setdefault(pack, {"installs": 0, "recovered": 0,
-                                  "still_missing": 0, "not_seen_since": 0,
-                                  "unconfirmed": 0})
-        b["installs"] += 1
-        if str(last_to).lower() in ("true", "1"):
-            b["recovered"] += 1
-        elif last_boot_rows is None:
-            b["unconfirmed"] += 1
-        elif lost_at is not None and last_boot.get(did, 0) > lost_at + 60:
-            b["still_missing"] += 1
-        else:
-            b["not_seen_since"] += 1
-    return out
 
 
-def _usage_fleet_query_one(hogql: str, key: str) -> list:
-    """Run one HogQL query. Returns the `results` rows, or [] on any error.
-
-    10 s timeout (not the 2 s capture timeout — this is a human waiting on a
-    dashboard, not a render path). Raises nothing; the caller treats an
-    empty result as "this panel of the dashboard has no data"."""
-    body = json.dumps({"query": {"kind": "HogQLQuery", "query": hogql}}).encode("utf-8")
-    project = (os.environ.get("PHOSPHENE_ANALYTICS_PROJECT") or "@current").strip()
-    req = urllib.request.Request(
-        f"{_analytics_api_host()}/api/projects/{quote(project)}/query/",
-        data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {key}",
-                 "User-Agent": "phosphene-panel-stats"},
-        method="POST",
-    )
-    # 25 s: the owner-exclusion subqueries make the all-time queries heavier,
-    # and at 10 s the all-range pack query timed out on every attempt.
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        data = json.loads(resp.read().decode("utf-8", "replace"))
-    rows = data.get("results")
-    return rows if isinstance(rows, list) else []
 
 
 def _pct_delta(cur, prev) -> float | None:
@@ -20167,293 +18883,10 @@ def _pct_delta(cur, prev) -> float | None:
     return round(100.0 * (cur - prev) / prev, 1)
 
 
-def _usage_fleet_report(range_key: str = STATS_RANGE_DEFAULT) -> dict | None:
-    """Build the fleet payload, or None when no query key is configured.
-
-    Every sub-query is independent: one failing (rate limit, schema drift,
-    a property that no install has sent yet) leaves that panel empty rather
-    than collapsing the whole view back to local. If EVERY query fails we
-    return None so the caller falls back to local with a warning."""
-    key = _analytics_query_key()
-    if not key:
-        return None
-    queries = _fleet_queries(range_key)
-    res: dict[str, list] = {}
-    failed: set[str] = set()
-
-    # Four at a time, one retry each. Run one after another, 24 queries took
-    # over a minute per range, and a single 10 s timeout under load blanked
-    # its tile — the measured 2026-10-14 run lost total_installs,
-    # total_renders and the pack queries to exactly that ("partial").
-    def _run(item):
-        name, hogql = item
-        for attempt in (1, 2):
-            try:
-                return name, _usage_fleet_query_one(hogql, key), True
-            except Exception:
-                if attempt == 2:
-                    return name, [], False
-                time.sleep(1.5)
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="phos-fleet-q") as ex:
-        for name, rows, ok in ex.map(_run, queries.items()):
-            res[name] = rows
-            if not ok:
-                failed.add(name)
-    failures = len(failed)
-    if failures == len(queries):
-        return None
-
-    def _scalar(name):
-        rows = res.get(name) or []
-        try:
-            return rows[0][0]
-        except (IndexError, TypeError):
-            return None
-
-    def _outcomes(name):
-        rows = {str(r[0]): int(r[1]) for r in (res.get(name) or [])
-                if isinstance(r, (list, tuple)) and len(r) >= 2}
-        return rows.get("render_completed", 0), rows.get("render_failed", 0)
-
-    # `people` rides along because a refusal's whole question is "how many
-    # DIFFERENT people did we send into this wall" — 65 events from 16
-    # people is a product bug; 65 from one person is a bookmark.
-    refusals = [{"refusal": str(r[0] or "unknown"), "count": int(r[1]),
-                 "people": int(r[2]) if len(r) >= 3 else 0}
-                for r in (res.get("refusals") or [])
-                if isinstance(r, (list, tuple)) and len(r) >= 2]
-    ok_n, fail_n = _outcomes("outcomes")
-    ok_prior, fail_prior = _outcomes("outcomes_prior")
-    engines = [{"engine": str(r[0] or "unknown"), "count": int(r[1])}
-               for r in (res.get("engines") or [])
-               if isinstance(r, (list, tuple)) and len(r) >= 2]
-    tot = sum(e["count"] for e in engines)
-    h3 = sum(e["count"] for e in engines if e["engine"] == "h3")
-
-    flip_rows = []
-    for r in (res.get("pack_flips") or []):
-        if not (isinstance(r, (list, tuple)) and len(r) >= 4):
-            continue
-        flip_rows.append({
-            "pack": str(r[0] or "?"),
-            "from": str(r[1]).lower() in ("true", "1"),
-            "to": str(r[2]).lower() in ("true", "1"),
-            "count": int(r[3]),
-        })
-    h3_lost = sum(r["count"] for r in flip_rows
-                  if r["pack"] == "h3" and r["from"] and not r["to"])
-    pack_losses = _usage_pack_loss_summary(
-        res.get("pack_losses") or [],
-        None if "pack_loss_last_boot" in failed else (res.get("pack_loss_last_boot") or []))
-
-    weeks = _usage_rolling_weeks(res.get("active_by_week") or [])
-    # Drop a window that starts before the first install ever reported: it
-    # is part-empty by construction and would draw as a collapse.
-    _first = next((str(r[0]) for r in (res.get("installs_by_day") or [])
-                   if isinstance(r, (list, tuple)) and r), None)
-    if _first:
-        import calendar
-        weeks = [(d, c) for d, c in weeks
-                 if time.strftime("%Y-%m-%d", time.gmtime(
-                     calendar.timegm(time.strptime(d, "%Y-%m-%d")) - 7 * 86400)) >= _first[:10]]
-    # The weekly-active tile IS the curve's last window (k == 0), so the two
-    # can never disagree; the stand-alone 'wau' query is the fallback.
-    wau = next((c for d, c in weeks[-1:]), None) if weeks else None
-    if wau is None:
-        wau = _scalar("wau")
-    active_n = _scalar("active_in_range")
-    if range_key == "7d" and wau is not None:
-        active_n = wau
-    active_prior_n = _scalar("active_in_range_prior")
-    error_rate_n = (round(100.0 * fail_n / (ok_n + fail_n), 1)
-                    if (ok_n + fail_n) else None)
-    error_rate_prior = (round(100.0 * fail_prior / (ok_prior + fail_prior), 1)
-                        if (ok_prior + fail_prior) else None)
-
-    error_groups = []
-    for r in (res.get("error_groups") or []):
-        if not (isinstance(r, (list, tuple)) and len(r) >= 6):
-            continue
-        error_groups.append({
-            "error_class": str(r[0] or "other"),
-            "count": int(r[1] or 0),
-            "installs": int(r[2] or 0),
-            "first_seen": str(r[3] or ""),
-            "last_seen": str(r[4] or ""),
-            "top_message": str(r[5] or "unknown error"),
-        })
-
-    return {
-        "ok": True,
-        "source": "fleet",
-        "generated_at": iso_now(),
-        "cached": False,
-        "range": range_key,
-        "note": "",
-        "partial": failures > 0,
-        "tiles": {
-            "weekly_active_installs": wau,
-            "daily_active_installs": _scalar("dau"),
-            "total_renders": _scalar("total_renders"),
-            "total_installs": _scalar("total_installs"),
-            "rendered_installs": _scalar("rendered_installs"),
-            "never_rendered_installs": (
-                max(0, int(_scalar("total_installs")) - int(_scalar("rendered_installs")))
-                if _scalar("total_installs") is not None
-                and _scalar("rendered_installs") is not None else None),
-            "active_in_range": active_n,
-            "renders_in_range": ok_n + fail_n,
-            "h3_share_pct": round(100.0 * h3 / tot, 1) if tot else None,
-            "error_rate_pct": error_rate_n,
-            # Not in renders_in_range and not in error_rate_pct — see the
-            # local aggregator's render_refused branch for why.
-            "refusals_in_range": sum(r["count"] for r in refusals),
-        },
-        # None (not zeroed) for range_key == "all". _fleet_window_sql
-        # returns an EMPTY clause for both the current and prior "all"
-        # queries (there is no window to bound them by), which means
-        # ok_prior/fail_prior/active_prior_n above are the SAME all-time
-        # totals as the current ones — _pct_delta(x, x) computes a real
-        # 0.0, not "no baseline". Gate on range_key explicitly rather than
-        # trust the arithmetic: "all time" has no prior period, full stop.
-        "deltas": {} if range_key == "all" else {
-            "renders_in_range_pct": _pct_delta(ok_n + fail_n, ok_prior + fail_prior),
-            "active_in_range_pct": _pct_delta(active_n, active_prior_n),
-            "error_rate_pp": (round(error_rate_n - error_rate_prior, 1)
-                              if error_rate_n is not None and error_rate_prior is not None
-                              else None),
-            # Raw failure-count trend for the Errors section header — a
-            # separate question from the RATE above (fewer installs total
-            # can raise the rate while the raw count falls).
-            "errors_count_pct": _pct_delta(fail_n, fail_prior),
-        },
-        "growth": _usage_growth_block(
-            [(r[0], r[1]) for r in (res.get("installs_by_day") or [])
-             if isinstance(r, (list, tuple)) and len(r) >= 2],
-            [(r[0], r[1]) for r in (res.get("renders_by_day") or [])
-             if isinstance(r, (list, tuple)) and len(r) >= 2],
-            weeks),
-        "boots_by_day": [{"date": str(r[0]), "count": int(r[1])}
-                         for r in (res.get("boots_by_day") or [])
-                         if isinstance(r, (list, tuple)) and len(r) >= 2],
-        "engines": engines,
-        "top_errors": [{"signature": str(r[0] or "unknown error"), "count": int(r[1]),
-                        "people": int(r[2]) if len(r) > 2 and r[2] is not None else None}
-                       for r in (res.get("top_errors") or [])
-                       if isinstance(r, (list, tuple)) and len(r) >= 2],
-        "error_groups": error_groups,
-        "failures_by_version": [{"version": str(r[0] or "unknown"), "failed": int(r[1] or 0),
-                                 "ok": int(r[2] or 0), "people": int(r[3] or 0),
-                                 "count": int(r[1] or 0),
-                                 "pct": round(100.0 * int(r[1] or 0) / max(1, int(r[1] or 0) + int(r[2] or 0)), 1)}
-                                for r in (res.get("failures_by_version") or [])
-                                if isinstance(r, (list, tuple)) and len(r) >= 4],
-        "top_refusals": refusals,
-        "versions": [{"version": str(r[0] or "unknown"), "count": int(r[1])}
-                     for r in (res.get("versions") or [])
-                     if isinstance(r, (list, tuple)) and len(r) >= 2],
-        "chips": [{"chip": str(r[0] or "unknown"), "count": int(r[1])}
-                  for r in (res.get("chips") or [])
-                  if isinstance(r, (list, tuple)) and len(r) >= 2],
-        "ram": [{"ram_gb": str(r[0] or "unknown"), "count": int(r[1])}
-                for r in (res.get("ram") or [])
-                if isinstance(r, (list, tuple)) and len(r) >= 2],
-        "pack_flips": {"h3_lost": h3_lost, "rows": flip_rows,
-                       "losses": pack_losses},
-        "owner_excluded": bool(_owner_exclusion_sql()),
-    }
 
 
-def _usage_attach_local(report: dict) -> dict:
-    """Ride this machine's own totals along with whatever we return.
-
-    Owner, 2026-09-18: "when I ask you for total renders, I mean total renders
-    from the fleet too… one of the first windows I want to see is total renders
-    for all the fleet." The dashboard used to show ONE number called
-    "Total renders" whose meaning silently changed with whether a query key was
-    configured — the fleet's total, or this Mac's. Two numbers, both labelled,
-    always: the fleet answers "how much is this app used", the machine answers
-    "how much have I used it", and neither can be mistaken for the other.
-    """
-    try:
-        # Fixed 7-day window regardless of the dashboard's selected range —
-        # this block is an evergreen "how much have I used it" reference
-        # (same idea as the fleet tiles' wau), not the range-scoped view.
-        local = _usage_local_report("7d")
-    except Exception:
-        return report
-    report["machine"] = {
-        "total_renders": (local.get("tiles") or {}).get("total_renders"),
-        "renders_7d": (local.get("tiles") or {}).get("renders_in_range"),
-        "error_rate_pct": (local.get("tiles") or {}).get("error_rate_pct"),
-        "first_day": (((local.get("growth") or {}).get("installs_by_day") or [{}])[0]
-                      or {}).get("date"),
-    }
-    return report
 
 
-def _usage_report(force: bool = False, range_key: str = STATS_RANGE_DEFAULT) -> dict:
-    """What GET /stats/usage returns. Fleet when a query key is configured
-    and the 6 h cache is stale; otherwise the cache; otherwise local.
-
-    Either way the payload carries `machine` (this Mac) AND says whether the
-    fleet half is available — `fleet_blocked` is "no_key" or "query_failed",
-    so the dashboard can show the fleet tile as unknown with a remedy instead
-    of quietly substituting a local number under a fleet label.
-
-    Cached PER RANGE (stats-v2, 2026-09-30): USAGE_FLEET_CACHE on disk holds
-    one entry per range key, each with its own `_fetched_at`, so switching
-    the dashboard's range control doesn't serve 7-day numbers under a
-    30-day label or force a fresh PostHog round trip on every click — only
-    the FIRST time a given range goes stale within the 6 h TTL."""
-    range_key = range_key if range_key in STATS_RANGE_DAYS else STATS_RANGE_DEFAULT
-    with _USAGE_FLEET_LOCK:
-        if _analytics_query_key():
-            if not force:
-                try:
-                    all_cached = json.loads(USAGE_FLEET_CACHE.read_text(encoding="utf-8"))
-                    cached = all_cached.get(range_key) if isinstance(all_cached, dict) else None
-                    if (cached and cached.get("_schema") == USAGE_FLEET_SCHEMA
-                            and time.time() - float(cached.get("_fetched_at") or 0)
-                            < USAGE_FLEET_TTL_SEC):
-                        cached = dict(cached)
-                        cached["cached"] = True
-                        cached["fleet_blocked"] = ""
-                        return _usage_attach_local(cached)
-                except (OSError, ValueError, json.JSONDecodeError, AttributeError):
-                    pass
-            fleet = None
-            try:
-                fleet = _usage_fleet_report(range_key)
-            except Exception:
-                fleet = None
-            if fleet:
-                fleet["_fetched_at"] = time.time()
-                fleet["_schema"] = USAGE_FLEET_SCHEMA
-                fleet["fleet_blocked"] = ""
-                try:
-                    _ensure_state_dir()
-                    try:
-                        all_cached = json.loads(USAGE_FLEET_CACHE.read_text(encoding="utf-8"))
-                        if not isinstance(all_cached, dict):
-                            all_cached = {}
-                    except (OSError, ValueError, json.JSONDecodeError):
-                        all_cached = {}
-                    all_cached[range_key] = fleet
-                    atomic_write_text(USAGE_FLEET_CACHE,
-                                      json.dumps(all_cached, indent=2))
-                except Exception:
-                    pass
-                return _usage_attach_local(fleet)
-            local = _usage_local_report(range_key)
-            local["fleet_blocked"] = "query_failed"
-            local["warning"] = ("PostHog query failed - showing this machine "
-                                "only. Check the personal API key in Settings.")
-            return _usage_attach_local(local)
-    local = _usage_local_report(range_key)
-    local["fleet_blocked"] = "no_key"
-    return _usage_attach_local(local)
 
 
 def _apply_generation_profile_to_job(job: dict) -> None:
@@ -22286,6 +20719,9 @@ class WarmHelper:
         # Wide enough that a traceback's frames survive an argument dump
         # printed under the exception (see failure_frame).
         self._boot_tail: collections.deque = collections.deque(maxlen=40)
+        # 4.19.6: how many runs the LIVE helper process has finished (0 = a
+        # fresh process). See run(): prompt-encoding aborts follow a warm helper.
+        self._jobs_in_proc = 0
 
     def _ensure(self) -> None:
         with self.lock:
@@ -22386,6 +20822,7 @@ class WarmHelper:
                 push(f"[gpu] {'short' if _short else 'M1/M2'} GPU steps: "
                      + ", ".join(f"{k}={env[k]}" for k in _steps))
             push(f"Spawning warm helper (low_memory={HELPER_LOW_MEMORY}, idle_timeout={HELPER_IDLE_TIMEOUT}s)")
+            self._jobs_in_proc = 0
             self.proc = subprocess.Popen(
                 [str(HELPER_PYTHON), str(HELPER_SCRIPT)],
                 cwd=str(MLX), env=env,
@@ -22784,7 +21221,20 @@ class WarmHelper:
         if (key and self.gemma_max_length is None
                 and metal_watchdog_needs_short_encode(key)):
             self.gemma_max_length = self.GEMMA_FALLBACK_MAX_LENGTH
+        # 4.19.6 (fleet, 4.19.2+): 37 of 40 LTX GPU aborts died in prompt
+        # encoding, and on the install that carried most of them 47 of 49
+        # warm-helper starts died there against 22 of 74 fresh ones - the
+        # 4.17.5 re-run worked because it started a NEW helper, not because
+        # of its shorter steps. A setting macOS already stopped in encoding
+        # therefore starts in a fresh helper (~10-15 s; output unchanged).
+        if (key and self._jobs_in_proc > 0 and self.is_alive()
+                and metal_watchdog_needs_short_encode(key)):
+            push("[gpu] Starting a fresh engine process for this render - macOS "
+                 "stopped this setting while reading the prompt before.")
+            with self.run_lock:
+                self.kill()
         short = bool(self.gpu_short_session)
+        abort_retry_used = False
         if short and job is not None:
             _gpu_steps_note(job)
         # Each re-run must bring a mitigation the last run did not have: short
@@ -22792,10 +21242,32 @@ class WarmHelper:
         # most three runs, and only while something is left to try.
         for _attempt in range(3):
             self._set_gpu_steps(short)
+            if job is not None:
+                job["helper_warm"] = bool(self._jobs_in_proc > 0 and self.is_alive())
             try:
                 return self._run_once(job_spec, timeout=timeout)
             except RuntimeError as exc:
                 watchdog = self._metal_timeout_seen and not self.is_alive()
+                # 4.19.6: a GPU abort that is NOT the watchdog (Metal's
+                # "Internal Error", an innocent-victim or other command-buffer
+                # error), in prompt encoding. Never retried before, and the
+                # queue moved straight on to the next job, which died the same
+                # way: re-runs within ~30 s failed 29 of 32 times, starts 30 s
+                # to 5 min later passed 16 of 19. So: once, in a fresh helper,
+                # after a pause. Nothing is recorded against the setting and
+                # the error, if it comes back, is the same native one. Only
+                # while an attempt is left (Codex 4.19.6: a third-run abort
+                # waited and then fell through to "unreachable").
+                if (not watchdog and not abort_retry_used and _attempt < 2
+                        and self._crash_line in METAL_ABORT_RETRY_LINES
+                        and self._last_phase == "encode"
+                        and not self.is_alive()):
+                    abort_retry_used = True
+                    if self._abort_cooldown(job):
+                        raise
+                    if job is not None:
+                        job["gpu_abort_retry"] = True
+                    continue
                 if not watchdog:
                     raise
                 gemma = self._gemma_fallback_applies()
@@ -22843,6 +21315,22 @@ class WarmHelper:
                      + " - a little slower; this Mac keeps it for this size "
                        "from now on.")
         raise RuntimeError("unreachable: the watchdog retry loop ended")
+
+    def _abort_cooldown(self, job: dict | None) -> bool:
+        """Wait METAL_ABORT_COOLDOWN_SEC before re-running after a GPU abort,
+        waking every second for a Stop. True when the job was stopped."""
+        push(f"[gpu] The graphics chip reported an error while reading the "
+             f"prompt (Metal: {self._crash_line}). Waiting "
+             f"{METAL_ABORT_COOLDOWN_SEC} s, then rendering it again once in a "
+             f"fresh engine process.")
+        deadline = time.monotonic() + METAL_ABORT_COOLDOWN_SEC
+        while time.monotonic() < deadline:
+            with LOCK:
+                if job is not None and job.get("cancel_requested"):
+                    return True
+            time.sleep(1)
+        with LOCK:
+            return bool(job is not None and job.get("cancel_requested"))
 
     def _run_once(self, job_spec: dict, timeout: float | None = None) -> dict:
         # Per-run detector state — reset here so a watchdog kill seen on an
@@ -22900,6 +21388,8 @@ class WarmHelper:
                 raise RuntimeError(
                     f"helper timed out after {timeout:g}s waiting for a response"
                 )
+            if self.is_alive():
+                self._jobs_in_proc += 1
             return self._dispatch_run_event(ev)
 
     # 4.17.3 (fleet): "helper pipe closed without an event; returncode=None"
@@ -23750,11 +22240,15 @@ def stop_current_job(timeout: float = 5.0, expect_id: str | None = None) -> bool
         push(f"image-kill failed: {type(e).__name__}: {e}")
     # Mux runs in its own process group outside the helper's. Kill it too,
     # otherwise ffmpeg keeps writing the (now-orphaned) output file.
+    # PermissionError as well as ProcessLookupError on every killpg below: a
+    # group whose members have all exited but are not yet reaped answers
+    # EPERM on macOS, and that escaped Stop itself (the whole-suite flake in
+    # test_review_416_ltx's Stop-during-join test, 4.18.0 -> 4.19.6).
     if mux_pgid:
         try:
             os.killpg(mux_pgid, signal.SIGTERM)
             push(f"SIGTERM sent to mux pgid {mux_pgid}")
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
     # Hailuo H3 renders live entirely outside HELPER — a `caffeinate → python →
     # ffmpeg` tree in its own process group. Without this, /stop left a 40 GiB
@@ -23764,7 +22258,7 @@ def stop_current_job(timeout: float = 5.0, expect_id: str | None = None) -> bool
         try:
             os.killpg(h3_pgid, signal.SIGTERM)
             push(f"SIGTERM sent to H3 pgid {h3_pgid}")
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         else:
             # Same escape hatch the trainer gets: MLX can sit inside a Metal
@@ -23774,7 +22268,7 @@ def stop_current_job(timeout: float = 5.0, expect_id: str | None = None) -> bool
                 try:
                     os.killpg(pgid, signal.SIGKILL)
                     push(f"SIGKILL sent to H3 pgid {pgid} (no SIGTERM ack)")
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
             threading.Thread(
                 target=_force_kill_h3, args=(8.0, h3_pgid),
@@ -23792,7 +22286,7 @@ def stop_current_job(timeout: float = 5.0, expect_id: str | None = None) -> bool
         try:
             os.killpg(train_pgid, signal.SIGTERM)
             push(f"SIGTERM sent to training pgid {train_pgid}")
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         else:
             # Best-effort SIGKILL fallback for trainers stuck in MLX
@@ -23804,7 +22298,7 @@ def stop_current_job(timeout: float = 5.0, expect_id: str | None = None) -> bool
                 try:
                     os.killpg(pgid, signal.SIGKILL)
                     push(f"SIGKILL sent to training pgid {pgid} (no SIGTERM ack)")
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass  # SIGTERM worked
             threading.Thread(
                 target=_force_kill_after, args=(8.0, train_pgid),
@@ -34269,65 +32763,12 @@ _TRAIN_ABORT_RX = re.compile(
 )
 
 
-def _train_phase_from_line(line: str, payload: "dict | None", current: str) -> str:
-    """Which phase the trainer is in, from the lines it prints.
-
-    The preprocessor's phase banners are plain text (they reach the panel
-    on the merged stdout/stderr pipe); a training step is a JSON event.
-    Anything else keeps the current phase. Phases: start -> text_encode ->
-    image_encode -> train.
-    """
-    if isinstance(payload, dict):
-        if (payload.get("event") or "step") in ("step", "train_progress"):
-            return "train"
-        return current
-    s = line or ""
-    if "Phase 1: encoding text captions" in s:
-        return "text_encode"
-    if "Phase 2: encoding image latents" in s:
-        return "image_encode"
-    return current
 
 
-def _train_encode_retry_wanted(rc: int, watchdog_seen: bool, phase: str,
-                               already_retried: bool) -> bool:
-    """One automatic relaunch, and only for the kill this can fix (#61):
-    SIGABRT with a Metal-watchdog signature in the log, during the caption
-    encode, not already retried. A kill during image encode or training
-    is the canvas-sized problem the existing error names; a crash without
-    the signature is not a GPU timeout at all."""
-    return (rc == -6 and bool(watchdog_seen) and phase == "text_encode"
-            and not already_retried)
 
 
-def _train_gemma_fallback_max_length() -> int:
-    """The shorter Gemma pad the relaunch uses — the same knob and default
-    (256, floor 64) as the render helper's fallback, so one env var tunes
-    both: LTX_GEMMA_FALLBACK_MAX_LENGTH."""
-    try:
-        return max(64, int(os.environ.get("LTX_GEMMA_FALLBACK_MAX_LENGTH", "256") or 256))
-    except ValueError:
-        return 256
 
 
-def _train_wipe_caption_conditions(dataset_dir: Path) -> int:
-    """Discard the caption encodings a killed run wrote, so the relaunch
-    re-encodes every caption at one length — the preprocessor skips a
-    condition file that exists, and a dataset half at 1024 tokens and half
-    at 256 would not batch. Image latents live beside them and are left
-    alone. Returns how many files went."""
-    cond = Path(dataset_dir) / "training_data" / ".precomputed" / "conditions"
-    if not cond.is_dir():
-        return 0
-    n = 0
-    for f in cond.iterdir():
-        if f.is_file() and f.name.startswith("condition_"):
-            try:
-                f.unlink()
-                n += 1
-            except OSError:
-                pass
-    return n
 
 
 #: Why a training job failed, one word (docs/ANALYTICS.md `train_error`).
@@ -34337,36 +32778,10 @@ TRAIN_ERROR_CLASSES = ("oom", "missing_file", "caption_check", "disk_full",
                        "import_error", "nan_loss", "other")
 
 
-def train_error_from_event(payload: dict) -> dict:
-    """The trainer's `error` event, its class held to the closed list."""
-    cls = str(payload.get("error_class") or "other")
-    return {
-        "stage": str(payload.get("stage") or "unknown")[:40],
-        "message": str(payload.get("message") or "")[:2000],
-        "error_class": cls if cls in TRAIN_ERROR_CLASSES else "other",
-    }
 
 
-def train_error_for_exit(rc: int, trainer_error: dict | None) -> str:
-    """The class of a trainer that exited non-zero. The trainer's own word
-    wins; a process killed by SIGKILL without one is macOS reclaiming memory
-    (jetsam), the one signal death that has a single cause."""
-    if trainer_error and trainer_error.get("error_class") in TRAIN_ERROR_CLASSES:
-        return trainer_error["error_class"]
-    if rc == -9:
-        return "oom"
-    return "other"
 
 
-def _train_release_render_memory() -> None:
-    """Stop the warm render helper before a training run (4.19.1)."""
-    try:
-        if HELPER.is_alive():
-            push("[train] releasing the render engine's memory for training "
-                 "(it reloads on the next render)")
-            HELPER.kill()
-    except Exception as e:  # never let housekeeping fail a training run
-        push(f"[train] could not release the render engine: {e}")
 
 
 def run_train_job_inner(job: dict) -> None:
@@ -42282,7 +40697,7 @@ from panel import routes_train as _routes_train
 for _routes_mod in (_routes_characters, _routes_files, _routes_image,
                     _routes_loras, _routes_meta, _routes_models, _routes_music,
                     _routes_oneshot, _routes_queue, _routes_stats, _routes_storyboard,
-                    _routes_train):
+                    _routes_train, _civitai_client):
     _routes_mod.P = sys.modules[__name__]
 
 
