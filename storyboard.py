@@ -1089,6 +1089,16 @@ _IMPLIES_SPEECH_RE = re.compile(
     r"|\bmid-sentence\b|\bmid-speech\b", re.IGNORECASE)
 
 
+# "nobody speaks", "no one says a word", "no voice is heard", "without
+# speaking", "never talks", "doesn't speak" - speech named only to deny it.
+_NEGATED_SPEECH_RE = re.compile(
+    r"\b(?:nobody|no one|no-one|never|not|without|(?:do|does|did|is|are|was|were|can|could|will|would)n['\u2019]t|cannot)"
+    r"(?:\s+\w+){0,2}?\s+(?:explain|describ|discuss|talk|speak|say|tell|address|announc|declar|recit|narrat"
+    r"|murmur|mutter|whisper|mumbl|ask|answer|repl|shout|instruct|sing|chant)\w*\b"
+    r"|\bno (?:voice|voices|dialogue|speech|talking|singing)\b(?:\s+(?:is|are|was|were))?(?:\s+(?:heard|spoken|present))?",
+    re.IGNORECASE)
+
+
 def shot_speech_problem(prompt: str) -> str | None:
     """The speech verb in `prompt` that has no words to go with it, or None.
 
@@ -1099,6 +1109,13 @@ def shot_speech_problem(prompt: str) -> str | None:
     p = prompt or ""
     if _SPOKEN_WORDS_RE.search(p):
         return None
+    # A prompt that says NOBODY speaks is the silent shot, stated out loud -
+    # our own planner writes "Nobody speaks and no voice is heard at any
+    # point." into silent shots' soundscape, and the verb scan used to read
+    # that sentence as an instruction to speak: the board's Render button
+    # stayed disabled on "'speaks' implies someone is speaking". Blank the
+    # negated phrases first so only an affirmative speech verb is judged.
+    p = _NEGATED_SPEECH_RE.sub(" ", p)
     m = _IMPLIES_SPEECH_RE.search(p)
     return m.group(0) if m else None
 
