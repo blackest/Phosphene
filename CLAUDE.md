@@ -476,7 +476,7 @@ and each is cheap enough that "I forgot" is not a reason.
 
 | gate | run it when you touch | what it refuses |
 |---|---|---|
-| `node scripts/check_pinokio_scripts.js` | any launcher `.js` | a single dispatch over 500 chars — Pinokio 8.0.x wedges at 764 and at 1,417 |
+| `node scripts/check_pinokio_scripts.js` | any launcher `.js`, any `scripts/pinokio/*.sh` an install/update dispatches | a single dispatch over 350 chars — Pinokio 8.0.x wedges at 764 and at 1,417 — and (4.20) a step with no way to stop the install: Pinokio 8.2 ignores a `shell.run` exit code and stops only on `error:` / `errno ` in the output, so every real failure prints `FATAL error: <reason + what to do>` and every optional one prints neither (`must.sh`, `defang`; `scripts/pinokio/README.md`; `test_fatal_install_paths.py` runs each script's failure + success path) |
 | `node scripts/check_ltx_pin.js` | the vendored pin, `update.js`, `install.js`, `_LTX_EXPECTED_VERSION` | a pin that is a bare SHA, a pin that disagrees with the version the runtime reports, a second checkout implementation, or anything in `update.js` that belongs post-pull |
 | `node scripts/check_post_update.js` | `scripts/post_update.sh` | the codec patch running before the reinstall or after anything optional, and a load-bearing step that cannot fail the Update |
 | `./ltx-2-mlx/env/bin/python3.11 scripts/assert_registry.py` | `MODEL_VERSIONS`, `required_files.json`, pack paths, the text-encoder seam, deep-verify sources | a generation that resolves another generation's weights or text encoder — the two bugs that shipped silently on 2026-08-12, neither of which raised anything |
@@ -561,7 +561,7 @@ prompts. Below -25 dB peak suggests a regression.
 
 | Script | Trigger | What it does |
 |---|---|---|
-| `install.js` | First Install or Resume Install | Clone `ltx-2-mlx`, force Python 3.11 venv, install MLX trio at pinned versions, install ltx-* packages, run `patch_ltx_codec.py`, `hf download` Q4 + Gemma. Idempotent. |
+| `install.js` | First Install or Resume Install | Disk preflight + size/time line (`install_plan.py preflight`), clone `ltx-2-mlx`, force Python 3.11 venv, install the engine packages, run `patch_ltx_codec.py`, fetch `required_files.json -> install.before_start` (LTX-2.5 + its encoder, 27.5 GB), the image/separator packs, then queue `install.after_start` (Gemma 3 + the IC-LoRAs, 10.7 GB) in `state/install_deferred.json` for the PANEL to fetch in the background after Start (4.20). Only install.js writes that marker; Update never does. Idempotent. |
 | `start.js` | Start button | Spawn panel inside the venv with `LTX_*` env vars set. Capture URL via regex with capture group, route to `local.set` via `input.event[1]`. |
 | `update.js` | Update button | `git pull` panel + ltx-2-mlx, force-reinstall mlx pin, force-reinstall ltx-* packages, re-run patches. |
 | `reset.js` | Reset button | Wipe venv + clones. **Preserves** `mlx_outputs/`, `panel_uploads/`, `mlx_models/` (those are user content / huge weight files). |

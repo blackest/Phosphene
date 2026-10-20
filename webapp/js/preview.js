@@ -736,7 +736,7 @@ async function _renderCharactersManageList() {
       const avatar = c.sample_image_url
         ? `<img class="cm-avatar" src="${escapeHtml(c.sample_image_url)}" alt="">`
         : `<span class="cm-avatar-ph">${escapeHtml(initial)}</span>`;
-      const idAttr = JSON.stringify(c.id).replace(/"/g, '&quot;');
+      const idAttr = escapeHtml(JSON.stringify(c.id));
       return `<div class="chars-manage-row" data-cid="${escapeHtml(c.id)}">
         ${avatar}
         <input type="text" class="cm-name-input"
@@ -1862,6 +1862,11 @@ async function refreshModelsModal({ silent = false } = {}) {
   // dependency is STATED, not enforced silently.
   const completeByKey = {};
   repos.forEach(r => { completeByKey[r.key] = !!r.complete; });
+  // 4.20: packs a fresh install queued for after Start. While the background
+  // fetcher holds the slot, a click on one of them moves it up the queue, so
+  // its button stays live; only a CLICKED download blocks the others.
+  const queuedKeys = new Set(data.deferred_pending || []);
+  const slotBlocked = !!(active && !active.background);
   const rows = repos.map(r => {
     let cls, icon, statusText, btnHtml;
     // Per ROW, not per install. The 2.5 packs download from a GitHub release
@@ -1875,8 +1880,8 @@ async function refreshModelsModal({ silent = false } = {}) {
       icon = '<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise-bold"/></svg>';
       const elapsed = Math.max(0, Math.round((Date.now()/1000) - (active.started_ts || 0)));
       const last = active.last_line ? `<div class="progress">${escapeHtml(active.last_line)}</div>` : '';
-      statusText = `Downloading · ${elapsed}s${last}`;
-      btnHtml = `<button class="ghost" onclick="cancelDownload()">Cancel</button>`;
+      statusText = `${active.background ? 'Downloading in the background' : 'Downloading'} · ${elapsed}s${last}`;
+      btnHtml = `<button class="ghost" onclick="cancelDownload()">${active.background ? 'Skip' : 'Cancel'}</button>`;
     } else if (r.complete) {
       cls = 'ready'; icon = '<svg class="ph" aria-hidden="true"><use href="#ph-check-bold"/></svg>';
       // `where: 'hf_cache'` means the files were resolved from
@@ -1889,19 +1894,23 @@ async function refreshModelsModal({ silent = false } = {}) {
     } else if (r.present_files > 0) {
       cls = 'partial'; icon = '<svg class="ph" aria-hidden="true"><use href="#ph-download-simple"/></svg>';
       const left = r.total_files - r.present_files;
-      statusText = `Partial · ${r.present_files}/${r.total_files} files · ${left} missing — resume to finish`;
+      statusText = queuedKeys.has(r.key)
+        ? `Queued · downloads in the background after setup · ${r.present_files}/${r.total_files} files so far`
+        : `Partial · ${r.present_files}/${r.total_files} files · ${left} missing — resume to finish`;
       btnHtml = hostMissing
         ? `<button disabled title="Install the Q8 weights first — the add-on lives inside that folder.">Needs Q8</button>`
         : hfOk
-        ? `<button onclick="startDownload('${escapeHtml(r.key)}')" ${active ? 'disabled' : ''}>Resume</button>`
+        ? `<button onclick="startDownload('${escapeHtml(r.key)}')" ${slotBlocked || (active && !queuedKeys.has(r.key)) ? 'disabled' : ''}>${queuedKeys.has(r.key) && active ? 'Download next' : 'Resume'}</button>`
         : `<button disabled>Resume</button>`;
     } else {
       cls = 'missing'; icon = '<svg class="ph" aria-hidden="true"><use href="#ph-x-circle"/></svg>';
-      statusText = `Not installed · ~${r.size_gb || '?'} GB`;
+      statusText = queuedKeys.has(r.key)
+        ? `Queued · downloads in the background after setup · ~${r.size_gb || '?'} GB`
+        : `Not installed · ~${r.size_gb || '?'} GB`;
       btnHtml = hostMissing
         ? `<button disabled title="Install the Q8 weights first — the add-on lives inside that folder.">Needs Q8</button>`
         : hfOk
-        ? `<button onclick="startDownload('${escapeHtml(r.key)}')" ${active ? 'disabled' : ''}>Download</button>`
+        ? `<button onclick="startDownload('${escapeHtml(r.key)}')" ${slotBlocked || (active && !queuedKeys.has(r.key)) ? 'disabled' : ''}>${queuedKeys.has(r.key) && active ? 'Download next' : 'Download'}</button>`
         : `<button disabled>Download</button>`;
     }
     // "required" means required BY THIS BUILD. A base pack from the retired
@@ -1909,6 +1918,10 @@ async function refreshModelsModal({ silent = false } = {}) {
     // so is the difference between an inventory and a claim.
     const kindBadge = (r.active === false)
       ? `<span style="color:var(--muted)">previous generation</span>`
+      // 4.20: queued by a fresh install for after Start - not something the
+      // renderer is waiting on, whatever its registry kind says.
+      : queuedKeys.has(r.key)
+      ? `<span style="color:var(--muted)">arrives after setup</span>`
       : r.kind === 'optional'
       ? `<span style="color:var(--muted)">optional</span>`
       : `<span style="color:var(--success,#3fb950)">required</span>`;
@@ -2011,9 +2024,41 @@ async function startDownload(key) {
   // to the user instead of silently no-op'ing the click.
   if (res && res.error) {
     alert(`Can't start download: ${res.error}`);
+  } else if (res && (res.queued || res.already) && res.note) {
+    // 4.20: the post-install background downloads hold the slot; the click
+    // moved this pack to the front of that queue (or it is the one running).
+    phosToast(res.note, { duration: 6000 });
   }
   refreshModelsModal();
   poll();
+}
+// 4.20: a feature whose pack has not landed yet (a fresh install fetches
+// Gemma 3 and the IC-LoRAs in the background after Start) answers 409 with
+// `needs_pack` / `pack_state`. One toast for all of them: the server's own
+// sentence, plus the one action that helps - Download now when nothing is
+// fetching it yet (or it is queued behind another pack), Show progress when
+// it is already on its way. True when it handled `res`.
+function packNeededToast(res) {
+  if (!res || !res.needs_pack) return false;
+  const el = phosToast(res.error || 'This needs a download first.',
+                       { kind: 'warning', duration: 12000 });
+  if (!el) return true;
+  const a = document.createElement('a');
+  a.href = '#';
+  a.className = 'phos-toast-action';
+  // waiting_disk is NOT fetching: the background download is paused for room,
+  // so the useful action is the explicit Download (not held to the floor).
+  const fetching = res.pack_state === 'downloading';
+  a.textContent = fetching ? 'Show progress'
+    : `Download now${res.pack_size ? ' (' + res.pack_size + ')' : ''}`;
+  a.onclick = (ev) => {
+    ev.preventDefault();
+    el.remove();
+    if (fetching) openModelsModal();
+    else startDownload(res.needs_pack);
+  };
+  el.appendChild(a);
+  return true;
 }
 async function cancelDownload() {
   if (!confirm('Cancel the active download? Partial files stay on disk; clicking Download/Resume later picks up where you left off.')) return;
@@ -2038,7 +2083,7 @@ Object.assign(globalThis, {
   spicyModeEnabled, renderSpicyAccess, civitaiNsfwRequested, renderCivitaiAuthBanner,
   closeCivitaiModal, civitaiSearch, civitaiLoadMore, renderCivitaiGrid,
   openModelsModal, closeModelsModal, refreshModelsModal, startDownload,
-  cancelDownload,
+  cancelDownload, packNeededToast,
   // inline-handler targets: generated markup resolves these through the
   // global scope (the v4.9.0 regression, PR #69)
   _charactersManageDelete, _charactersManageSave, civitaiAuthSave, civitaiSetFamily,

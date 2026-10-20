@@ -414,7 +414,7 @@ async function osPlanBeats() {
     const r = await fetch('/oneshot/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt, seconds: OS.seconds, engine: OS.engine }) });
     const d = await r.json();
-    if (!d.ok) throw new Error(d.error || 'the planner did not answer');
+    if (!d.ok) { (typeof packNeededToast === 'function' && packNeededToast(d)); throw new Error(d.error || 'the planner did not answer'); }
     osSetBeats(d.beats || []);
   } catch (e) {
     if (hint) hint.textContent = `could not write the beats: ${e.message || e}`;

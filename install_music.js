@@ -10,6 +10,10 @@ module.exports = {
     { method: "notify", params: {
       html: "<b>Installing YuE2 (the music engine, ~11 GB).</b><br>Writes a full song — vocals, arrangement and all — from lyrics and a style description, and sits beside LTX and Hailuo H3 as a peer. Needs a 24 GB+ Apple Silicon Mac. Resumable if interrupted."
     } },
+    // Pinokio 8.2 ignores a step's exit code and stops only on /error:/i or
+    // /errno /i in its output: every script here (and music_fetch.py, in its
+    // fetch mode) prints a "FATAL error:" line when it fails, which is what
+    // ends this install. scripts/check_pinokio_scripts.js holds that.
     { method: "shell.run", params: { message: "bash scripts/pinokio/music_preflight.sh" } },
     { method: "shell.run", params: { message: "bash scripts/pinokio/music_clone.sh" } },
     // Both lanes read and validate engine_pin.txt.

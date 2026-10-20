@@ -19,7 +19,9 @@ box and only showed up from zero.
 > enough on its own** — a clean room started by hand has the same wrong
 > environment this dev box does.
 
-Run these BEFORE promoting `dev`/`beta` → public `main`. All must pass.
+Run these BEFORE promoting the private release line → public `main`. All
+must pass, and they run on a checkout of the exact line the snapshot is built
+from — see "Promoting" below.
 
 ## 0. The mechanical gates, in one command
 
@@ -283,6 +285,13 @@ release.
 >
 > `test_release_coherence.py` fails if that command ever reappears in this file.
 
+> ### The snapshot is built from the designated release line only
+>
+> Which private branch is the release line, and how work reaches it, is in
+> the maintainer's private handoff doc (`docs/STATE.md`, which never ships).
+> Build the snapshot from that line, run the gates on it, and let step 3's
+> leak check fail the promote if anything private slipped in.
+
 The promote is: build the tree you want to publish, remove what must not go
 public, commit that tree onto `origin/main` with `commit-tree`, **verify the
 result before it is pushed**, then push exactly one commit.
@@ -306,9 +315,13 @@ push, not just when you remember to.
 ```
 git fetch origin
 
-# 1. stage dev's tree, then remove what public main does not carry
+# 0. the source is the release line's tip and nothing else
+git fetch beta
+SRC=<RELEASE-LINE-SHA>      # the release line named in docs/STATE.md
+
+# 1. stage the release line's tree, then remove what public main does not carry
 git read-tree --empty
-git read-tree <DEV-SHA>
+git read-tree "$SRC"
 # scripts/public_exclude.txt is the ONE list of what must never ship
 # (docs/STATE.md, the leak-check's own pattern list, plus anything else
 # added there) — it is also what public_leak_check.py verifies in step 3,
@@ -340,7 +353,7 @@ python3 scripts/public_leak_check.py "$COMMIT"   # exit 0 = no excluded path,
 git diff --stat origin/main "$COMMIT"     # read EVERY path; expect only this
                                           # release's changes
 diff <(git ls-tree -r --name-only "$COMMIT" | sort) \
-     <(git ls-tree -r --name-only <DEV-SHA> | sort)   # only the removals above
+     <(git ls-tree -r --name-only "$SRC" | sort)      # only the removals above
 git log --format=%P -1 "$COMMIT"          # exactly ONE parent == origin/main
 
 # 4. push the single commit, then tag it
@@ -349,6 +362,11 @@ git tag -a vX.Y.Z "$COMMIT" -m "vX.Y.Z"
 git push origin vX.Y.Z
 gh release create vX.Y.Z --repo mrbizarro/Phosphene ...
 ```
+
+Merging the snapshot back: record it on every private line with
+`git merge -s ours <snapshot>` unless that line's tree is the snapshot's
+(then a normal merge is tree-identical); check `git diff HEAD^1 HEAD` is
+empty on a line it must not change.
 
 Reminders that bit before: the git index is shared, so `read-tree`/`rm --cached`
 leaves it staging the promote tree — reset it when you are done. And any weight

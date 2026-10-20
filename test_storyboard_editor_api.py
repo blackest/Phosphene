@@ -651,8 +651,8 @@ class ReadRoutes(EditorCase):
 
     def test_the_drafts_and_versions_routes_check_the_film_exists(self):
         # Every other editor route opens with a load that 404s an unknown id;
-        # these two built a board path straight out of the query string, and
-        # `storyboard.board_dir` does no sanitising at all.
+        # these two built a board path straight out of the query string (and
+        # `storyboard.board_dir` now refuses an id that is not one folder name).
         for url in ("/storyboard/edit/drafts?id=nope",
                     "/storyboard/edit/versions?id=nope",
                     "/storyboard/edit/drafts?id=../../..",

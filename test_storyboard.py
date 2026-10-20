@@ -829,6 +829,40 @@ class SpeechLawAtBoardLevel(unittest.TestCase):
         for p in self.SILENT:
             self.assertIsNone(sb.shot_speech_problem(p), f"false positive: {p!r}")
 
+    def test_a_sentence_denying_speech_is_not_an_instruction_to_speak(self):
+        # The planner writes "Nobody speaks and no voice is heard at any
+        # point." into silent shots; the verb scan used to flag it and left
+        # the board's Render button disabled on "'speaks' implies someone is
+        # speaking".
+        for p in ("A woman watches the rain. Nobody speaks and no voice is heard at any point.",
+                  "He crosses the room without speaking.",
+                  "No one says a word as the door closes.",
+                  "She never talks; the camera holds on her face.",
+                  "He doesn't speak. No dialogue."):
+            self.assertIsNone(sb.shot_speech_problem(p), f"false positive: {p!r}")
+
+    def test_denying_one_speaker_does_not_excuse_another(self):
+        self.assertIsNotNone(sb.shot_speech_problem(
+            "Nobody moves. A man addresses the camera."))
+
+    def test_a_negation_only_covers_the_verb_right_after_it(self):
+        # The negator has to sit directly on the speech verb. "without"
+        # belongs to "hesitation" and "never" to "stops": both shots still
+        # have someone speaking with no words, so both must still be flagged.
+        for p in ("Without hesitation she addresses the camera.",
+                  "She never stops talking."):
+            self.assertIsNotNone(sb.shot_speech_problem(p), f"missed: {p!r}")
+
+    def test_a_denial_with_an_exception_still_has_a_speaker(self):
+        for p in ("Nobody speaks except the narrator.",
+                  "No voice is heard other than the narrator's, who explains the plan.",
+                  "Nobody speaks but the narrator.",
+                  "No one talks apart from the old man at the bar."):
+            self.assertIsNotNone(sb.shot_speech_problem(p), f"missed: {p!r}")
+        # A comma before "but" is a new clause, and the denial still holds.
+        self.assertIsNone(sb.shot_speech_problem(
+            "Nobody speaks, but a dog barks somewhere outside."))
+
     def test_a_briefing_room_is_a_room(self):
         # The planner's version of this law paid for this false positive once
         # already, firing three times on "a dimly lit briefing room".

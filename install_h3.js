@@ -51,7 +51,18 @@ const H3_BRANCH = "codex/h3-engine-v2"
 // Every step that works inside the checkout starts here: resolve the roots the
 // panel uses (LTX_H3_ROOT / LTX_H3_MODELS), then enter the checkout. See
 // scripts/pinokio/h3_roots.sh.
-const RH3 = ". scripts/pinokio/h3_roots.sh && cd \"$H3_CHECKOUT\" && "
+//
+// 4.20 - HOW A STEP STOPS THIS INSTALL. Pinokio 8.2 ignores a shell.run step's
+// exit code; it stops a script only when the step's OUTPUT matches /error:/i or
+// /errno /i (pinokiod kernel/shells.js, the default `on` handlers). So every
+// required script this file dispatches (h3_preflight, h3_checkout, h3_venv,
+// h3_deps, h3_build_q8, and h3_roots.sh's h3_enter / h3_fetch_weights) prints
+// one "FATAL error: <reason + what to do>" line when it fails - before this,
+// the preflight refused the download and the install carried on and started it.
+// `h3_enter` replaces the inline `cd`: a missing checkout used to end the `&&`
+// chain in silence. The two optional fetches (Turbo, TAE) never say "error:".
+// scripts/check_pinokio_scripts.js fails the build for a call that cannot stop.
+const RH3 = ". scripts/pinokio/h3_roots.sh && h3_enter && "
 
 module.exports = {
   requires: { bundle: "ai" },

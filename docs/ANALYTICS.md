@@ -291,7 +291,7 @@ The surfaces render events cannot see. One event per action, no free text.
 
 | prop | type | example | why |
 |---|---|---|---|
-| `feature` | string | `"storyboard_plan"` | **Closed vocabulary**: `storyboard_plan`, `storyboard_export`, `editor_open`, `editor_export`, `civitai_download`, `sample_character`, `train_start`, `enhance_prompt`, `train_refused`. Unknown names are dropped locally, never sent. `train_start` fires only past `/train/start`'s RAM refusal (SYS-41) — a refused click counts as `train_refused` with `detail: "ram"` instead |
+| `feature` | string | `"storyboard_plan"` | **Closed vocabulary**: `storyboard_plan`, `storyboard_export`, `editor_open`, `editor_export`, `civitai_download`, `sample_character`, `train_start`, `enhance_prompt`, `train_refused`, `enhance_prompt` is sent by the server when an Enhance succeeds, with the mode (`t2v`, `i2v`, `a2v`) as `detail` (from 2026-10-19; before that nothing sent it, so earlier zeros mean unmeasured, not unused). `share` (the clip toolbar's Share: a caption with the Phosphene link copied and the file selected in Finder; only that the button was used is sent, never which clip). Unknown names are dropped locally, never sent. `train_start` fires only past `/train/start`'s RAM refusal (SYS-41) — a refused click counts as `train_refused` with `detail: "ram"` instead |
 | `detail` | string | `"nle"` | Optional, lowercase `[a-z0-9_.-]` only, ≤32 chars — a sub-choice within the feature |
 | `version` | string | `"4.9.7"` | As on `app_boot` |
 
@@ -321,6 +321,14 @@ never seen again. Between `app_installed` and the first `render_*` the panel
 said nothing, so *"they tried and it was broken"* and *"they looked and left"*
 were the same shape in the data. These events tell those apart.
 
+**`first_use` (growth pass, 2026-10-19).** Pinokio auto-runs Start the moment
+the install finishes, so `first_boot` can fire with nobody at the screen. In
+the 2026-09-20 → 10-11 cohorts, 20% of new installs booted once and never
+rendered, and three in four of those sent nothing but the boot events. The
+page now reports one `first_use` the first time anyone clicks or presses a key
+on it (a hover or scroll does not count), which separates "nobody ever looked"
+from "looked and left". Nothing about what was clicked is sent.
+
 **At most one event per step per install, ever** — with one deliberate
 exception: `engine_env` reports again when its answer *changes* (outcome, or
 from 4.17.5 the `cause` of a failure), because a broken environment that gets
@@ -328,7 +336,7 @@ repaired is the most useful transition on this event. This is not a heartbeat an
 
 | prop | type | example | why |
 |---|---|---|---|
-| `step` | string | `"engine_env"` | **Closed vocabulary**: `first_boot` (the panel came up), `engine_env` (its Python environment can run a render), `weights_check` (the base model is on disk), `first_queue` (a job reached the worker — someone pressed Render) |
+| `step` | string | `"engine_env"` | **Closed vocabulary**: `first_boot` (the panel came up), `engine_env` (its Python environment can run a render), `weights_check` (the base model is on disk), `first_queue` (a job reached the worker — someone pressed Render), `first_use` (someone clicked or typed on the panel page for the first time — reported by the page, the only step it may report; always `ok`) |
 | `outcome` | string | `"failed"` | **Closed vocabulary**: `started`, `ok`, `failed`, `skipped` |
 | `error_class` | string | `"venv_broken"` | Only on `failed`, and only from the same closed taxonomy `render_failed` uses |
 | `cause` | string | `"network"` | 4.17.5 — only on a failed `engine_env`: WHY, one word. **Closed vocabulary**: `network` (a package server could not be reached), `timeout` (downloads timed out), `disk` (disk full), `uv_error` (the package tool could not resolve or build), `python_missing` (the venv's Python does not run), `installing` (Pinokio's Install was still writing the venv when the panel looked - reported again when it finishes), `mismatch` (4.19.4 - the packages are all there but transformers refuses the version of one of its own dependencies, e.g. tokenizers 0.23.3 under transformers <5.13; read from the venv's files by the panel, Repair engine fixes it), `other`, `unknown` (no installer record: an install that stopped before the engine step, or one older than 4.17.5). Read from the installer's own record (`ltx-2-mlx/env/.phosphene_engine_result.json`, written by `scripts/pinokio/ltx_engine_env.sh` in these words via `install_cause.sh`) - never from its output text |
@@ -405,7 +413,7 @@ The queue paused itself after three identical failures in a row.
 | `queued` | int | `12` | Jobs left waiting |
 | `error_class` | string | `"model_missing"` | The same closed taxonomy as `render_failed` |
 
-The browser reports `update_prompt`, `broadcast_seen` and the Editor's two `feature_used` values through **one** route, `POST /analytics/ui`, which allowlists every (event, value) pair and answers 400 to anything else. Everything else is emitted server-side.
+The browser reports `update_prompt`, `broadcast_seen`, the `feature_used` values `editor_open`, `editor_export`, `enhance_prompt` and `share`, and the single `install_step` value `first_use` through **one** route, `POST /analytics/ui`, which allowlists every (event, value) pair and answers 400 to anything else. Everything else is emitted server-side.
 
 ### `render_refused`
 

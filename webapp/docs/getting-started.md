@@ -44,6 +44,8 @@ The gallery on the right shows what you have made. Click a card to put it on the
 - **Show all** loads older renders than the newest 60.
 - [[sc:outputs.step]] steps through the gallery, [[sc:player.toggle]] plays and pauses, [[sc:outputs.expand]] expands the player to full screen.
 - Over the player, the action row offers what you can do next with that clip: **Extend** it, run **Upscale & Face Fix** on it, send it **To film**, **Animate** a still, see its **Params**.
+- A clip with no sound carries a **No sound · Add sound** pill on its gallery card (and the player says the same). One click puts the clip on the player and opens Hailuo H3's **Add sound** with it picked.
+- **Share** (in the clip's **More** menu and in the full-screen viewer) copies a one-line caption with the Phosphene link and shows the file in Finder, ready to attach. Nothing is uploaded.
 - The eye icon hides a clip from the gallery (there is currently no way to bring it back from the UI — see [Video](#docs/video/more) for the manual restore). The trash button on a card moves the file to the macOS Trash after asking — restore it from Finder if you change your mind. [[sc:outputs.trash]] does the same for the selected output.
 
 ## Where files go {#files}
@@ -56,11 +58,22 @@ The gallery on the right shows what you have made. Click a card to put it on the
 
 Every render also writes a small sidecar file beside it with its settings. That is what **Params** reads, and what lets Outputs search by LoRA or seed.
 
+## The first start {#first-start}
+
+On a new install, 27.5 GB downloads before **Start** appears: the LTX-2.5 engine, its text encoder and the preview decoder. The installer checks disk space first: you need about 32.5 GB free, and it tells you if there is not enough.
+
+After **Start**, 10.7 GB more downloads in the background, one at a time: Gemma 3 (what **Enhance** and the **Storyboard planner** run on) and the adapters for **Upscale & Face Fix**, **Control**, **Ingredients** and **Colorize**.
+
+You can follow progress in the panel. The background download keeps 10 GB free on the drive and waits if there is less. Until a model arrives, the feature that needs it says it is downloading and offers **Download now**.
+
+Updating an existing install downloads and removes nothing.
+
 ## Updating {#update}
 
 - The version pill in the header says where you stand: **Up to date**, or **Update to** a newer version. When one is out, a banner offers **Update now** / **Later**.
 - In Pinokio, the **Update** item in the Phosphene sidebar updates everything, including Python dependencies. Updating keeps your queue, settings and models.
 - After an in-app update the banner reads *"Updated to … — restart to finish"*: click **Stop**, then **Start** in Pinokio. If the update touched dependencies, it tells you to use Pinokio's **Update** instead.
 - If an update started from a very old version only seems to move the panel, click **Update** once more — an old version updates its updater first.
+- If Pinokio's **Update** stops in its first second (it can on 4.19.6 and older), use **Update now** in Phosphene's own banner or version pill instead, then restart. From 4.19.7 on, Pinokio's button works again. See [troubleshooting](#docs/troubleshooting/update-stops).
 
 > **Tip** Press [[sc:docs.open]] anywhere to open these docs on the shortcuts page, and use the search box on the left to find any button by the word written on it.

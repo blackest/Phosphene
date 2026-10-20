@@ -299,6 +299,36 @@ class ReleaseChecklistPromoteRitual(unittest.TestCase):
                 .format(token),
             )
 
+    def test_snapshot_is_built_from_the_release_line_only(self):
+        # 2026-10-20: the snapshot reads one designated release line ($SRC),
+        # never the daily dev branch, and the merge-back never takes the
+        # snapshot's tree onto a line it must not change.
+        checklist = _read("docs/RELEASE_CHECKLIST.md")
+        self.assertIn('git read-tree "$SRC"', checklist)
+        self.assertNotIn("git read-tree <DEV-SHA>", checklist)
+        self.assertNotIn("git read-tree beta/main", checklist)
+        self.assertIn("git merge -s ours <snapshot>", checklist)
+
+
+class LeakCheckPathPatterns(unittest.TestCase):
+    """A `p` row in the private list matches tree PATHS (2026-10-20)."""
+
+    def test_path_rows_are_checked(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "public_leak_check",
+            os.path.join(REPO, "scripts", "public_leak_check.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        listing = "a.py\nsub/private_thing.py\nscripts/public_leak_patterns.txt\n"
+        mod._git = lambda *a: listing
+        hits = mod.check_banned_paths("HEAD", [
+            ("private file", r"(^|/)private_thing\.py$", "p"),
+            ("content row, not a path row", r"a\.py", "0"),
+            ("the list itself is never a hit", r"public_leak_patterns", "p"),
+        ])
+        self.assertEqual(hits, ["[private file] sub/private_thing.py"])
+
 
 if __name__ == "__main__":
     unittest.main()

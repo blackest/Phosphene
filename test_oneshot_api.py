@@ -86,6 +86,7 @@ def test_options_describe_this_mac():
 
 
 def test_plan_beats_folds_the_planner_answer_into_beats(monkeypatch):
+    monkeypatch.setattr(p, "planner_model_missing", lambda: False)   # 4.20: Gemma 3 "on disk"
     def fake_plan(concept, n_shots, **kw):
         assert "ONE SHOT" in concept and n_shots == 6
         return {"shots": [{"n": i + 1, "prompt": f"beat {i + 1}", "mode": "text"} for i in range(6)]}

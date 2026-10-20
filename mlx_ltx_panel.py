@@ -72,6 +72,9 @@ SEQ_NOUN_CAP = "Sequence"
 # Pre-removal snapshot: git tag pre-agent-removal-2026-05-15.
 import image_engine as agent_image_engine
 import hostinfo
+# 4.20: what install.js fetches before Start and what the panel fetches after
+# (required_files.json -> install). Stdlib only; install.js runs it too.
+import install_plan
 
 # Agent-facing Ideogram 4 caption builder + validator (pure stdlib). Powers
 # the GET /image/agent/schema + POST /image/agent endpoints — a clean JSON
@@ -89,6 +92,10 @@ import ideogram_caption
 # loads a model in THIS process. Both are 3.9-compatible because the panel is.
 import storyboard
 import storyboard_planner
+# Hailuo H3 prompt guards — short in-prompt sentences against reported H3
+# failures (lines sung, invented rings, dialogue nouns on screen, ellipses).
+# Pure stdlib; applied in run_h3_job_inner right before the runner argv.
+import h3_prompt_guards
 
 # --- Paths -------------------------------------------------------------------
 # Everything below is overridable via env vars so the panel can be cloned and
@@ -3351,6 +3358,25 @@ def _safe_job_id(job_id: str) -> str:
     if len(job_id) > 64:
         raise ValueError("job_id too long")
     return job_id
+
+
+def train_trigger_problem(trigger: str) -> str:
+    """"" when `trigger` can name a trained LoRA's files, else why not.
+
+    The trigger IS the file name: the trainer writes
+    <loras>/<trigger>_v2.safetensors and its sidecars. A trigger with a path
+    in it (`/tmp/x`, `../x`) wrote the model and its JSON outside the library,
+    over whatever was there, and the character never appeared in the panel
+    (ov-review D-02). Words, spaces and the usual punctuation stay allowed."""
+    t = str(trigger or "")
+    if any(c in t for c in ("/", "\\", "\x00")) or ".." in t:
+        return ("The trigger word becomes the LoRA's file name, so it can't "
+                "contain / or \\ or '..'.")
+    if t[:1] in (".", "-"):
+        return "The trigger word can't start with '.' or '-'."
+    if len(t) > 64:
+        return "The trigger word is too long (64 characters at most)."
+    return ""
 
 
 def _normalise_caption_text(text: str, trigger: str | None = None) -> str:
@@ -7247,6 +7273,11 @@ DOWNLOAD: dict = {
     # a cancelled attempt looked like a failed one and was RETRIED, and a
     # cancel during backoff did nothing at all (Codex INST-07 / JOB-05).
     "cancelled": False,
+    # 4.20: True while the slot is held by the post-install background fetcher
+    # (deferred_fetch_step) rather than a click. The UI words the card calmly
+    # ("you can render now") and a Download click for another queued pack
+    # moves it up the queue instead of answering 409.
+    "background": False,
 }
 
 
@@ -7272,7 +7303,7 @@ def _download_register(proc) -> bool:
     return not cancelled
 
 
-def _download_thread(repo: dict) -> None:
+def _download_thread(repo: dict) -> str:
     """Run `hf download <repo_id> --local-dir <repo.local_dir>` and stream
     stdout/stderr line-by-line into STATE['log']. Sets DOWNLOAD["active"]
     back to False on exit (success or fail). Files land at repo['local_dir']
@@ -7355,11 +7386,15 @@ def _download_thread(repo: dict) -> None:
 
     max_attempts = 3
     backoff_sec = 5
+    # 4.20: what happened, for the background fetcher: "ok" | "cancelled" |
+    # "failed". Thread callers ignore it, as before.
+    outcome = "failed"
     try:
         for attempt in range(1, max_attempts + 1):
             with DOWNLOAD_LOCK:
                 if not DOWNLOAD["active"] or DOWNLOAD["cancelled"]:
                     push(f"[{dl_tag}] {dl_label} cancelled before attempt {attempt}.")
+                    outcome = "cancelled"
                     break
             if attempt > 1:
                 push(f"[{dl_tag}] {dl_label} attempt {attempt}/{max_attempts} — resuming from where the previous attempt stopped.")
@@ -7378,6 +7413,7 @@ def _download_thread(repo: dict) -> None:
                 break
             if not _download_register(proc):
                 push(f"[{dl_tag}] {dl_label} cancelled.")
+                outcome = "cancelled"
                 break
             # Stream every line. hf emits a tqdm progress bar with carriage
             # returns; we split on \r as well as \n so progress updates show
@@ -7401,11 +7437,13 @@ def _download_thread(repo: dict) -> None:
             rc = proc.wait()
             if rc == 0:
                 push(f"[{dl_tag}] {dl_label} downloaded successfully.")
+                outcome = "ok"
                 break
             with DOWNLOAD_LOCK:
                 cancelled = DOWNLOAD["cancelled"] or not DOWNLOAD["active"]
             if cancelled:
                 push(f"[{dl_tag}] {dl_label} cancelled (exit {rc}).")
+                outcome = "cancelled"
                 break
             if attempt < max_attempts:
                 push(f"[{dl_tag}] {dl_label} attempt {attempt} failed (exit {rc}). Retrying in {backoff_sec}s — the downloader resumes from where it stopped.")
@@ -7431,6 +7469,8 @@ def _download_thread(repo: dict) -> None:
             DOWNLOAD["proc"] = None
             DOWNLOAD["pgid"] = None
             DOWNLOAD["cancelled"] = False
+            DOWNLOAD["background"] = False
+    return outcome
 
 
 def _kill_active_download() -> None:
@@ -7452,6 +7492,308 @@ def _kill_active_download() -> None:
 
 
 atexit.register(_kill_active_download)
+
+
+# ---- Background downloads after the first boot (4.20) ------------------------
+# install.js used to download ~38 GB before Start appeared. Since 4.20 it stops
+# at what a first render needs (required_files.json -> install.before_start,
+# ~27.5 GB) and writes state/install_deferred.json naming the rest
+# (install.after_start: Gemma 3 for Enhance and the Storyboard planner, the
+# Upscale & Face Fix adapter, the three 2.3 IC-LoRAs). This fetcher works
+# through that list after the panel boots:
+#   * one pack at a time, through the SAME slot and downloader as a click on
+#     Download (_download_thread), so progress, Cancel and resume are the ones
+#     the Models page already has;
+#   * never taking the models drive below install.background_floor_gb free -
+#     renders need room too; it waits and re-checks instead;
+#   * a pack the user cancels is dropped from the list (they said no; the
+#     Models page still offers it); a failure backs off and retries;
+#   * ONLY when the marker exists. Update never writes one, so an existing
+#     install that updates is never handed a download it did not ask for.
+DEFERRED_LOCK = threading.Lock()
+DEFERRED: dict = {
+    "state": "idle",        # idle | starting | downloading | waiting | waiting_disk | retry_wait | failed | done
+    "key": None,            # the pack being worked on
+    "message": "",          # one plain sentence for the UI
+    "failures": {},         # key -> consecutive failures this boot
+    "retry_at": {},         # key -> epoch seconds before which it is not retried
+    "finished": [],         # keys that landed this boot (for the "ready" toast)
+}
+DEFERRED_START_DELAY_SEC = float(os.environ.get("LTX_DEFERRED_START_DELAY", "20") or 20)
+DEFERRED_SLOT_WAIT_SEC = 15.0
+DEFERRED_DISK_RECHECK_SEC = 300.0
+DEFERRED_RETRY_SEC = 600.0
+DEFERRED_MAX_FAILURES = 4
+
+
+def _deferred_set(**kw) -> None:
+    with DEFERRED_LOCK:
+        DEFERRED.update(kw)
+
+
+def _deferred_repo(key: str) -> dict | None:
+    return next((r for r in _repos() if r.get("key") == key), None)
+
+
+def deferred_marker_keys() -> list[str]:
+    """The keys install.js queued that the registry still knows, in order."""
+    m = install_plan.read_marker(STATE_DIR)
+    if not m:
+        return []
+    known = {r.get("key") for r in _repos()}
+    return [k for k in m["pending"] if k in known]
+
+
+def _deferred_missing(repo: dict | None) -> bool:
+    """Missing from THIS install's own folder. Deliberately not the HF-cache
+    fallback _repo_effective_missing() also accepts: Enhance, the planner and
+    the IC modes load these from the local path, so a copy in some cache does
+    not make them work."""
+    return repo is None or bool(_repo_missing(repo))
+
+
+def deferred_pending_keys() -> list[str]:
+    """Queued AND still missing on disk."""
+    return [k for k in deferred_marker_keys() if _deferred_missing(_deferred_repo(k))]
+
+
+def _deferred_floor_bytes() -> int:
+    return int(install_plan.install_block(_REQUIRED)["background_floor_gb"] * 1e9)
+
+
+def deferred_pack_state(key: str) -> str:
+    """What the fetcher is doing about ONE pack: downloading | queued |
+    waiting_disk | missing (not queued at all) | ready."""
+    repo = _deferred_repo(key)
+    if repo is not None and not _deferred_missing(repo):
+        return "ready"
+    with DOWNLOAD_LOCK:
+        if DOWNLOAD["active"] and DOWNLOAD.get("key") == key:
+            return "downloading"
+    if key in deferred_pending_keys():
+        free = install_plan.free_bytes(ROOT)
+        left = (install_plan.remaining_bytes(ROOT, repo or {}, _MIN_FILE_BYTES)
+                + install_plan.peak_overhead(repo or {}))
+        if free is not None and free < left + _deferred_floor_bytes():
+            return "waiting_disk"
+        return "queued"
+    return "missing"
+
+
+def deferred_status() -> dict:
+    """/status.deferred_downloads - the background list as the UI shows it."""
+    rows = []
+    for k in deferred_pending_keys():
+        repo = _deferred_repo(k) or {}
+        left = install_plan.remaining_bytes(ROOT, repo, _MIN_FILE_BYTES)
+        rows.append({"key": k, "name": repo.get("name") or k,
+                     "size_gb": round(install_plan.expected_bytes(repo) / 1e9, 2),
+                     "left_gb": round(left / 1e9, 2)})
+    with DEFERRED_LOCK:
+        snap = {"state": DEFERRED["state"], "key": DEFERRED["key"],
+                "message": DEFERRED["message"], "finished": list(DEFERRED["finished"])}
+    return {**snap, "active": bool(rows), "pending": rows,
+            "left_gb": round(sum(r["left_gb"] for r in rows), 2)}
+
+
+def deferred_fetch_step() -> float | None:
+    """One pass of the background fetcher: start at most one download (and run
+    it to the end), or decide to wait. Returns the seconds to sleep before the
+    next pass, or None when there is nothing left to do this boot."""
+    keys = deferred_marker_keys()
+    live = []
+    for k in keys:
+        repo = _deferred_repo(k)
+        if repo is not None and _deferred_missing(repo):
+            live.append(k)
+        else:
+            # Landed (or got there another way - a click, an Update): done.
+            install_plan.drop_from_marker(STATE_DIR, k)
+    if not live:
+        _deferred_set(state="done" if keys else "idle", key=None, message="")
+        return None
+    now = time.time()
+    with DEFERRED_LOCK:
+        fails = dict(DEFERRED["failures"])
+        retry_at = dict(DEFERRED["retry_at"])
+    candidates = [k for k in live if fails.get(k, 0) < DEFERRED_MAX_FAILURES]
+    if not candidates:
+        _deferred_set(state="failed", key=None,
+                      message="The background downloads kept failing - Settings -> Models "
+                              "offers each one, and they resume where they stopped.")
+        return None
+    ready_now = [k for k in candidates if retry_at.get(k, 0) <= now]
+    if not ready_now:
+        _deferred_set(state="retry_wait", key=None,
+                      message="A background download failed; retrying in a few minutes.")
+        return max(5.0, min(retry_at.get(k, now) for k in candidates) - now)
+    free = install_plan.free_bytes(ROOT)
+    floor = _deferred_floor_bytes()
+    # The first pack in order that FITS. A big one that does not (Gemma 3 on a
+    # nearly full 256 GB Mac) must not hold back the small ones behind it.
+    key = None
+    for k in ready_now:
+        left = install_plan.remaining_bytes(ROOT, _deferred_repo(k), _MIN_FILE_BYTES)
+        left += install_plan.peak_overhead(_deferred_repo(k))
+        if free is None or free >= left + floor:
+            key = k
+            break
+    if key is None:
+        first = _deferred_repo(ready_now[0])
+        left = install_plan.remaining_bytes(ROOT, first, _MIN_FILE_BYTES)
+        _deferred_set(state="waiting_disk", key=ready_now[0], message=(
+            f"Paused: {first.get('name') or ready_now[0]} needs {install_plan.fmt_gb(left)} and "
+            f"Phosphene keeps {install_plan.fmt_gb(floor)} free for your renders - this "
+            f"drive has {install_plan.fmt_gb(free)} free. Free up "
+            f"{install_plan.fmt_gb(left + floor - free)} and it carries on by itself."))
+        return DEFERRED_DISK_RECHECK_SEC
+    repo = _deferred_repo(key)
+    left = install_plan.remaining_bytes(ROOT, repo, _MIN_FILE_BYTES)
+    is_mirror = ((repo.get("mirror") or {}).get("kind") == "github-release")
+    if HF_BIN is None and not is_mirror:
+        with DEFERRED_LOCK:
+            DEFERRED["failures"][key] = DEFERRED_MAX_FAILURES
+        _deferred_set(state="failed", key=key,
+                      message="The hf downloader is missing - click Update in Pinokio.")
+        return 1.0
+    with DOWNLOAD_LOCK:
+        if DOWNLOAD["active"]:
+            busy = True
+        else:
+            busy = False
+            DOWNLOAD.update({"active": True, "key": key, "repo_id": repo["repo_id"],
+                             "started_ts": time.time(), "cancelled": False,
+                             "last_line": "starting (background)…", "background": True})
+    if busy:
+        _deferred_set(state="waiting", key=key,
+                      message="Waiting for the current download to finish.")
+        return DEFERRED_SLOT_WAIT_SEC
+    _deferred_set(state="downloading", key=key, message="")
+    push(f"[background] downloading {repo.get('name') or key} "
+         f"(~{install_plan.fmt_gb(left)}) - you can render meanwhile.")
+    outcome = _download_thread(repo)
+    if not _deferred_missing(repo):
+        install_plan.drop_from_marker(STATE_DIR, key)
+        with DEFERRED_LOCK:
+            DEFERRED["failures"].pop(key, None)
+            DEFERRED["finished"].append(key)
+        with _INTEGRITY_LOCK:
+            _INTEGRITY_CACHE["ts"] = 0.0
+        push(f"[background] {repo.get('name') or key} is ready.")
+        return 1.0
+    if outcome == "cancelled":
+        install_plan.drop_from_marker(STATE_DIR, key)
+        push(f"[background] {repo.get('name') or key} skipped - Settings -> Models "
+             f"offers it whenever you want it.")
+        return 1.0
+    with DEFERRED_LOCK:
+        n = DEFERRED["failures"].get(key, 0) + 1
+        DEFERRED["failures"][key] = n
+        DEFERRED["retry_at"][key] = time.time() + DEFERRED_RETRY_SEC
+    return 1.0
+
+
+def deferred_fetch_loop() -> None:
+    """Background thread body. Started at boot only when the marker exists."""
+    _deferred_set(state="starting", message="")
+    time.sleep(max(0.0, DEFERRED_START_DELAY_SEC))
+    while True:
+        try:
+            wait = deferred_fetch_step()
+        except Exception as exc:  # noqa: BLE001 - never take the panel down
+            push(f"[background] download queue error: {exc}")
+            wait = DEFERRED_RETRY_SEC
+        if wait is None:
+            return
+        time.sleep(wait)
+
+
+def deferred_fetch_enabled() -> bool:
+    if (os.environ.get("LTX_DEFERRED_DOWNLOADS") or "").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    return bool(deferred_marker_keys())
+
+
+def deferred_prioritize(key: str) -> bool:
+    """A click on Download for a pack that is queued behind the one running:
+    move it to the front instead of refusing. True when it was queued."""
+    return install_plan.prioritize_in_marker(STATE_DIR, key)
+
+
+def pack_needed_payload(key: str, feature: str, what: str) -> dict:
+    """The 409 body a feature returns when the pack it runs on is not on disk
+    yet - one sentence the user can act on, plus what the button needs.
+    `what` names the pack in the user's words ("its language model")."""
+    repo = _deferred_repo(key) or {}
+    size = install_plan.fmt_gb(install_plan.expected_bytes(repo)) if repo else "?"
+    state = deferred_pack_state(key)
+    if state == "downloading":
+        msg = (f"{feature} needs {what} ({size}), which is still downloading in the "
+               f"background. It works the moment that finishes - no restart needed.")
+    elif state == "queued":
+        msg = (f"{feature} needs {what} ({size}), which is queued to download in the "
+               f"background. Click Download now to fetch it first.")
+    elif state == "waiting_disk":
+        free = install_plan.free_bytes(ROOT) or 0
+        floor = _deferred_floor_bytes()
+        left = (install_plan.remaining_bytes(ROOT, repo, _MIN_FILE_BYTES)
+                + install_plan.peak_overhead(repo))
+        msg = (f"{feature} needs {what} ({size}). Its background download is paused: "
+               f"Phosphene keeps {install_plan.fmt_gb(floor)} free for your renders and this "
+               f"drive has {install_plan.fmt_gb(free)}. Free up "
+               f"{install_plan.fmt_gb(max(0, left + floor - free))} and it starts by itself"
+               f" - or click Download now to fetch it anyway.")
+    else:
+        msg = f"{feature} needs {what} ({size}), which is not downloaded yet."
+    return {"ok": False, "error": msg, "needs_pack": key,
+            "pack_name": repo.get("name") or key, "pack_size": size, "pack_state": state}
+
+
+def _gemma3_missing_at(path: Path) -> bool:
+    """Is the Gemma 3 model Enhance / the planner load from absent at `path`?
+
+    On the registry's own folder the registry answers (the same files the
+    Models page counts). A path moved with LTX_GEMMA_PATH /
+    LTX_STORYBOARD_PLANNER is the user's: there the folder must at least hold a
+    config.json, which every mlx-lm model folder has."""
+    try:
+        repo = _deferred_repo("gemma")
+        if repo is not None and Path(path).resolve() == (ROOT / repo["local_dir"]).resolve():
+            return _deferred_missing(repo)
+        return not (Path(path) / "config.json").is_file()
+    except OSError:
+        return True
+
+
+def enhance_model_missing() -> bool:
+    return _gemma3_missing_at(GEMMA)
+
+
+def planner_model_missing() -> bool:
+    try:
+        return _gemma3_missing_at(Path(storyboard_planner.DEFAULT_MODEL_PATH))
+    except Exception:  # noqa: BLE001 - an unreadable path is the planner's own error
+        return False
+
+
+def gemma3_refusal(feature: str, what: str, path) -> dict:
+    """The 409 body for a feature whose Gemma 3 is not there. On the registry's
+    own folder that is the pack offer (downloading / Download now). On a folder
+    the user moved it to (LTX_GEMMA_PATH / LTX_STORYBOARD_PLANNER) a download
+    into the default folder would not help - say which setting points where."""
+    repo = _deferred_repo("gemma")
+    try:
+        default = repo is not None and Path(path).resolve() == (ROOT / repo["local_dir"]).resolve()
+    except OSError:
+        default = False
+    if default:
+        return pack_needed_payload("gemma", feature, what)
+    var = ("LTX_STORYBOARD_PLANNER" if os.environ.get("LTX_STORYBOARD_PLANNER")
+           and "planner" in feature.lower() else "LTX_GEMMA_PATH")
+    return {"ok": False, "error": (f"{feature} loads {what} from {path} ({var}), and "
+                                   f"there is no model there. Point {var} at the folder "
+                                   f"that holds it, or remove the setting to use the "
+                                   f"downloaded copy.")}
 
 
 # ---- CivitAI bridge ---------------------------------------------------------
@@ -12562,10 +12904,51 @@ def _h3_repair_hold(next_job: dict | None) -> str:
     refused - and three identical refusals trip the queue breaker."""
     if not isinstance(next_job, dict) or (next_job.get("params") or {}).get("engine") != "h3":
         return ""
-    if not h3_env_busy():
+    if not h3_env_busy() and not _h3_auto_repair_start():
         return ""
     return ("Queue held: Hailuo H3's packages are being repaired (about a "
             "minute). The next H3 render starts when it finishes.")
+
+
+#: One automatic repair per panel run - a repair that did not take must not
+#: loop; the job is then refused with the manual Repair, as before.
+_H3_AUTO_REPAIR: dict = {"tried": False}
+
+
+def _h3_auto_repair_start() -> bool:
+    """Start the H3 venv repair by itself when an H3 render is next and the
+    venv is off its known-good set. True when a repair was started.
+
+    FLEET (4.19.5-4.19.6, 10 installs in 5 days): every H3 user's first render
+    after updating into the 4.19.5 constraint set was refused with "the Hailuo
+    H3 venv is not on the package set this release was tested with - mlx
+    0.32.x (tested: 0.32.4)". Each of them pressed Repair and rendered ~10
+    minutes later - the repair always worked; the Update had not run it for
+    them (an update that never ran post_update.sh 8b, or one stopped before
+    it). The refusal was a failed render plus a click for a fix the panel can
+    make itself: now the job waits in the queue while the same repair
+    (h3_deps.sh, packages only, weights untouched) runs, then renders."""
+    if _H3_AUTO_REPAIR.get("tried"):
+        return False
+    # Only the app's own checkout. LTX_H3_ROOT points the panel at a checkout
+    # somebody manages themselves (a shared tree, a developer's engine
+    # worktree whose venv is off the set on purpose): the panel judges it and
+    # offers the button, but never rewrites its packages unasked.
+    if os.environ.get("LTX_H3_ROOT", "").strip():
+        return False
+    try:
+        fault = h3_env_fault()
+    except Exception:                                            # noqa: BLE001
+        return False
+    if not fault:
+        return False
+    _H3_AUTO_REPAIR["tried"] = True
+    code, _payload = h3_env_repair_start()
+    if code != 202:
+        return False
+    push("[h3] the next render needs Hailuo H3's packages repaired first "
+         f"({fault}) - repairing automatically, then it starts.")
+    return True
 
 
 def h3_env_status() -> dict:
@@ -12649,8 +13032,11 @@ def _h3_env_repair_thread() -> None:
         if getattr(timer, "fired", False):
             raise subprocess.TimeoutExpired(cmd, H3_REPAIR_TIMEOUT_S)
         if rc != 0:
-            reason = next((l for l in reversed(tail) if l.startswith("error:")), "")
-            error = (reason[len("error:"):].strip() if reason
+            # h3_deps.sh says why on a "FATAL error: ..." line (4.20; it was a
+            # bare "error:" line before - both still read).
+            reason = next((l for l in reversed(tail)
+                           if l.startswith(("FATAL error:", "error:"))), "")
+            error = (reason.split("error:", 1)[1].strip() if reason
                      else f"the install stopped (exit {rc})")
     except subprocess.TimeoutExpired:
         error = f"the install took longer than {H3_REPAIR_TIMEOUT_S // 60} minutes"
@@ -16179,8 +16565,16 @@ def _music_install_thread() -> None:
                              "Use “Install the music engine” in the Phosphene sidebar in Pinokio instead.")
                     break
             reason = next((l for l in reversed(tail) if not l.startswith(("+", "Traceback"))), "")
-            error = f"{label} failed (exit {rc})" + (f": {reason}" if reason else "") + \
-                    ". Click Install again to resume — nothing already downloaded is lost."
+            # The scripts end a failure with "FATAL error: <reason + next click>"
+            # (that line is what stops a Pinokio install; 4.20). Show the reason,
+            # not the marker, and do not say "Install again" twice.
+            if reason.startswith("FATAL error:"):
+                reason = reason[len("FATAL error:"):].strip()
+            error = f"{label} failed (exit {rc})" + (f": {reason}" if reason else "")
+            if not error.endswith("."):
+                error += "."
+            if "Install again" not in reason:
+                error += " Click Install again to resume — nothing already downloaded is lost."
             break
     stopped = _MUSIC_INSTALL_STOP.is_set()
     ok = not stopped and error is None and not music_paths()["missing"]
@@ -17115,6 +17509,36 @@ _ANALYTICS_PATH_RES = (
                r"|Library|System))(?:/[^\s'\"<>,;)\]]*)*"),
     re.compile(r"(?:/[\w.+\-]+){2,}/?"),
 )
+
+# THREE SHAPES THE PASSES ABOVE LET THROUGH (ov-review A-03), run before them
+# by _analytics_redact_paths():
+#   * a username with a space. The anchored pass stops at whitespace, so
+#     `'/Users/Jane Doe/Models/x.safetensors'` left "Doe" (the surname) in the
+#     signature. A quoted string that starts like a path is redacted whole,
+#     quotes kept, and an unquoted home folder is cut up to its next slash.
+#   * a URL. The path passes ate the URL's path and kept its query string -
+#     `?token=...` went out verbatim. Scheme and host stay (which server
+#     failed is the useful half); userinfo, path and query go.
+#   * a Windows path (`C:\\Users\\Alice\\...`), which no pass knew.
+_ANALYTICS_URL_RE = re.compile(
+    r"\b([a-zA-Z][a-zA-Z0-9+.-]{1,15})://(?:[^@/\s'\"]*@)?([^/\s'\"?#]+)[^\s'\"]*")
+_ANALYTICS_QUOTED_PATH_RE = re.compile(
+    r"(['\"])(?:~/|/|[A-Za-z]:\\|\.{1,2}/)[^'\"\n]*\1")
+_ANALYTICS_HOME_RE = re.compile(r"/(?:Users|home)/[^/\n'\"]{1,64}(?=/)")
+_ANALYTICS_WINPATH_RE = re.compile(r"\b[A-Za-z]:\\[^\s'\"<>|]*")
+
+
+def _analytics_redact_paths(s: str) -> str:
+    """Every path and URL in `s` replaced - see _ANALYTICS_PATH_RES."""
+    s = _ANALYTICS_URL_RE.sub(lambda m: f"{m.group(1)}://{m.group(2)}/<url>", s)
+    s = _ANALYTICS_QUOTED_PATH_RE.sub(lambda m: f"{m.group(1)}<path>{m.group(1)}", s)
+    s = _ANALYTICS_HOME_RE.sub("<path>", s)
+    s = _ANALYTICS_WINPATH_RE.sub("<path>", s)
+    for rx in _ANALYTICS_PATH_RES:
+        s = rx.sub("<path>", s)
+    return s
+
+
 _ANALYTICS_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
@@ -17374,10 +17798,7 @@ def _bug_report_scrub_line(line: str) -> str:
     tail. This reuses the SAME path regexes, per line, keeping every line
     and the tail's full diagnostic shape."""
     try:
-        s = str(line or "")
-        for rx in _ANALYTICS_PATH_RES:
-            s = rx.sub("<path>", s)
-        return s
+        return _analytics_redact_paths(str(line or ""))
     except Exception:
         return str(line or "")
 
@@ -17401,8 +17822,7 @@ def _analytics_scrub_text(text, secrets=()) -> str:
             # enough not to blank out ordinary words in an error string.
             if len(sec) >= 6 and sec in s:
                 s = s.replace(sec, "<redacted>")
-        for rx in _ANALYTICS_PATH_RES:
-            s = rx.sub("<path>", s)
+        s = _analytics_redact_paths(s)
         s = " ".join(s.split())
         return s[:ANALYTICS_STR_MAX]
     except Exception:
@@ -17831,7 +18251,16 @@ def update_pressed_landed(marker: str) -> tuple[bool, str]:
 # invents one. This is the same discipline as the error taxonomy, for the same
 # reason — a free-text step name is a field nobody can chart and a string
 # nobody reviewed.
-_INSTALL_STEPS = ("first_boot", "engine_env", "weights_check", "first_queue")
+# `first_use` (growth pass, 2026-10-19): the first click or key press anyone
+# makes on the panel page. Pinokio auto-runs Start the moment the ~37 GB
+# install finishes, so `first_boot` can fire with nobody in front of the
+# screen; in the 2026-09-20 -> 10-11 cohorts 20% of new installs booted once
+# and never rendered, and three in four of those sent nothing but the boot
+# events. `first_use` splits "nobody ever looked" from "looked and left" -
+# they need opposite fixes. Reported by the page through /analytics/ui, the
+# only step the browser may report.
+_INSTALL_STEPS = ("first_boot", "engine_env", "weights_check", "first_queue",
+                  "first_use")
 _INSTALL_OUTCOMES = ("started", "ok", "failed", "skipped")
 _UPDATE_STAGES = ("running_new", "restart_pending")
 _UPDATE_OUTCOMES = ("ok", "failed")
@@ -18042,7 +18471,13 @@ _ANALYTICS_FEATURES = ("storyboard_plan", "storyboard_export", "editor_open",
                        # fires only past the refusal; train_refused counts
                        # the clicks that never got there, so neither number
                        # silently absorbs the other.
-                       "train_refused")
+                       "train_refused",
+                       # Growth pass 2026-10-19: the clip toolbar's Share
+                       # (caption with the repo link + the file selected in
+                       # Finder). Nothing about the clip is sent - only that
+                       # the button was used, so "do people share what they
+                       # make" stops being a guess.
+                       "share")
 
 
 def _analytics_feature(feature: str, detail: str = "") -> None:
@@ -19281,8 +19716,9 @@ def _mp4_boxes(buf: bytes, start: int = 0, end: int | None = None):
         pos += size
 
 
-def _mp4_display_dims(path) -> tuple[int, int] | None:
-    """(width, height) of an mp4's first video track, from its tkhd box."""
+def _mp4_read_moov(path) -> bytes | None:
+    """The `moov` box of an mp4 (its track headers), or None. Seeks over the
+    top-level boxes and never reads `mdat`, so it costs a few KB per file."""
     try:
         with open(path, "rb") as fh:
             total = os.fstat(fh.fileno()).st_size
@@ -19310,6 +19746,12 @@ def _mp4_display_dims(path) -> tuple[int, int] | None:
                 pos += size
     except OSError:
         return None
+    return moov or None
+
+
+def _mp4_display_dims(path) -> tuple[int, int] | None:
+    """(width, height) of an mp4's first video track, from its tkhd box."""
+    moov = _mp4_read_moov(path)
     if not moov:
         return None
     for typ, a, b in _mp4_boxes(moov):
@@ -19340,6 +19782,160 @@ def _output_dims(path) -> tuple[int, int] | None:
     dims = _mp4_display_dims(path)
     _OUTPUT_DIMS_CACHE[key] = (st.st_mtime_ns, st.st_size, dims)
     return dims
+
+
+# W6 (2026-10-19): Add sound was nearly undiscovered — 3 renders by 2
+# users in 14 days against 115 Lip-sync renders. The gallery and the player now
+# offer it on every SILENT clip, which needs the server to know which clips are
+# silent without the browser probing anything:
+#   * no audio track at all — read from the mp4's own track headers (the moov
+#     box, a few KB, the same read the size chip already does), answered inline;
+#   * an audio track that is digital silence (an exported Editor cut, a muted
+#     import) — one ffmpeg volumedetect pass, run on a background thread and
+#     never on the request; the listing says None ("not known yet") until the
+#     answer lands and the next poll carries it.
+# Every answer is cached per (mtime, size) and persisted in STATE_DIR, so a
+# clip is decoded once in its life, not once per /status poll or per restart.
+OUTPUT_SILENT_MAX_DB = -80.0       # volumedetect max_volume at or under = silence
+_SILENCE_CACHE_NAME = "output_silence.json"
+_SILENCE_CACHE: dict[str, list] = {}       # path -> [mtime_ns, size, silent]
+_SILENCE_LOCK = threading.Lock()
+_SILENCE_PENDING: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+_SILENCE_WAKE = threading.Event()
+_SILENCE_STATE = {"loaded": False, "thread": None, "dirty": False}
+
+
+def _mp4_has_audio_track(path) -> bool | None:
+    """True/False when the mp4's header says whether it carries a sound
+    track (a `trak` whose `hdlr` is `soun`); None when it cannot be read."""
+    moov = _mp4_read_moov(path)
+    if not moov:
+        return None
+    for typ, a, b in _mp4_boxes(moov):
+        if typ != b"trak":
+            continue
+        for mtyp, ma, mb in _mp4_boxes(moov, a, b):
+            if mtyp != b"mdia":
+                continue
+            for htyp, ha, hb in _mp4_boxes(moov, ma, mb):
+                # hdlr: version+flags (4), pre_defined (4), handler_type (4)
+                if htyp == b"hdlr" and hb - ha >= 12 and moov[ha + 8:ha + 12] == b"soun":
+                    return True
+    return False
+
+
+def _audio_is_digital_silence(path) -> bool | None:
+    """Whether a clip's first audio stream never rises above
+    OUTPUT_SILENT_MAX_DB. None when ffmpeg cannot say (no decoder, a broken
+    file, a timeout) — the clip is then simply not offered Add sound."""
+    try:
+        r = subprocess.run(
+            [str(FFMPEG), "-nostdin", "-hide_banner", "-v", "info", "-i", str(path),
+             "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, errors="replace", timeout=60)
+    except Exception:
+        return None
+    m = re.search(r"max_volume:\s*(-?inf|-?[0-9.]+)\s*dB", r.stderr or "")
+    if not m:
+        return None
+    v = m.group(1)
+    if v.endswith("inf"):
+        return v.startswith("-")
+    try:
+        return float(v) <= OUTPUT_SILENT_MAX_DB
+    except ValueError:
+        return None
+
+
+def _silence_cache_path() -> Path:
+    return STATE_DIR / _SILENCE_CACHE_NAME
+
+
+def _silence_load_once() -> None:
+    if _SILENCE_STATE["loaded"]:
+        return
+    _SILENCE_STATE["loaded"] = True
+    try:
+        raw = json.loads(_silence_cache_path().read_text())
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(v, list) and len(v) == 3:
+                    _SILENCE_CACHE[str(k)] = v
+    except (OSError, ValueError):
+        pass
+
+
+def _silence_save() -> None:
+    with _SILENCE_LOCK:
+        if not _SILENCE_STATE["dirty"]:
+            return
+        _SILENCE_STATE["dirty"] = False
+        snap = {k: v for k, v in _SILENCE_CACHE.items() if v[2] is not None}
+    snap = {k: v for k, v in snap.items() if os.path.exists(k)}
+    try:
+        atomic_write_text(_silence_cache_path(), json.dumps(snap))
+    except Exception:
+        pass
+
+
+def _silence_worker() -> None:
+    while True:
+        _SILENCE_WAKE.wait(timeout=30)
+        _SILENCE_WAKE.clear()
+        while True:
+            with _SILENCE_LOCK:
+                if not _SILENCE_PENDING:
+                    break
+                path, _ = _SILENCE_PENDING.popitem(last=False)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            silent = _audio_is_digital_silence(path)
+            with _SILENCE_LOCK:
+                _SILENCE_CACHE[path] = [st.st_mtime_ns, st.st_size, silent]
+                _SILENCE_STATE["dirty"] = True
+        _silence_save()
+
+
+def output_is_silent(path) -> bool | None:
+    """True when a gallery clip has no sound (no audio track, or a track of
+    digital silence), False when it has sound, None when not known yet.
+    Never decodes on the caller's thread — see the W6 note above."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = str(path)
+    with _SILENCE_LOCK:
+        _silence_load_once()
+        hit = _SILENCE_CACHE.get(key)
+        if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+            # None here = queued, or ffmpeg could not say; either way the
+            # header is not re-read and nothing is queued twice.
+            return hit[2]
+    has_audio = _mp4_has_audio_track(path)
+    if has_audio is None:
+        return None
+    with _SILENCE_LOCK:
+        if not has_audio:
+            _SILENCE_CACHE[key] = [st.st_mtime_ns, st.st_size, True]
+            _SILENCE_STATE["dirty"] = True
+            silent = True
+        else:
+            # Remember "has a track, level unknown" so the header is not
+            # re-read every poll while the worker gets to it.
+            _SILENCE_CACHE[key] = [st.st_mtime_ns, st.st_size, None]
+            _SILENCE_PENDING[key] = None
+            silent = None
+            if _SILENCE_STATE["thread"] is None:
+                t = threading.Thread(target=_silence_worker, name="output-silence",
+                                     daemon=True)
+                _SILENCE_STATE["thread"] = t
+                t.start()
+    if silent is None:
+        _SILENCE_WAKE.set()
+    return silent
 
 
 def _probe_video_frames(path: str) -> int:
@@ -20497,6 +21093,9 @@ def list_outputs(
     for _e in sliced:
         _d = _output_dims(_e["path"]) if _e.get("kind") == "video" else None
         _e["width"], _e["height"] = (_d if _d else (None, None))
+        # W6: True on a clip with no sound (the gallery and the player offer
+        # Add sound on it), False with sound, None while not known yet.
+        _e["silent"] = output_is_silent(_e["path"]) if _e.get("kind") == "video" else None
     if return_total:
         return sliced, total
     return sliced
@@ -21884,6 +22483,29 @@ def _fit_inside(w: int, h: int, target_w: int, target_h: int) -> tuple[int, int]
     return max(2, int(round(w * s))), max(2, int(round(h * s)))
 
 
+#: Every LTX `upscale` value compute_upscale_plan() can plan (or skip).
+LTX_UPSCALE_MODES = ("off", "native", "ltx_x2", "fit_720p", "fit_1080p", "x2")
+
+
+def normalize_ltx_upscale(value, quality: str | None) -> tuple[str, str]:
+    """(mode, note): an LTX export size compute_upscale_plan() knows.
+
+    FLEET (4.19.5): `unknown upscale mode: fit_360p` on an i2v job. make_job
+    took the field verbatim and compute_upscale_plan() only rejected it AFTER
+    the render - the whole generation burned, then the job failed with no
+    output. A value from an older sidecar, a Retry/Restore of such a job or an
+    API caller now falls back to the quality's own default before the render,
+    and the note says so."""
+    raw = str(value if value is not None else "").strip().lower()
+    if raw in ("", "none"):
+        return "off", ""
+    if raw in LTX_UPSCALE_MODES:
+        return raw, ""
+    fallback = "fit_720p" if quality == "balanced" else "off"
+    return fallback, (f"export size {str(value)[:40]!r} is not one this version "
+                      f"has - exporting at {fallback} instead")
+
+
 def compute_upscale_plan(w: int, h: int, mode: str | None,
                           helper_did_model_upscale: bool = False) -> dict | None:
     """Plan a panel-side ffmpeg upscale pass. Returns None when no further
@@ -22740,6 +23362,10 @@ def oneshot_plan_beats(prompt: str, seconds: int, engine: str = "ltx") -> dict:
         return {"ok": False, "error": "prompt is required"}
     if seconds not in TAKE_SECONDS:
         return {"ok": False, "error": f"seconds must be one of {list(TAKE_SECONDS)}"}
+    if planner_model_missing():
+        return gemma3_refusal("Writing the beats",
+                              "the Storyboard planner's language model, Gemma 3",
+                              storyboard_planner.DEFAULT_MODEL_PATH)
     n = max(1, seconds // TAKE_BEAT_SECONDS)
     concept = _sb_take_concept(prompt, seconds)
     eng = "h3" if (str(engine or "").lower() == "h3" and _sb_h3_available()) else "ltx"
@@ -24420,14 +25046,16 @@ def storyboard_status() -> dict:
     """Compact Storyboard snapshot for the page bootstrap.
 
     `planner_present` answers the only question that could make the feature
-    unusable — and it is almost always yes, because the planner runs on the same
-    weights /prompt/enhance already loads. Nothing is ever downloaded.
+    unusable. The planner runs on the same weights /prompt/enhance loads
+    (Gemma 3), and since 4.20 a fresh install fetches those in the background
+    after the first boot - so for a while it can be no, with
+    `planner_pack_state` saying whether it is downloading or queued.
     """
     model = ""
     present = False
     try:
         model = str(storyboard_planner.DEFAULT_MODEL_PATH or "")
-        present = bool(model) and Path(model).is_dir()
+        present = bool(model) and not planner_model_missing()
     except Exception:
         pass
     s = get_settings()
@@ -24436,6 +25064,7 @@ def storyboard_status() -> dict:
         "planner_model": model,
         "planner_model_name": Path(model).name if model else "",
         "planner_present": present,
+        "planner_pack_state": "ready" if present else deferred_pack_state("gemma"),
         "ram_help": STORYBOARD_RAM_HELP,
         "ram_status": storyboard_planner_ram_status(),
         "engine_help": STORYBOARD_ENGINE_HELP,
@@ -31199,7 +31828,8 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
                     or _qcell.get("width") or 1024)
     default_h = int((_character_quality or {}).get("height")
                     or _qcell.get("height") or 576)
-    upscale = f("upscale", "fit_720p" if quality == "balanced" else "off")
+    upscale, _upscale_note = normalize_ltx_upscale(
+        f("upscale", "fit_720p" if quality == "balanced" else "off"), quality)
     requested_upscale_method = (f("upscale_method", "lanczos") or "lanczos").strip().lower()
     if requested_upscale_method == "model":
         requested_upscale_method = "pipersr"
@@ -31669,6 +32299,10 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
             # say this. SAME allowlist trap.
             "h3_extend_seconds": _safe_float(f("h3_extend_seconds", "5"), 5.0,
                                              minimum=0.5),
+            # Which H3 prompt guards run ("" = the default set, "off", "all"
+            # or a comma list — h3_prompt_guards.parse_guard_setting). SAME
+            # allowlist trap: leave it out and an API "off" silently no-ops.
+            "h3_prompt_guards": f("h3_prompt_guards", "").strip().lower(),
             "take": _take,
             # LTX-2.5 distilled schedule preset — "" (tuned default) or
             # "fast"/"vendor", already gated above to the lane that defines
@@ -31961,6 +32595,8 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
         if job["params"]["frames"] != _req_f:
             push(f"{_req_f} frames isn't on the 8k+1 grid — rendering "
                  f"{job['params']['frames']} frames.")
+        if _upscale_note:
+            push(f"[export] {_upscale_note}")
         # A distilled-lane job runs exactly 8 steps; a stray count from the
         # H3 surface, a Params restore or a Retry is clamped, never refused.
         _steps_note = clamp_distilled_steps(job["params"])
@@ -32812,6 +33448,9 @@ def run_train_job_inner(job: dict) -> None:
         train_job_id = _safe_job_id(p.get("train_job_id") or "")
     except ValueError as e:
         raise RuntimeError(f"train job has invalid id: {e}")
+    _trig_problem = train_trigger_problem(p.get("trigger") or "")
+    if _trig_problem:
+        raise RuntimeError(_trig_problem)
 
     # Train type — "character" (default, voice-paired) or "style" (no voice,
     # different output naming + cache dir + sidecar kind). The branching is
@@ -34865,6 +35504,25 @@ def run_h3_job_inner(job: dict) -> None:
         chain_prompts = []
     if mode == "a2v":
         prompt = h3_a2v_prompt(prompt)
+    # Prompt guards (h3_prompt_guards.py): ellipses inside <d> become , or .,
+    # and a sentence each against a line being sung (#68), rings invented on
+    # bare hands (#86) and dialogue nouns appearing on screen (#81) — only
+    # where the prompt does not already ask for the opposite. Applied to the
+    # text the runner encodes, never to p["prompt"], so Load Params gives the
+    # user back exactly what they typed. `h3_prompt_guards=off` on the job
+    # turns them off.
+    _guard_keys = h3_prompt_guards.parse_guard_setting(p.get("h3_prompt_guards"))
+    prompt, _guards_applied = h3_prompt_guards.apply_guards(prompt, mode, _guard_keys)
+    if chain_prompts:
+        _guarded_windows = []
+        for _wp in chain_prompts:
+            _gw, _ga = h3_prompt_guards.apply_guards(_wp, mode, _guard_keys)
+            _guarded_windows.append(_gw)
+            _guards_applied += [g for g in _ga if g not in _guards_applied]
+        chain_prompts = _guarded_windows
+    p["h3_prompt_guards_applied"] = list(_guards_applied)
+    if _guards_applied:
+        push("[h3] prompt guards: " + ", ".join(_guards_applied))
     mode_argv: list[str] = plan["argv"]
     if plan.get("first_frame") is not None:
         first_frame = plan["first_frame"]
@@ -36881,6 +37539,12 @@ def run_job_inner(job: dict) -> None:
         push("[accel] Boost/Turbo was retired in v4.0.5 — this render restored "
              "it from an old sidecar; running with acceleration off.")
         p["accel"] = "off"
+    # The export size is checked BEFORE the render (normalize_ltx_upscale):
+    # compute_upscale_plan() rejects an unknown one only after it - a Retry or
+    # Restore of an old job used to burn the whole generation first.
+    p["upscale"], _upscale_note = normalize_ltx_upscale(p.get("upscale"), quality)
+    if _upscale_note:
+        push(f"[export] {_upscale_note}")
 
     # The Q4 distilled lane runs a fixed 9-point sigma table — exactly 8
     # steps. Fewer used to be refused (a truncated walk leaves the clip part
@@ -36894,7 +37558,9 @@ def run_job_inner(job: dict) -> None:
     if _steps_note:
         push(f"[generation] {_steps_note}")
 
-    if p["stop_comfy"]:
+    # .get: a job built outside make_job (a New Take or Retry of a sidecar, an
+    # API restore) may not carry it - a bare KeyError reached the fleet.
+    if p.get("stop_comfy"):
         kill_comfy()
         time.sleep(1)
 
@@ -40942,6 +41608,14 @@ class Handler(BaseHTTPRequestHandler):
             return False
         q = parse_qs(parsed.query)
         bid = (q.get("id") or [""])[0].strip()
+        # Not a board id (an absolute path, `..`): refused before any branch
+        # can turn it into a directory - storyboard.board_dir() says why.
+        try:
+            if bid:
+                storyboard.board_dir(STATE_DIR, bid)
+        except storyboard.StoryboardError:
+            self._json({"ok": False, "error": "no such film"}, 404)
+            return True
 
         if path == "/storyboard/edit/status":
             self._json({"ok": True, "id": bid, "prepare": _sbe_job_state(bid)})
@@ -41246,6 +41920,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"ok": False,
                                 "error": "Write a couple of sentences about the "
                                          "film first."}, 400)
+                    return
+                # 4.20: the planner runs on Gemma 3, which a fresh install
+                # downloads in the background after the first boot.
+                if planner_model_missing():
+                    self._json(gemma3_refusal(
+                        "The Storyboard planner", "its language model, Gemma 3",
+                        storyboard_planner.DEFAULT_MODEL_PATH), 409)
                     return
                 # Constraint 1, enforced server-side: a stale tab must not be
                 # able to start a planner while the renderer holds the memory.
@@ -41864,6 +42545,11 @@ class Handler(BaseHTTPRequestHandler):
                                 "error": "The renderer is using the memory. "
                                          "Planning can start when the queue is "
                                          "empty."}, 409)
+                    return
+                if planner_model_missing():
+                    self._json(gemma3_refusal(
+                        "The Storyboard planner", "its language model, Gemma 3",
+                        storyboard_planner.DEFAULT_MODEL_PATH), 409)
                     return
                 err = _sb_claim_planner(bid)
                 if err:
@@ -44367,6 +45053,12 @@ if __name__ == "__main__":
     if _stats_fetch_enabled() and not STATS_READONLY:
         threading.Thread(target=stats_fetch_loop, daemon=True,
                          name="phos-stats-fetch").start()
+    # 4.20: the packs install.js left for after Start (state/install_deferred
+    # .json). No marker - every install that did not come through a 4.20
+    # install.js, i.e. every UPDATED install - means no thread at all.
+    if deferred_fetch_enabled():
+        threading.Thread(target=deferred_fetch_loop, daemon=True,
+                         name="phos-deferred-fetch").start()
     # Anonymous usage analytics — one app_boot event plus any optional-pack
     # transitions since the last boot, then nothing until a job finishes.
     # Deliberately here in __main__ and not at import time, so `import

@@ -308,6 +308,16 @@ def get_sidecar(h, parsed) -> None:
         if companion is None:
             h.send_error(404); return
         sidecar = companion
+    # The sidecar itself must stay under the roots too (ov-review A-02): the
+    # media path was resolved and confined above, but `<media>.json` was read
+    # as found - a symlink at that name would have served any file it points
+    # at (panel_settings.json and its saved keys included).
+    try:
+        _side_real = sidecar.resolve()
+    except OSError:
+        h.send_error(404); return
+    if not _side_real.is_file() or not any(_side_real.is_relative_to(r) for r in roots):
+        h.send_error(404); return
     # VC-19: the modal's "Format" line used to read straight from
     # params.width/height — the RENDER canvas, not the DELIVERED file.
     # Balanced's default 720p-fit export (or any upscale) changes the two,

@@ -282,9 +282,12 @@ def get_models(h, parsed) -> None:
     with P.DOWNLOAD_LOCK:
         payload["active_download"] = (
             {"key": P.DOWNLOAD["key"], "repo_id": P.DOWNLOAD["repo_id"],
-             "started_ts": P.DOWNLOAD["started_ts"], "last_line": P.DOWNLOAD["last_line"]}
+             "started_ts": P.DOWNLOAD["started_ts"], "last_line": P.DOWNLOAD["last_line"],
+             "background": bool(P.DOWNLOAD.get("background"))}
             if P.DOWNLOAD["active"] else None
         )
+    # 4.20: packs a fresh install queued for the background (empty otherwise).
+    payload["deferred_pending"] = P.deferred_pending_keys()
     h._json(payload)
 
 
@@ -550,9 +553,19 @@ def post_analytics_ui(h, path, qs, ctype) -> None:
                 analytics_update_pressed=P.update_pressed_marker())
     elif event == "broadcast_seen":
         P._analytics_capture("broadcast_seen", {"version": P.running_version()})
+    elif event == "install_step":
+        # The page may report exactly ONE funnel step: `first_use`, the first
+        # click or key press on the panel. Every other step is evaluated
+        # server-side where its answer lives, and a page must not be able to
+        # forge `first_queue` or a failed `engine_env`. The outcome is fixed
+        # here, never read from the form; once-per-install is enforced by
+        # _analytics_install_step itself.
+        if str(_f("step")).strip() != "first_use":
+            h._json({"ok": False, "error": "unknown step"}, 400); return
+        P._analytics_install_step("first_use", "ok")
     elif event == "feature_used":
         feature = str(_f("feature")).strip()
-        if feature not in ("editor_open", "editor_export", "enhance_prompt"):
+        if feature not in ("editor_open", "editor_export", "enhance_prompt", "share"):
             h._json({"ok": False, "error": "unknown feature"}, 400); return
         P._analytics_feature(feature, _f("detail"))
     else:

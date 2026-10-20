@@ -23,9 +23,16 @@ Do that, then choose Settings → **Hailuo H3 model** → Automatic or Compact. 
 
 ## A model or add-on is not downloaded {#missing}
 
+- *"Enhance needs its language model, Gemma 3 (8.1 GB)"* and the same for the adapters — on a new install these download in the background after the first **Start**. The message says whether it is downloading, queued or waiting for disk space; **Download now** fetches it right away.
 - *"Extend needs the LTX-2.5 High add-on (the Q8 model), which isn't downloaded on this Mac yet"* — the same for Keyframes and High quality. Install it from the Models window (click the health chip, then **Models**).
 - *"Upscale & Face Fix needs the LTX-2.5 Pixel Spatial Upscaler adapter"* — download it from the Models window, then render again.
 - *"Stopped before rendering — the model weights are incomplete"* — a download was interrupted. Open the Models window and resume it. Settings → **Verify model files** checks every file and offers a re-download of any that are damaged.
+
+## Update stops right away {#update-stops}
+
+On some Macs, Pinokio's **Update** in versions before 4.19.7 stopped in its first second: Pinokio's terminal read the words "error:" in Update's own command text as a failure (#114). Pinokio runs the Update script of the version you already have, so the fix can only take over after one update.
+
+Update once from inside Phosphene instead: click **Update now** in its update banner (or the version pill in the header), wait until it says the update is done, then restart. Or open a terminal in the Phosphene folder (`~/pinokio/api/<your Phosphene folder>`), run `git pull`, and press **Update** in Pinokio again - it then runs the new, fixed script. After that the button works.
 
 ## "Click Update" — an engine older than the panel {#stale-engine}
 

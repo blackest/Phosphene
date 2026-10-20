@@ -188,3 +188,6 @@ try { if (typeof applyAppearance === 'function') applyAppearance(); } catch (e) 
 // The player scales to leave the Outputs pane a header and a row of cards on
 // every screen (queue.js, fitStagePlayer).
 initStagePlayerFit();
+// install_step `first_use`: one report the first time anyone clicks or types
+// on the page (health.js).
+try { armFirstUseReport(); } catch (e) {}

@@ -62,7 +62,7 @@
 # =============================================================================
 
 ROOT="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
-cd "$ROOT" || { echo "FATAL: cannot enter app root $ROOT"; exit 1; }
+cd "$ROOT" || { echo "FATAL error: cannot open the Phosphene folder ($ROOT) - check its permissions, then run Update again."; exit 1; }
 
 require() {
   local what="$1"; shift
@@ -82,6 +82,22 @@ require() {
     exit 1
   fi
 }
+
+# defang <cmd...> - run an OPTIONAL step with its output made safe for Pinokio.
+# Pinokio 8.2 ignores a step's exit code and ENDS the script when the output
+# matches /error:/i or /errno /i (pinokiod kernel/shells.js default `on`
+# handlers). The scripts an install runs - and the tools under them (uv, hf, git,
+# urllib) - say "FATAL error:" / "error:" / "[Errno N]" when something fails, and
+# on an optional step that must not end the Update before the codec patch, the
+# import gate and the music check have run. defang rewrites "FATAL error:" to
+# "WARN:", any other "error:" to "problem -" and "Errno " to "errno-", and hands
+# back the command's OWN exit status (pipefail), so the caller's `|| echo WARN`
+# still fires. Required steps never go through it: `require` prints its own
+# "error:" banner on purpose.
+defang() (
+  set -o pipefail
+  "$@" 2>&1 | sed -u -e 's/FATAL [Ee]rror:/WARN:/g' -e 's/[Ee][Rr][Rr][Oo][Rr]:/problem -/g' -e 's/[Ee]rrno /errno-/g'
+)
 
 PY="$ROOT/ltx-2-mlx/env/bin/python3.11"
 VENV_PY="$ROOT/ltx-2-mlx/env/bin/python"
@@ -291,7 +307,7 @@ PHOSPHENE_SEPARATOR_VIA=update bash "$ROOT/scripts/pinokio/a2v_stems_deps.sh" "$
 # reclaim. A self-heal must not conjure the thing it heals.
 if [ -d "$ROOT/mlx_models/ltx-2.3-mlx-q4" ]; then
   echo 'Ensuring the Q4 spatial upscaler is present (mosaic fix)…'
-  "$HF" download dgrauet/ltx-2.3-mlx-q4 --local-dir "$ROOT/mlx_models/ltx-2.3-mlx-q4" --include 'spatial_upscaler_x2_v1_1.safetensors' \
+  defang "$HF" download dgrauet/ltx-2.3-mlx-q4 --local-dir "$ROOT/mlx_models/ltx-2.3-mlx-q4" --include 'spatial_upscaler_x2_v1_1.safetensors' \
     || echo 'WARN: spatial upscaler fetch failed — open the panel and click Repair to retry (fixes the mosaic).'
 else
   echo 'LTX-2.3 is not installed — skipping its spatial-upscaler self-heal (install it from Settings → Models if you want to train a character).'
@@ -304,7 +320,7 @@ fi
 # read-only HF token), hence the fetcher rather than `hf download`. It verifies
 # what it already has, so the steady state is a read pass.
 echo 'Ensuring the LTX-2.5 weights are present (default generation)…'
-"$PY" "$ROOT/scripts/fetch_pack_release.py" --repo-key q4_25 --repo-key gemma4_25 --repo-key tae \
+defang "$PY" "$ROOT/scripts/fetch_pack_release.py" --repo-key q4_25 --repo-key gemma4_25 --repo-key tae \
   || echo 'WARN: LTX-2.5 weight fetch failed — open the panel, go to Models, and click Download for the LTX 2.5 rows to retry. It resumes.'
 
 # The three IC-LoRAs the optional modes need. Colorize + Control are un-gated
@@ -312,15 +328,15 @@ echo 'Ensuring the LTX-2.5 weights are present (default generation)…'
 # BYTE-IDENTICAL gated file un-gated — and --include is CRITICAL there because
 # that repo is ~708 GB.
 echo 'Ensuring the Colorize IC-LoRA is present (restore mode, optional)…'
-"$HF" download DoctorDiffusion/LTX-2.3-IC-LoRA-Colorizer --local-dir "$ROOT/mlx_models/loras/ic" --include 'LTX-2.3-22b-IC-LoRA-Colorizer-0.9.safetensors' \
+defang "$HF" download DoctorDiffusion/LTX-2.3-IC-LoRA-Colorizer --local-dir "$ROOT/mlx_models/loras/ic" --include 'LTX-2.3-22b-IC-LoRA-Colorizer-0.9.safetensors' \
   || echo 'WARN: Colorize IC-LoRA fetch failed — the Colorize mode will fetch it on first use, or click Repair.'
 
 echo 'Ensuring the Ingredients IC-LoRA is present (multi-reference mode, optional)…'
-"$HF" download DeepBeepMeep/LTX-2 --local-dir "$ROOT/mlx_models/loras/ic" --include 'ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors' \
+defang "$HF" download DeepBeepMeep/LTX-2 --local-dir "$ROOT/mlx_models/loras/ic" --include 'ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors' \
   || echo 'WARN: Ingredients IC-LoRA fetch failed — the Ingredients mode will fetch it on first use, or click Repair.'
 
 echo 'Ensuring the Control IC-LoRA is present (Union, control mode, optional)…'
-"$HF" download Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control --local-dir "$ROOT/mlx_models/loras/ic" --include 'ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors' \
+defang "$HF" download Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control --local-dir "$ROOT/mlx_models/loras/ic" --include 'ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors' \
   || echo 'WARN: Control IC-LoRA fetch failed — the Control mode will fetch it on first use, or click Repair.'
 
 # ---- 8b. H3 compact (Q8) engine — the memory-halving default (optional) ----
@@ -356,7 +372,7 @@ if { [ -f "$H3_MODELS_ROOT/models/$H3_DIT_REL" ] || [ -f "$H3_MODELS_ROOT/$H3_DI
   # sat on the old branch and this step built against that forever. Move the
   # checkout to the pin first (the same move the H3 installer makes).
   echo 'Ensuring the H3 engine checkout is on the pinned branch…'
-  bash "$ROOT/scripts/pinokio/h3_checkout.sh" "$H3_CHECKOUT" \
+  defang bash "$ROOT/scripts/pinokio/h3_checkout.sh" "$H3_CHECKOUT" \
     || echo 'WARN: could not move the H3 checkout to its pinned branch — the Q8 build below may not run; re-run the H3 engine Install to retry.'
   # 4.19.5: THE H3 VENV'S KNOWN-GOOD SET. Through 4.19.4 the H3 venv was the
   # one engine venv with no lock (requirements.txt floors only), so whatever
@@ -375,13 +391,11 @@ if { [ -f "$H3_MODELS_ROOT/models/$H3_DIT_REL" ] || [ -f "$H3_MODELS_ROOT/$H3_DI
   # pipefail so the WARN still fires on h3_deps.sh's own exit code.
   if "$H3_CHECKOUT/.venv/bin/python" -c 'import sys' >/dev/null 2>&1; then
     echo 'Ensuring the H3 venv is on its known-good set (repairs a drifted one)…'
-    ( set -o pipefail
-      bash "$ROOT/scripts/pinokio/h3_deps.sh" "$H3_CHECKOUT" 2>&1 \
-        | sed -u -e 's/[Ee][Rr][Rr][Oo][Rr]:/problem -/g' -e 's/[Ee]rrno /errno-/g' ) \
+    defang bash "$ROOT/scripts/pinokio/h3_deps.sh" "$H3_CHECKOUT" \
       || echo 'WARN: the H3 venv could not be put on its known-good set — press Repair Hailuo H3 in the panel, or run "Update Hailuo H3 runner" from the sidebar.'
   fi
   echo 'Ensuring the H3 compact (Q8) engine is built (halves H3 render memory)…'
-  ( cd "$H3_CHECKOUT" && bash "$ROOT/scripts/pinokio/h3_build_q8.sh" "$ROOT" ) \
+  ( cd "$H3_CHECKOUT" && defang bash "$ROOT/scripts/pinokio/h3_build_q8.sh" "$ROOT" ) \
     || echo 'WARN: H3 Q8 build failed — H3 keeps the full bf16 engine for now; re-run the H3 engine Install to retry.'
 fi
 
@@ -478,10 +492,12 @@ MUSIC_CHECKOUT="${LTX_MUSIC_ROOT:-$ROOT/yue2-mlx}"
 MUSIC_MODELS_ROOT="${LTX_MUSIC_MODELS:-$ROOT/mlx_models/yue2}"
 if [ -d "$MUSIC_CHECKOUT/.git" ] && [ -f "$MUSIC_CHECKOUT/.venv/pyvenv.cfg" ]; then
   echo 'Checking the pinned YuE2 engine and installed music pack…'
-  if bash "$ROOT/scripts/pinokio/music_checkout.sh" "$MUSIC_CHECKOUT" \
-     && bash "$ROOT/scripts/pinokio/music_venv.sh" "$MUSIC_CHECKOUT" \
-     && bash "$ROOT/scripts/pinokio/music_sync.sh" "$MUSIC_CHECKOUT" \
-     && "$MUSIC_CHECKOUT/.venv/bin/python" "$ROOT/scripts/pinokio/music_fetch.py" --models "$MUSIC_MODELS_ROOT" --check; then
+  # Optional on Update (the WARN below), so every script goes through `defang`:
+  # music_checkout / music_venv / music_sync print "FATAL error:" for Install.
+  if defang bash "$ROOT/scripts/pinokio/music_checkout.sh" "$MUSIC_CHECKOUT" \
+     && defang bash "$ROOT/scripts/pinokio/music_venv.sh" "$MUSIC_CHECKOUT" \
+     && defang bash "$ROOT/scripts/pinokio/music_sync.sh" "$MUSIC_CHECKOUT" \
+     && defang "$MUSIC_CHECKOUT/.venv/bin/python" "$ROOT/scripts/pinokio/music_fetch.py" --models "$MUSIC_MODELS_ROOT" --check; then
     echo 'YuE2 engine and weights verified.'
   else
     echo 'WARN: YuE2 needs repair. Run Repair the music engine from the sidebar; intact weights are kept.'

@@ -19,6 +19,25 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import mlx_ltx_panel as panel                                        # noqa: E402
+
+
+# 4.20: Enhance, the Storyboard planner, one-shot beats and auto-caption answer
+# 409 "needs its language model" while Gemma 3 is not on disk (a fresh install
+# fetches it after Start - test_install_deferred.py covers that). These tests
+# exercise what happens AFTER that check, so they hold it open whatever this
+# checkout's mlx_models holds, and put it back for the next module.
+_GEMMA3_GATES = None
+
+
+def setUpModule():
+    global _GEMMA3_GATES
+    _GEMMA3_GATES = (panel.enhance_model_missing, panel.planner_model_missing)
+    panel.enhance_model_missing = lambda: False
+    panel.planner_model_missing = lambda: False
+
+
+def tearDownModule():
+    panel.enhance_model_missing, panel.planner_model_missing = _GEMMA3_GATES
 import storyboard_edit as sedt                                       # noqa: E402
 
 

@@ -49,6 +49,38 @@ function updateModelsCard(s) {
     return;
   }
 
+  // ----- 4.20: the post-install background downloads ----------------------
+  // A fresh install starts with the renderer only; Gemma 3 and the IC-LoRAs
+  // follow in the background. That is not a problem to fix, so the card says
+  // so calmly: you can render now, this is what is arriving and what it
+  // unlocks. Cancel skips that one pack (Settings -> Models still offers it).
+  const bgq = s.deferred_downloads || {};
+  if (dl && dl.background) {
+    card.style.display = '';
+    card.classList.add('state-downloading');
+    icon.textContent = '↓';
+    const rest = Math.max(0, (bgq.pending || []).length - 1);
+    title.textContent = `Finishing setup in the background — you can render now`;
+    sub.textContent = `Downloading ${dl.name || dl.key}${dl.size_gb ? ` (~${dl.size_gb} GB)` : ''}`
+      + (rest ? ` · ${rest} more after this (${bgq.left_gb} GB left in all)` : '')
+      + ' · resumes if interrupted';
+    progress.style.display = '';
+    const m = (dl.last_line || '').match(/\b(\d{1,3})%/);
+    fill.style.width = m ? `${Math.min(100, parseInt(m[1]))}%` : '15%';
+    last.textContent = dl.last_line || 'starting…';
+    actions.innerHTML = `<button class="ghost" onclick="cancelDownload()">Skip this one</button>`;
+    return;
+  }
+  if (!dl && bgq.state === 'waiting_disk' && bgq.message && baseOk) {
+    card.style.display = '';
+    card.classList.add('state-warn');
+    icon.innerHTML = '<svg class="ph" aria-hidden="true"><use href="#ph-download-simple"/></svg>';
+    title.textContent = 'Background downloads paused — the disk is nearly full';
+    sub.textContent = bgq.message;
+    actions.innerHTML = `<button class="ghost" onclick="openModelsModal()">Models</button>`;
+    return;
+  }
+
   // ----- Active download takes precedence over everything ------------------
   if (dl) {
     card.style.display = '';

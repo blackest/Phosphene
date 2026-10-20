@@ -1219,6 +1219,9 @@ async function enhancePrompt() {
     return;
   }
   btn.disabled = false; btn.innerHTML = originalLabel;
+  // 4.20: Enhance's model (Gemma 3) may still be downloading after a fresh
+  // install - say so and offer the download, not a red "failed".
+  if ((typeof packNeededToast === 'function' && packNeededToast(res))) return;
   if (res.error) {
     // VC-16: a GPU-busy refusal (409) names what's rendering instead of a
     // flat "a render is using the GPU" — show it inline, not a blocking
@@ -3558,9 +3561,12 @@ async function poll() {
   const dl = s.download && s.download.active ? s.download : null;
   if (dl) {
     const elapsed = Math.max(0, Math.round(s.server_now - (dl.started_ts || s.server_now)));
-    mp.innerHTML = `<span class="dot"></span>↓ ${dl.key} · ${elapsed}s`;
+    mp.innerHTML = dl.background
+      ? `<span class="dot"></span>↓ extras · ${escapeHtml(String(dl.key))}`
+      : `<span class="dot"></span>↓ ${dl.key} · ${elapsed}s`;
     mp.className = 'pill pill-running';
-    mp.title = `Downloading ${dl.repo_id} — ${dl.last_line || 'starting…'}`;
+    mp.title = (dl.background ? `Background download after install (you can render meanwhile): ${dl.name || dl.repo_id}`
+                              : `Downloading ${dl.repo_id}`) + ` — ${dl.last_line || 'starting…'}`;
   } else {
     // Per-repo ready/total counts, scoped server-side (VC-32) to repos that
     // are actually relevant to THIS generation — never another generation's
@@ -4236,6 +4242,11 @@ async function poll() {
     currentOutputs = s.outputs;
     if (typeof updateModelCredit === 'function') { try { updateModelCredit(); } catch (e) {} }
     renderCarousel();
+    // W6: a clip's silence is learned in the background, so the selected
+    // clip's "No sound · Add sound" can arrive a poll after it was opened.
+    if (activePath && typeof findOutputByPath === 'function') {
+      try { syncPlayerSoundOffer(findOutputByPath(activePath)); } catch (e) {}
+    }
     // Pick the first FILTERED entry as the default selection so the
     // viewer agrees with what the gallery is showing — without this,
     // landing on Photos with no active selection would auto-pick a
@@ -4960,7 +4971,7 @@ function renderCarousel() {
   const _visibleSlice = visible.slice(0, _renderLimit);
   const _hiddenCount = visible.length - _visibleSlice.length;
   el.innerHTML = _visibleSlice.map(o => {
-    const pathAttr = JSON.stringify(o.path).replace(/"/g, '&quot;');
+    const pathAttr = escapeHtml(JSON.stringify(o.path));
     const isPhoto = outputKind(o) === 'image';
     const isAudio = outputKind(o) === 'audio';
     // Thumbnail markup branches on kind. Photos use <img> directly with
@@ -4989,7 +5000,7 @@ function renderCarousel() {
     //   - Hide was useless (clutter, never used in practice).
     //   - Extend wasn't practical on Mac.
     // Folder-reveal moved to a global button in the carousel header.
-    const animateArgs = JSON.stringify({path: o.path, prompt: ''}).replace(/"/g, '&quot;');
+    const animateArgs = escapeHtml(JSON.stringify({path: o.path, prompt: ''}));
     const animateChip = isPhoto
       ? `<button class="card-action card-action-photo" type="button"
                  title="Pre-fill i2v with this image (does not auto-submit)"
@@ -5001,7 +5012,7 @@ function renderCarousel() {
     // hidream_quality_inline, sets n=1, and auto-submits. Useful flow:
     // generate 4 candidates in Fast/Medium, pick the best, hit ✦ to bake the
     // same composition at Quality fidelity.
-    const remakeArgs = JSON.stringify({path: o.path}).replace(/"/g, '&quot;');
+    const remakeArgs = escapeHtml(JSON.stringify({path: o.path}));
     const remakeChip = (isPhoto && o.has_sidecar)
       ? `<button class="card-action card-action-photo" type="button"
                  title="Re-run this prompt + seed + refs at Quality (auto-submits)"
@@ -5021,6 +5032,11 @@ function renderCarousel() {
          onkeydown="if(event.target===event.currentTarget&&(event.key==='Enter'||event.key===' ')){event.preventDefault();selectOutput(${pathAttr});}">
       <div class="car-thumb-wrap">
         ${thumbHtml}
+        ${addSoundOffer(o) === 'run'
+          ? `<button class="car-add-sound" type="button"
+                     title="This clip has no sound. Hailuo H3 can make sound for it — the picture stays exactly as it is."
+                     onclick="event.stopPropagation(); addSoundFromCard(${pathAttr})"><svg class="ph" aria-hidden="true"><use href="#ph-speaker-slash"/></svg>No sound · Add sound</button>`
+          : ''}
         ${o.has_sidecar
           ? `<button class="car-info-btn" type="button" title="Show generation info"
                      onclick="event.stopPropagation(); openOutputInfoModal(${pathAttr})"><svg class="ph" aria-hidden="true"><use href="#ph-info"/></svg></button>`
@@ -5355,7 +5371,7 @@ function selectOutput(path, options) {
     const _sf = wrap.closest('.player-surface');
     if (_sf) _sf.setAttribute('data-song', '');
   } else if (isAudio) {
-    const pathAttr = JSON.stringify(path).replace(/"/g, '&quot;');
+    const pathAttr = escapeHtml(JSON.stringify(path));
     const openLink = (o && o.engine === 'music')
       ? `<button type="button" class="ghost-btn player-audio-open" onclick="openSongInAudioTab(${pathAttr})">Open in Audio tab</button>`
       : '';
@@ -5519,6 +5535,7 @@ function selectOutput(path, options) {
   const addSoundBtn = document.getElementById('addSoundBtn');
   if (addSoundBtn) addSoundBtn.style.display = (!isPhoto && !isAudio
     && typeof h3CanServe === 'function' && h3CanServe('v2a')) ? '' : 'none';
+  syncPlayerSoundOffer(o);
   const continueSongBtn = document.getElementById('continueSongBtn');
   if (continueSongBtn) continueSongBtn.style.display = (outIsA2v && !isPhoto && !isAudio) ? '' : 'none';
   // VA-26: Retake is video-only, engine-agnostic (any finished clip, H3
@@ -5668,7 +5685,7 @@ function openAudioUseMenu(ev, path) {
   const menu = document.getElementById('audioUseMenu');
   if (!menu || !path) return;
   const o = findOutputByPath(path);
-  const attr = JSON.stringify(path).replace(/"/g, '&quot;');
+  const attr = escapeHtml(JSON.stringify(path));
   const items = audioUseTargets(o, window._ENGINE_PROBES || {});
   menu.innerHTML = '<div class="song-menu-head">Use this audio for…</div>' + items.map(t =>
     `<button type="button" role="menuitem" class="song-menu-item" data-target="${t.id}"`
@@ -5973,6 +5990,7 @@ function openExpandLightbox() {
       <button type="button" class="ghost-btn" onclick="useLastFrameActive()">Use last frame</button>
       <button type="button" class="ghost-btn" onclick="openActiveInEditor()">Open in Editor</button>
       <button type="button" class="ghost-btn" onclick="revealActive()">Reveal in Finder</button>
+      <button type="button" class="ghost-btn" onclick="shareActive()">Share</button>
     ` : '';
   }
   lb.style.display = 'flex';
@@ -6269,6 +6287,57 @@ function useAsAddSoundSource(path) {
   updateDerived();
   document.querySelector('aside.form-pane').scrollTop = 0;
   phosToast('Clip loaded into Add sound — describe the sound you want, then Generate.', { kind: 'success' });
+}
+
+// W6 (2026-10-19): Add sound was nearly undiscovered (3 renders in 14 days
+// against 115 Lip-sync), so every SILENT clip offers it where the user is
+// already looking — on its gallery card and in the player. Silence is decided
+// server-side (list_outputs `silent`: no sound track, or a track of digital
+// silence; null while not known yet). What a clip is offered:
+//   'run'    — H3 can make sound for it now;
+//   'update' — H3 is installed but its runner predates Add sound;
+//   'needs'  — this Mac can run H3 but it is not installed;
+//   ''       — nothing (it has sound, not known yet, or H3 can't run here).
+function addSoundOffer(o) {
+  if (!o || o.silent !== true || outputKind(o) !== 'video') return '';
+  if (typeof h3CanServe === 'function' && h3CanServe('v2a')) return 'run';
+  const h3 = (window._ENGINE_PROBES && window._ENGINE_PROBES.h3) || {};
+  if (h3.available) return 'update';
+  return h3.capable ? 'needs' : '';
+}
+// The player's half: one line in the meta strip ("No sound · Add sound", a
+// button when H3 can run it, a plain sentence when it needs installing or
+// updating) and the Add sound action highlighted. Its own element, so a later
+// /status poll that learns the clip is silent can update it without reloading
+// the video (the level check runs server-side in the background).
+function syncPlayerSoundOffer(o) {
+  const meta = document.getElementById('playerOverlayMeta');
+  const btn = document.getElementById('addSoundBtn');
+  const offer = addSoundOffer(o);
+  if (btn) btn.classList.toggle('po-act-suggest', offer === 'run');
+  if (!meta) return;
+  let el = document.getElementById('poSoundOffer');
+  if (!offer) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement('span');
+    el.id = 'poSoundOffer';
+    el.className = 'po-sound-offer';
+    meta.appendChild(el);
+  }
+  if (el.dataset.offer === offer) return;
+  el.dataset.offer = offer;
+  el.innerHTML = '<span class="po-dot"></span>' + (offer === 'run'
+    ? '<button type="button" class="po-silent po-silent-add" onclick="useAsAddSoundSource()"'
+      + ' title="Hailuo H3 makes sound for this clip — the picture stays exactly as it is.">'
+      + '<svg class="ph" aria-hidden="true"><use href="#ph-speaker-slash"/></svg>No sound · Add sound</button>'
+    : '<span class="po-silent">No sound · Add sound needs '
+      + (offer === 'update' ? 'a Hailuo H3 update' : 'Hailuo H3') + '</span>');
+}
+// The card's "Add sound": show the clip in the player AND land in Add sound
+// with it picked — the same door the player's own Add sound button opens.
+function addSoundFromCard(path) {
+  if (typeof selectOutput === 'function') selectOutput(path);
+  useAsAddSoundSource(path);
 }
 
 // VA-38: hands a published Windows-partial to Extend as its source. Not a
@@ -6569,6 +6638,54 @@ async function revealClipInFinder(path) {
 function revealActive() {
   if (!activePath) return phosToast('Pick a clip in Outputs first.', {});
   return revealClipInFinder(activePath);
+}
+
+// ---- Share (growth pass, 2026-10-19) ----------------------------------------
+// Nothing in the panel helped a clip leave the Mac with its origin attached:
+// the top 5% of installs make 58% of all renders and every one of them went
+// out unattributed. Share does the two things a post needs and nothing else:
+// a one-line caption with the link on the clipboard, and the file selected in
+// Finder, ready to drag into X / Reddit / Discord. No upload, no watermark,
+// no account; the fleet only learns that the button was used.
+const SHARE_CAPTION = 'Made on my Mac with Phosphene, free open-source AI video that runs locally: https://github.com/mrbizarro/phosphene';
+
+function _copyText(text) {
+  const legacy = () => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e) { return false; }
+  };
+  if (!navigator.clipboard || !navigator.clipboard.writeText) return Promise.resolve(legacy());
+  return navigator.clipboard.writeText(text).then(() => true).catch(() => legacy());
+}
+
+async function shareClip(path) {
+  if (!path) { phosToast('Pick a clip first.', {}); return; }
+  const copied = await _copyText(SHARE_CAPTION);
+  const fd = new URLSearchParams();
+  fd.set('path', path);
+  let r;
+  try { r = await (await fetch('/output/reveal', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false }; }
+  const shown = !!(r && r.ok);
+  try { _uiEvent('feature_used', {feature: 'share'}); } catch (_) {}
+  const msg = copied && shown ? 'Caption copied, and the clip is selected in Finder. Drag it into your post and paste.'
+            : copied ? 'Caption copied. Use Reveal in Finder to grab the file.'
+            : shown ? 'The clip is selected in Finder. Caption: ' + SHARE_CAPTION
+            : 'Could not copy or open Finder. Caption: ' + SHARE_CAPTION;
+  phosToast(msg, { kind: copied || shown ? 'success' : 'danger', duration: 8000 });
+}
+function shareActive() {
+  if (!activePath) return phosToast('Pick a clip in Outputs first.', {});
+  return shareClip(activePath);
 }
 
 async function openClipInEditor(path) {
@@ -7106,6 +7223,32 @@ async function loadParams(recipe) {
     _flashActionDone('loadParamsBtn', 'Loaded');
     return;
   }
+  // ov-review E-02: the Remix tools used to fall through to the final
+  // setMode('t2v') - Load Params of a Control or Colorize clip dropped its
+  // source video and the next Generate rendered plain text-to-video. They
+  // reopen in their own tool, with their own inputs.
+  else if (p.mode === 'control' || p.mode === 'restore') {
+    setMode(p.mode);
+    const srcId = p.mode === 'control' ? 'control_video_path' : 'restore_video_path';
+    const srcEl = document.getElementById(srcId);
+    if (srcEl) srcEl.value = p[srcId] || '';
+  }
+  else if (p.mode === 'ingredients') {
+    setMode('ingredients');
+    let imgs = [];
+    try { imgs = JSON.parse(p.ingredient_images_json || '[]'); } catch (e) { imgs = []; }
+    _ingredientPaths = (Array.isArray(imgs) ? imgs : [])
+      .filter(x => typeof x === 'string' && x).slice(0, 8);
+    try { _ingredientSync(); } catch (e) {}
+    const _set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+    _set('ingredient_action', p.ingredient_action || '');
+    if (typeof populateIngredientCharLoras === 'function') {
+      try { populateIngredientCharLoras(); } catch (e) {}
+    }
+    _set('ingredient_char_lora', p.ingredient_char_lora || '');
+    _set('ingredient_char_strength', p.ingredient_char_strength || '1.3');
+    _set('ingredient_char_trigger', p.ingredient_char_trigger || '');
+  }
   else if (p.mode === 'extend') setMode('extend');
   else if (p.mode === 'v2a') setMode('v2a');
   else if (p.mode === 'keyframe') setMode('keyframe');
@@ -7440,6 +7583,18 @@ async function loadParams(recipe) {
     }
     const _seedEl = document.getElementById('seed');
     if (_seedEl && _seedBefore != null) _seedEl.value = _seedBefore;
+  } else {
+    // ov-review E-03: setEngine()'s LTX branch hands the quality preset its
+    // default export back (H3 forces it off), which overwrote the export
+    // size and method this clip was made with - restored above, before the
+    // engine. A Load Params (or a queue Edit) of an Export x2 clip came back
+    // as Fit 720p. The recipe wins.
+    if (p.upscale && typeof setUpscale === 'function') {
+      try { setUpscale(p.upscale); } catch (e) {}
+    }
+    if (p.upscale_method && typeof setUpscaleMethod === 'function') {
+      try { setUpscaleMethod(p.upscale_method); } catch (e) {}
+    }
   }
 
   // STG round-trips (journey audit, High): the slider only means anything on
@@ -7606,10 +7761,10 @@ function renderOutputInfoBody(path, data) {
   };
 
   const promptText = p.prompt || '';
-  const promptAttr = JSON.stringify(promptText).replace(/"/g, '&quot;');
+  const promptAttr = escapeHtml(JSON.stringify(promptText));
   const seedVal = String(p.seed_used != null ? p.seed_used : p.seed || '');
-  const seedAttr = JSON.stringify(seedVal).replace(/"/g, '&quot;');
-  const pathAttr = JSON.stringify(path).replace(/"/g, '&quot;');
+  const seedAttr = escapeHtml(JSON.stringify(seedVal));
+  const pathAttr = escapeHtml(JSON.stringify(path));
   const accelMetrics = (data && data.accel_metrics) || null;
   const keyframeModeLabel = (() => {
     if (!p.keyframes_json) return 'FFLF (first + last frame)';
@@ -8831,10 +8986,10 @@ Object.assign(globalThis, {
   lbToggleFullscreen,
   audioUseTargets, audioUseApply, useAudioAsSoundtrack, openAudioUseMenu, closeAudioUseMenu,
   animateActive, hide, unhide, openOutputsFolder, hideActive,
-  useAsExtendSource, useAsAddSoundSource, useAsUpscaleSource, useAsUpscaleSourcePath, setUpscalePreset,
+  useAsExtendSource, useAsAddSoundSource, addSoundOffer, addSoundFromCard, syncPlayerSoundOffer, useAsUpscaleSource, useAsUpscaleSourcePath, setUpscalePreset,
   faceFixClip, faceFixActive, isUpscaledPath, loadParams, _flashActionDone, closeOutputInfoModal,
   queueSharpExport, sharpExportActive, useLastFramePath, useLastFrameActive,
-  revealClipInFinder, revealActive, openClipInEditor, openActiveInEditor, kebabToggle,
+  revealClipInFinder, revealActive, shareClip, shareActive, openClipInEditor, openActiveInEditor, kebabToggle,
   reorderQueuedJob, editQueuedJob, cancelEditingQueuedJob, updateQueuedJob, fmtEtaCompact,
   showEnhancePanel, acceptEnhance, undoEnhance, keepMineEnhance,
   updateLangHint, promptLooksNonLatin,

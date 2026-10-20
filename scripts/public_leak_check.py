@@ -39,6 +39,12 @@ reviewed and shipped safely. See the private pattern list's own comments
 for specifics; if a future release wants one of those gated too, add a
 per-hit allowlist rather than a blanket ban.
 
+3. PATH-PATTERN check (2026-10-20) — a pattern-list row whose flag is `p`
+   is a regex matched against every PATH in the tree rather than against
+   content. It is how a private-only file is caught by its name even when
+   its content carries no other marker. The rows themselves
+   live in the same private list, so the public tree never names them.
+
 Usage:
     python3 scripts/public_leak_check.py <tree-ish>
 
@@ -96,8 +102,10 @@ def load_exclude_list() -> list[str]:
     return paths
 
 
-def load_patterns() -> list[tuple[str, str, bool]]:
-    """Load (label, regex, case_insensitive) from the private pattern list.
+def load_patterns() -> list[tuple[str, str, str]]:
+    """Load (label, regex, flag) from the private pattern list. flag is
+    "0" (case-sensitive content), "1" (case-insensitive content) or "p" (a
+    path regex, checked against `git ls-tree` names).
 
     Fails closed: a missing pattern file is a setup error, never a silent
     "nothing to check." This is what makes it safe for this script to ship
@@ -111,7 +119,7 @@ def load_patterns() -> list[tuple[str, str, bool]]:
             "run from the private tree\n"
         )
         raise SystemExit(2)
-    patterns: list[tuple[str, str, bool]] = []
+    patterns: list[tuple[str, str, str]] = []
     for lineno, line in enumerate(PATTERN_FILE.read_text().splitlines(), 1):
         line = line.rstrip("\n")
         if not line.strip() or line.lstrip().startswith("#"):
@@ -123,8 +131,13 @@ def load_patterns() -> list[tuple[str, str, bool]]:
                 "'<0|1>\\t<label>\\t<regex>'\n"
             )
             raise SystemExit(2)
-        ci_flag, label, pattern = parts
-        patterns.append((label, pattern, ci_flag == "1"))
+        flag, label, pattern = parts
+        if flag not in ("0", "1", "p"):
+            sys.stderr.write(
+                f"FAIL setup: {PATTERN_FILE}:{lineno} flag must be 0, 1 or p\n"
+            )
+            raise SystemExit(2)
+        patterns.append((label, pattern, flag))
     if not patterns:
         sys.stderr.write(f"FAIL setup: {PATTERN_FILE} has no active entries\n")
         raise SystemExit(2)
@@ -144,7 +157,20 @@ def check_pattern_file_absent(tree_ish: str) -> bool:
     return PATTERN_FILE_PATH in set(listing.splitlines())
 
 
-def check_banned_content(tree_ish: str, patterns: list[tuple[str, str, bool]]) -> list[str]:
+def check_banned_paths(tree_ish: str, patterns: list[tuple[str, str, str]]) -> list[str]:
+    """`p` rows: a regex over every path in the tree (re.search)."""
+    listing = _git("ls-tree", "-r", "--name-only", tree_ish).splitlines()
+    hits: list[str] = []
+    for label, pattern, flag in patterns:
+        if flag != "p":
+            continue
+        rx = re.compile(pattern)
+        hits += [f"[{label}] {path}" for path in listing
+                 if path != PATTERN_FILE_PATH and rx.search(path)]
+    return hits
+
+
+def check_banned_content(tree_ish: str, patterns: list[tuple[str, str, str]]) -> list[str]:
     hits: list[str] = []
     # The pattern list necessarily spells out every string it detects, so
     # scanning it against itself is a guaranteed, meaningless self-match —
@@ -154,9 +180,11 @@ def check_banned_content(tree_ish: str, patterns: list[tuple[str, str, bool]]) -
     # This does NOT weaken the security property: PATTERN_FILE_PATH's
     # presence is separately hard-checked by check_pattern_file_absent().
     args_pathspec = ["--", ".", f":!{PATTERN_FILE_PATH}"]
-    for label, pattern, ci in patterns:
+    for label, pattern, flag in patterns:
+        if flag == "p":
+            continue
         args = ["grep", "-nI"]
-        if ci:
+        if flag == "1":
             args.append("-i")
         args += ["-P", "-e", pattern, tree_ish] + args_pathspec
         out = _git(*args)
@@ -189,6 +217,7 @@ def main(argv: list[str]) -> int:
     leaked_paths = check_excluded_paths(tree_ish, excluded)
     pattern_file_leaked = check_pattern_file_absent(tree_ish)
     content_hits = check_banned_content(tree_ish, patterns)
+    path_hits = check_banned_paths(tree_ish, patterns)
 
     ok = True
     if leaked_paths:
@@ -203,6 +232,12 @@ def main(argv: list[str]) -> int:
         ok = False
         print(f"FAIL banned pattern present in {tree_ish}:")
         for h in content_hits:
+            print(f"  {h}")
+
+    if path_hits:
+        ok = False
+        print(f"FAIL banned path pattern present in {tree_ish}:")
+        for h in path_hits:
             print(f"  {h}")
 
     if ok:

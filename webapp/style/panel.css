@@ -11701,6 +11701,51 @@ body[data-workflow="oneshot"] #audioSectionTab { display: none !important; }
 .po-ls-ok { color: #3fb950; }
 .po-ls-mid { color: #d29922; }
 .po-ls-bad { color: #f85149; }
+/* W6 (2026-10-19): a SILENT clip offers Add sound where the user already looks —
+   a small always-visible pill on its gallery card (only silent clips carry it,
+   so it marks them instead of cluttering every card) and one line in the
+   player's meta strip, with the Add sound action highlighted. queue.js:
+   addSoundOffer / syncPlayerSoundOffer. */
+.car-card .car-add-sound {
+  position: absolute; left: 6px; bottom: 6px; z-index: 4;
+  /* The panel's base `button` rule is full width; a pill is its label. */
+  width: auto; max-width: calc(100% - 12px); overflow: hidden; text-overflow: ellipsis;
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px 2px 6px;
+  border: 1px solid rgba(255,255,255,0.18);
+  border-radius: 999px;
+  background: rgba(0, 4, 18, 0.72);
+  color: rgba(255,255,255,0.9);
+  font-size: 11px; font-weight: 500; line-height: 16px;
+  white-space: nowrap; cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+.car-card .car-add-sound .ph { width: 12px; height: 12px; }
+.car-card .car-add-sound:hover,
+.car-card .car-add-sound:focus-visible {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.po-sound-offer { display: inline-flex; align-items: center; gap: 6px; }
+.po-silent { white-space: nowrap; color: rgba(255,255,255,0.78); }
+.po-silent-add {
+  pointer-events: auto; width: auto;
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 7px 1px 5px;
+  border: 1px solid rgba(88,166,255,0.45);
+  border-radius: 999px;
+  background: rgba(47,129,247,0.16);
+  color: #fff;
+  font: inherit; cursor: pointer;
+}
+.po-silent-add .ph { width: 12px; height: 12px; }
+.po-silent-add:hover, .po-silent-add:focus-visible { background: var(--accent); border-color: var(--accent); }
+.po-act.po-act-suggest {
+  border-color: rgba(88,166,255,0.55);
+  background: rgba(47,129,247,0.16);
+  color: #fff;
+}
 .os-log { margin: 0; white-space: pre-wrap; font-family: var(--ph-font-mono); font-size: 11px; line-height: 1.4; color: var(--muted); max-height: 9em; overflow: auto; }
 
     /* ======================================================================

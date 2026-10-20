@@ -18,7 +18,8 @@
 #
 # Usage: bash scripts/pinokio/h3_deps.sh <h3-checkout-dir>
 # Exit 0 = the venv holds the set and the runner's imports load. Non-zero =
-# a line starting "error:" says why (Pinokio stops a run on "error:").
+# a "FATAL error:" line says why (Pinokio 8.2 ignores the exit code and stops a
+# run only when the output matches /error:/i or /errno /i).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 HC="$HERE/h3_constraints.txt"
@@ -30,14 +31,14 @@ if [ "$(uname -s)" != Darwin ]; then
   echo 'H3 known-good set is for macOS - skipped here (scripts/linux/install_h3.sh owns this venv).'
   exit 0
 fi
-[ -f "$HC" ] || { echo "error: $HC is missing - the app update did not land. Re-run Update."; exit 1; }
+[ -f "$HC" ] || { echo "FATAL error: $HC is missing - the app update did not land. Re-run Update."; exit 1; }
 if [ -z "$H3_DIR" ] || [ ! -f "$H3_DIR/requirements.txt" ]; then
-  echo "error: no H3 engine checkout at '${H3_DIR:-<none>}' - run Install Hailuo H3."
+  echo "FATAL error: no H3 engine checkout at '${H3_DIR:-<none>}' - run Install Hailuo H3."
   exit 1
 fi
-cd "$H3_DIR" || exit 1
+cd "$H3_DIR" || { echo "FATAL error: cannot open the Hailuo H3 engine folder ($H3_DIR) - run Install Hailuo H3."; exit 1; }
 if ! .venv/bin/python -c 'import sys' >/dev/null 2>&1; then
-  echo 'error: the H3 venv has no working Python - run Repair Hailuo H3 from the Pinokio sidebar (weights kept).'
+  echo 'FATAL error: the H3 venv has no working Python - run Repair Hailuo H3 from the Pinokio sidebar (weights kept).'
   exit 1
 fi
 # ONE INSTALL AT A TIME (Codex 4.19.5): Pinokio's Install / Update and the
@@ -48,7 +49,7 @@ LOCK=.venv/.phosphene_h3_deps.d
 if ! mkdir "$LOCK" 2>/dev/null; then
   other="$(head -1 "$LOCK/pid" 2>/dev/null)"
   if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
-    echo "error: another install into the H3 venv is running (pid $other) - let it finish, then try again."
+    echo "FATAL error: another install into the H3 venv is running (pid $other) - let it finish, then try again."
     exit 1
   fi
   echo 'An earlier H3 package install was interrupted - taking over.'
@@ -56,10 +57,10 @@ fi
 echo "$$" > "$LOCK/pid"
 trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null' EXIT
 if ! uv pip install --python .venv/bin/python -c "$HC" -r requirements.txt; then
-  echo 'error: the H3 packages did not install - the lines above say why (network, disk).'
+  echo 'FATAL error: the H3 packages did not install - the lines above say why (network, disk).'
   exit 1
 fi
 .venv/bin/python "$HERE/h3_env_check.py" "$HC" || {
-  echo 'error: the H3 venv is still not on its known-good set after the install.'
+  echo 'FATAL error: the H3 venv is still not on its known-good set after the install.'
   exit 1
 }

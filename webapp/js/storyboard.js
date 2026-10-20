@@ -585,7 +585,7 @@ function sbRenderCast() {
       ? `<img class="chars-avatar-img" src="${escapeHtml(c.sample_image_url)}" alt="">`
       : `<span class="chars-avatar-ph">${escapeHtml((name || '?').charAt(0).toUpperCase())}</span>`;
     return `<button type="button" class="chars-avatar-chip ${active ? 'active' : ''}"
-              onclick="sbPickCast(${JSON.stringify(c.id).replace(/"/g, '&quot;')})"
+              onclick="sbPickCast(${escapeHtml(JSON.stringify(c.id))})"
               title="${escapeHtml(name)}${active ? ' · click to deselect' : ''}">
               ${avatar}<span class="chars-avatar-name">${escapeHtml(name)}</span></button>`;
   }).join('');
@@ -763,7 +763,8 @@ async function sbPlan() {
   } catch (e) { r = { ok: false, error: String(e) }; }
   if (!r.ok) {
     sbPlanBtnReset();
-    phosToast(r.error || 'Planning could not start.', { kind: 'danger', duration: 6000 });
+    // 4.20: the planner's model (Gemma 3) may still be downloading.
+    if (!(typeof packNeededToast === 'function' && packNeededToast(r))) phosToast(r.error || 'Planning could not start.', { kind: 'danger', duration: 6000 });
     return;
   }
   SB.id = r.id;
@@ -888,7 +889,7 @@ async function sbReplan() {
   let r;
   try { r = await (await fetch('/storyboard/plan', { method: 'POST', body: fd })).json(); }
   catch (e) { r = { ok: false, error: String(e) }; }
-  if (!r.ok) { phosToast(r.error || 'Re-plan could not start.', { kind: 'danger', duration: 6000 }); return; }
+  if (!r.ok) { if (!(typeof packNeededToast === 'function' && packNeededToast(r))) phosToast(r.error || 'Re-plan could not start.', { kind: 'danger', duration: 6000 }); return; }
   sbShow('planning'); sbSetPlanningStage('load'); sbLoad(SB.id);
 }
 
@@ -912,7 +913,7 @@ async function sbTryAgain() {
   let r;
   try { r = await (await fetch('/storyboard/plan', { method: 'POST', body: fd })).json(); }
   catch (e) { r = { ok: false, error: String(e) }; }
-  if (!r.ok) { phosToast(r.error || 'Planning could not start.', { kind: 'danger', duration: 6000 }); return; }
+  if (!r.ok) { if (!(typeof packNeededToast === 'function' && packNeededToast(r))) phosToast(r.error || 'Planning could not start.', { kind: 'danger', duration: 6000 }); return; }
   sbShow('planning'); sbSetPlanningStage('load'); sbLoad(SB.id);
 }
 
@@ -2265,7 +2266,7 @@ async function sbRewrite() {
   let r;
   try { r = await (await fetch('/storyboard/replan-shots', { method: 'POST', body: fd })).json(); }
   catch (e) { r = { ok: false, error: String(e) }; }
-  if (!r.ok) { phosToast(r.error || 'Could not start the rewrite.', { kind: 'danger', duration: 6000 }); return; }
+  if (!r.ok) { if (!(typeof packNeededToast === 'function' && packNeededToast(r))) phosToast(r.error || 'Could not start the rewrite.', { kind: 'danger', duration: 6000 }); return; }
   sbShow('planning'); sbSetPlanningStage('load'); sbLoad(SB.id);
 }
 

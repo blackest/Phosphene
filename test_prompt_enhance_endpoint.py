@@ -125,6 +125,10 @@ class PromptEnhanceEndpointTest(unittest.TestCase):
             gemma4 = models / "gemma4-12b-ltx25-q4"
             gemma3.mkdir(parents=True)
             gemma4.mkdir(parents=True)
+            # 4.20: /prompt/enhance answers 409 "needs its language model" when
+            # Gemma 3 is not on disk (a fresh install fetches it after Start).
+            # Every mlx-lm model folder has a config.json; this stand-in has one.
+            (gemma3 / "config.json").write_text("{}", encoding="utf-8")
 
             # WarmHelper invokes LTX_HELPER_PYTHON with mlx_warm_helper.py as
             # argv[1]. This interpreter shim intentionally ignores that argv
@@ -241,6 +245,7 @@ class PromptEnhanceEndpointTest(unittest.TestCase):
             gemma4 = models / "gemma4-12b-ltx25-q4"
             gemma3.mkdir(parents=True)
             gemma4.mkdir(parents=True)
+            (gemma3 / "config.json").write_text("{}", encoding="utf-8")   # 4.20: present
             shim = scratch / "fake-helper-python"
             shim.write_text(
                 "#!/bin/sh\n"
@@ -314,7 +319,7 @@ class PromptEnhanceEndpointTest(unittest.TestCase):
                     return status, response_body
 
                 status, body = invoke(VALID_PROMPT)
-                self.assertEqual(status, 200)
+                self.assertEqual(status, 200, body)
                 self.assertGreater(len(body), 0)
                 payload = json.loads(body)
                 self.assertTrue(payload["ok"])

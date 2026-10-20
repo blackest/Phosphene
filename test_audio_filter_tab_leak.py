@@ -154,13 +154,14 @@ class TestOpenSongInAudioTab(unittest.TestCase):
 
     def test_path_argument_is_safely_escaped_in_the_open_link(self):
         # Consistent with every other per-item onclick in this file: JSON
-        # stringify + HTML-escape the quotes, never a raw string concat that
+        # stringify, then HTML-escape the WHOLE literal (ampersand included -
+        # escaping only the quote let a name containing `&quot;` break out,
+        # test_inline_handler_escaping.py), never a raw string concat that
         # would break on an apostrophe in the filename.
         fn = extract_function("selectOutput", QUEUE_JS)
         i = fn.index("player-audio-open")
         block = fn[fn.rindex("const pathAttr", 0, i):i]
-        self.assertIn("JSON.stringify(path)", block)
-        self.assertIn("&quot;", block)
+        self.assertIn("escapeHtml(JSON.stringify(path))", block)
 
 
 if __name__ == "__main__":

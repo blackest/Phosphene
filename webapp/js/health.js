@@ -226,6 +226,26 @@ function _uiEvent(event, props) {
   } catch (_) {}
 }
 
+// install_step `first_use` (growth pass, 2026-10-19): the first click or key
+// press anyone makes on this page, once per install, ever. Pinokio auto-runs
+// Start when the ~37 GB install finishes, so a panel can boot with nobody in
+// front of it; this is what tells "nobody ever looked" from "looked and left".
+// A hover or a scroll is not a person deciding to use the app, so only
+// pointerdown/keydown count. At most one localhost POST per page load; the
+// SERVER owns once-per-install (_analytics_install_step), deliberately not
+// localStorage: every install on a Mac is served from the same origin, so a
+// browser-side flag would silence a reinstall's new install id for good.
+function armFirstUseReport() {
+  const opts = {capture: true, passive: true};
+  const fire = () => {
+    document.removeEventListener('pointerdown', fire, opts);
+    document.removeEventListener('keydown', fire, opts);
+    _uiEvent('install_step', {step: 'first_use'});
+  };
+  document.addEventListener('pointerdown', fire, opts);
+  document.addEventListener('keydown', fire, opts);
+}
+
 function _maybeShowUpdateModal(st) {
   if (window._updModalShownThisLoad || window._phModalOpen) return;
   if (!st || st.error || st.suppress_reason || !st.checked_ts) return;
@@ -931,7 +951,7 @@ setInterval(refreshVersionPill, 5 * 60 * 1000);
 // Inline handlers in the markup and the other files resolve these through
 // the global scope; everything NOT listed here is private to this module.
 Object.assign(globalThis, {
-  renderVersionPill, updateHealthChip, versionPillClick, _uiEvent,
+  renderVersionPill, updateHealthChip, versionPillClick, _uiEvent, armFirstUseReport,
   // SYS-19: closeHealthPop wasn't published -- openTierModal (settings.js)
   // and openModelsModal (preview.js) need it so clicking a health-popover
   // row closes the popover before its modal opens on top of it.

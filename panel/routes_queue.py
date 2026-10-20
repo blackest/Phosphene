@@ -281,15 +281,23 @@ def get_status(h, parsed) -> None:
     # user gets live feedback even before opening the log panel.
     with P.DOWNLOAD_LOCK:
         if P.DOWNLOAD["active"]:
+            _dl_repo = next((r for r in P._repos() if r.get("key") == P.DOWNLOAD["key"]), {})
             payload["download"] = {
                 "active": True,
                 "key": P.DOWNLOAD["key"],
                 "repo_id": P.DOWNLOAD["repo_id"],
                 "started_ts": P.DOWNLOAD["started_ts"],
                 "last_line": P.DOWNLOAD["last_line"],
+                # 4.20: the post-install background fetcher, not a click.
+                "background": bool(P.DOWNLOAD.get("background")),
+                "name": _dl_repo.get("name") or P.DOWNLOAD["key"],
+                "size_gb": _dl_repo.get("size_gb"),
             }
         else:
             payload["download"] = {"active": False}
+    # 4.20: what install.js left for after Start, and where the background
+    # fetcher is with it (empty and idle on every install it never queued).
+    payload["deferred_downloads"] = P.deferred_status()
     payload["hf_available"] = P.HF_BIN is not None
     # Settings snapshot — only needs the public-safe view (booleans
     # for token presence, no secret values). The UI reads
@@ -664,6 +672,12 @@ def post_prompt_enhance(h, path, qs, ctype) -> None:
         mode = "t2v"
     if not user_prompt:
         h._json({"error": "no prompt provided"}, 400); return
+    # 4.20: Gemma 3 is downloaded in the background after the first boot, so
+    # for a while after a fresh install it is not on disk yet. Say so - with
+    # what to do - instead of letting the helper fail to load a model that is
+    # still arriving.
+    if P.enhance_model_missing():
+        h._json(P.gemma3_refusal("Enhance", "its language model, Gemma 3", P.GEMMA), 409); return
     # 2026-05-20 — collect trigger tokens that Gemma MUST preserve
     # case-exact. Three sources, unioned:
     #   1. The panel-supplied `preserve_tokens` form field (the
@@ -758,6 +772,13 @@ def post_prompt_enhance(h, path, qs, ctype) -> None:
     if triggers_added:
         P.push(f"[enhance] added trigger word(s): {', '.join(triggers_added)}")
     P.push(f"[enhance] → {enhanced[:120]}… ({result.get('elapsed_sec','?')}s)")
+    # `enhance_prompt` was in the feature vocabulary and the /analytics/ui
+    # allowlist since v4.9.7, but nothing ever sent it: the fleet showed 0
+    # Enhance uses across 809 active installs (2026-09-19 -> 10-19), which is
+    # "unmeasured", not "unused". Counted here, on success, where it happens.
+    # It decides whether the 6 GB Gemma 3 that Enhance runs on has to be
+    # downloaded before a new user can press Start at all.
+    P._analytics_feature("enhance_prompt", "a2v" if a2v_mode else mode)
     h._json({
         "ok": True,
         "original": user_prompt,
@@ -1219,6 +1240,15 @@ def post_queue_newtake(h, path, qs, ctype) -> None:
     src_params = side.get("params") or {}
     if not src_params:
         h._json({"error": "sidecar has no params to replay"}, 400); return
+    # A Sharp export of a clip that had no settings of its own (an imported
+    # mp4) records only {mode: t2v, sharp_export_*}: no prompt, no canvas. New
+    # Take queued that as a t2v job, which died on its first missing field -
+    # the bare `'stop_comfy'` in the fleet (4.19.5). Nothing to re-roll.
+    if src_params.get("sharp_export_source") and not (
+            src_params.get("prompt") or src_params.get("width")):
+        h._json({"error": "This clip is a Sharp export of a clip with no "
+                          "recorded settings, so there is nothing to re-roll."},
+                400); return
     new_params = dict(src_params)
     stored_take = new_params.get("take")
     if stored_take:

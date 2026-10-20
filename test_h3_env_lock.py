@@ -113,10 +113,16 @@ class ConstraintsOnEveryPath(unittest.TestCase):
         self.assertLess(hits[0], gate, "the LTX import gate must stay the last step")
         # The optional engine's "error:" lines cannot end the Update (Pinokio
         # 8.2.0 stops a run on one) - and the WARN still fires (pipefail).
-        self.assertIn("2>&1", post[hits[0]])
-        self.assertIn("s/[Ee][Rr][Rr][Oo][Rr]:/problem -/g", post[hits[0]])
+        # 4.20: through post_update.sh's `defang` helper, whose body holds the
+        # same sed and the pipefail (so the WARN fires on h3_deps.sh's own exit).
+        self.assertIn("defang bash", post[hits[0]])
+        body = "\n".join(_code_lines("scripts/post_update.sh"))
+        helper = body[body.index("defang() ("):]
+        helper = helper[:helper.index("\n)")]
+        self.assertIn("2>&1", helper)
+        self.assertIn("s/[Ee][Rr][Rr][Oo][Rr]:/problem -/g", helper)
+        self.assertIn("set -o pipefail", helper)
         self.assertIn("|| echo 'WARN", post[hits[0]])
-        self.assertIn("set -o pipefail", post[hits[0] - 1])
 
     def test_the_panel_repair_runs_h3_deps(self):
         seen = {}

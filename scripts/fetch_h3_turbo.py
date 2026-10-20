@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -25,6 +26,17 @@ ASSET_URL = (
 )
 ASSET_SHA256 = "d51d626fe0845da7e5845a47c323cf3f29086d44d24cb1a4b980882488746197"
 ASSET_BYTES = 1956165254
+
+
+def _plain(text) -> str:
+    """An exception's text with Pinokio's two stop words defused.
+
+    This fetch is OPTIONAL (the panel offers a one-click retry). Pinokio 8.2
+    ends an install when a step's output matches /error:/i or /errno /i, and a
+    dropped connection reads "<urlopen error [Errno 8] ...>" - which would end
+    the whole H3 install over a file the panel can fetch later.
+    """
+    return re.sub(r"(?i)errno ", "errno-", re.sub(r"(?i)error:", "problem -", str(text)))
 
 
 def file_sha256(path: Path) -> str:
@@ -85,7 +97,7 @@ def main() -> int:
                 fh.write(chunk)
                 written += len(chunk)
     except Exception as exc:  # noqa: BLE001
-        print(f"TURBO FETCH FAILED at {written // (1 << 20)} MB: {exc} "
+        print(f"TURBO FETCH FAILED at {written // (1 << 20)} MB: {_plain(exc)} "
               "(partial kept for resume; panel offers a one-click retry)",
               file=sys.stderr)
         return 1

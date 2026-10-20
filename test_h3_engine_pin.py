@@ -113,7 +113,8 @@ class PinBehaviour(unittest.TestCase):
         self.script.write_text(text)
         r = self._run()
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("left as is", r.stdout)
+        self.assertIn("FATAL error:", r.stdout)       # the line that stops a Pinokio install (4.20)
+        self.assertIn("left as it was", r.stdout)
         self.assertEqual(_git(self.checkout, "rev-parse", "HEAD"), before)
 
 

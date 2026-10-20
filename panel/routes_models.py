@@ -37,15 +37,32 @@ def post_models_download(h, path, qs, ctype) -> None:
         h._json({"error": "hf binary not found. Reinstall Phosphene "
                              "or install huggingface_hub>=1.0 in the venv."}, 500); return
     with P.DOWNLOAD_LOCK:
-        if P.DOWNLOAD["active"]:
-            h._json({"error": f"another download is in progress: "
-                                 f"{P.DOWNLOAD['repo_id']}. Wait for it to finish "
-                                 f"(or click Cancel)."}, 409); return
-        P.DOWNLOAD["active"] = True
-        P.DOWNLOAD["key"] = key
-        P.DOWNLOAD["repo_id"] = repo["repo_id"]
-        P.DOWNLOAD["started_ts"] = P.time.time()
-        P.DOWNLOAD["last_line"] = "starting…"
+        busy = P.DOWNLOAD["active"]
+        busy_key = P.DOWNLOAD.get("key")
+        busy_bg = bool(P.DOWNLOAD.get("background"))
+        busy_repo = P.DOWNLOAD.get("repo_id")
+        if not busy:
+            P.DOWNLOAD["active"] = True
+            P.DOWNLOAD["background"] = False
+            P.DOWNLOAD["key"] = key
+            P.DOWNLOAD["repo_id"] = repo["repo_id"]
+            P.DOWNLOAD["started_ts"] = P.time.time()
+            P.DOWNLOAD["last_line"] = "starting…"
+    if busy:
+        # 4.20: the background fetcher holds the slot after a fresh install. A
+        # click for the pack it is fetching is already being served, and a
+        # click for one queued behind it moves that one to the front - the
+        # user asked for it, a 409 would only make them wait without saying so.
+        if busy_bg and busy_key == key:
+            h._json({"ok": True, "key": key, "already": True,
+                     "note": "Already downloading in the background."}); return
+        if busy_bg and P.deferred_prioritize(key):
+            h._json({"ok": True, "key": key, "queued": True,
+                     "note": "Queued next - it starts when the current background "
+                             "download finishes."}, 202); return
+        h._json({"error": f"another download is in progress: "
+                             f"{busy_repo}. Wait for it to finish "
+                             f"(or click Cancel)."}, 409); return
     P.threading.Thread(target=P._download_thread, args=(repo,), daemon=True).start()
     h._json({"ok": True, "key": key, "repo_id": repo["repo_id"]}); return
 

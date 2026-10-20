@@ -578,6 +578,42 @@ transcribed back word for word on the first take) is the reference render.
 
 ---
 
+### Prompt guards (2026-10-19)
+
+`h3_prompt_guards.py`, applied in `run_h3_job_inner` to the text the runner encodes (the
+main prompt and every per-window prompt; `p["prompt"]` keeps what was typed, the guards
+applied land in `h3_prompt_guards_applied`). H3 has no negative prompt, so each guard is
+one in-prompt sentence at the end of the description field, added only when the prompt
+does not already ask for the opposite, and never twice:
+
+| Guard | Against | Fires when | Default |
+|---|---|---|---|
+| `ellipsis` | ComfyUI H3 guide: ellipses hurt intelligibility | `...` / `…` inside `<d>` → `,` or `.` (the only edit to dialogue words) | on |
+| `spoken` | MiniMax-H3 #68, spoken lines sung | a `<d>` line and no singing word anywhere outside it (instrumental music does not count); not on Lip-sync | on |
+| `hands` | #86, rings invented on bare hands | hands in the description, no ring/jewellery/gloves/watch asked; not on Add sound | on |
+| `nouns` | #81, what the dialogue mentions appears | the line names content words the description does not; not on Add sound | **opt-in** |
+
+`h3_prompt_guards=off` sends the prompt verbatim; `all` adds `nouns`. The storyboard
+planner's L14 tells the LLM the same: no `...` in `<d>`, and the description names only
+what should be seen.
+
+A/B, Draft Fast (640×384, 124 f, TaoMate 3-step), T2V, same seed per pair, unguarded vs
+every guard that fires (the review folder's `work/out/ux_*`). Voice measured on
+the demucs vocal stem (pyin): a known spoken clip reads voiced 0.20 / held-note 0.08, a
+known sung one 0.90 / 0.40.
+
+| Prompt (seed) | Guards | Whisper (raw → guarded) | Vocal: voiced, held-note (raw → guarded) | Picture |
+|---|---|---|---|---|
+| pier line over a guitar score (5101) | spoken, nouns | word-perfect → word-perfect | 0.40, 0.21 → 0.39, 0.11 | same shot; neither take sung |
+| two hands, candlelit table (5102) | hands | — (no line) | — | a ring on her finger in BOTH takes |
+| umbrella line with `...` (5103) | ellipsis, spoken, nouns | word-perfect → word-perfect | 0.51, 0.16 → 0.49, 0.13 | no umbrella or train in either; the guarded take adds a red fire extinguisher |
+
+So at one seed each: no guard cost intelligibility, and the guarded voice reads further
+from singing; the hands sentence did not stop the ring; the nouns sentence did not
+change the absent objects and came with a stray red prop, which is why it is opt-in.
+None of the three failures reproduced cleanly on the unguarded side either — a
+many-seed run is what would show a rate.
+
 ## LoRAs
 
 H3 takes community adapters through the same `--lora PATH[:SCALE]` flag Turbo

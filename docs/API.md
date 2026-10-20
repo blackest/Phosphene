@@ -72,6 +72,7 @@ Add a job to the panel's queue. Returns immediately; the helper renders it async
 | `video_path`, `h3_extend_seconds` | path / float | `mode=extend`: any clip, continued from its last 17 frames and their sound; 0.5–15 s added after it. |
 | `audio`, `image`, `frames`, `audio_start_time`, `audio_stem_auto` | | `mode=a2v` with `engine=h3`: the track is held exactly and the picture rendered to it; `frames` (24 fps) is the length, capped at the audio left after `audio_start_time` and at 30 s; `audio_stem_auto=on` conditions on the separated vocal and delivers the original. |
 | `video_path` | path | `mode=v2a` (Add sound, H3 only): the clip's picture is kept exactly and only its sound is generated; up to 60 s. |
+| `h3_prompt_guards` | `""` \| `off` \| `all` \| comma list | Which prompt guards run on the text the runner encodes (`h3_prompt_guards.py`): `ellipsis`, `spoken`, `hands`, `nouns`. Empty = the default set (`ellipsis`, `spoken`, `hands`; `nouns` is opt-in); `off` sends the prompt verbatim. The guards applied are recorded as `h3_prompt_guards_applied`; `prompt` keeps what was typed. |
 
 **LoRA payload:** the `loras` field is a JSON-encoded array of `{path, strength}` objects. Stack as many as needed: On Hailuo H3, stacking needs the engine's repeatable `--lora` (`/status.h3.loras.max_stack` > 1); an older pack takes one adapter and the `h3_lora_slot` field decides whether it goes to Turbo or to the LoRA.
 
@@ -244,6 +245,8 @@ whatever the chosen quality renders on.
 
 Every `outputs[]` row carries `q`: the output's searchable words, lower-cased, built from its sidecar in the listing pass that already reads it — prompt, label, mode, quality, engine, character, seed, `WxH`, `Nf`, LoRA file stems, the model directory name, the temporal mode and `windows`. The gallery's search box is a substring test over `name + q`; every typed word must match, and typing pulls the older outputs in so the search is over everything.
 
+Every video row also carries `silent`: `true` when the clip has no sound (no audio track in its mp4 header, or a track that never rises above −80 dB), `false` with sound, `null` while not known yet. The header read is inline; the level check runs once per file on a background thread and is cached per (mtime, size) in `state/output_silence.json`, so a poll never decodes anything. The gallery card and the player offer **Add sound** on a `silent` clip when `/status.h3.video_to_audio` is true.
+
 Returns the full panel state.
 
 ```json
@@ -258,6 +261,7 @@ Returns the full panel state.
 ```
 
 Field semantics:
+- `deferred_downloads` (4.20) — `{ active, state, key, message, pending: [{key, name, size_gb, left_gb}], left_gb, finished }`. The packs a fresh install queued for after Start (`state/install_deferred.json`, written by install.js; `required_files.json -> install.after_start`). `state` is `idle`, `starting`, `downloading`, `waiting` (another download holds the slot), `waiting_disk` (the panel keeps `install.background_floor_gb` free; `message` says how much to free), `retry_wait`, `failed` or `done`. Empty and `idle` on any install install.js never queued — an updated install downloads nothing. `download` carries `background: true` while the fetcher holds the slot.
 - `current` — the job actively running (`null` when idle).
 - `queue` — jobs waiting, FIFO order.
 - `history` — completed/failed jobs. Each entry has `status`, `elapsed_sec`, `output_path`, `raw_path` (native pre-upscale), `error`.
@@ -993,6 +997,8 @@ Form-encoded. Pre-rewrites a prompt with Gemma. Used by the panel's Enhance butt
 | `loras` | 4.18.0: JSON list of installed LoRA paths on the render. The panel reads each one's name, trigger words and guide (else the creator's description) from the LoRA library — paths it does not list are ignored — and hands at most 4, bounded, to the helper as fenced reference text. A LoRA whose trigger words are all missing from the result gets its first trigger put back at the front. |
 
 Returns `{ ok, original, enhanced, mode, elapsed_sec, source_non_latin, translated, lora_notes_used: [names], lora_triggers_added: [words] }`; `{ error }` with 409 while a render holds the GPU.
+
+**409 `needs_pack` (4.20).** Enhance runs on Gemma 3, which a fresh install downloads in the background *after* the first boot (see `deferred_downloads` under `GET /status`). Until it is on disk the route answers 409 `{ ok: false, error, needs_pack: "gemma", pack_name, pack_size, pack_state }` with `pack_state` one of `downloading`, `queued`, `waiting_disk`, `missing`, and never asks the helper to load it. `/storyboard/plan`, `/storyboard/replan-shots`, `/oneshot/plan` and `/train/auto-caption` answer the same shape for the same reason. `POST /models/download repo_key=<needs_pack>` fetches it now: while the background fetcher holds the download slot that answers 202 `{ queued: true }` and moves the pack to the front of the queue (`{ already: true }` when it is the one downloading).
 
 ### `POST /upload`
 

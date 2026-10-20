@@ -4488,7 +4488,7 @@ The last line"></textarea>
         <!-- VC-18/37: secondary clip actions that don't earn a permanent icon
              slot — Sharp export (re-run the ANE upscaler on a clip already
              liked, no re-render), Use last frame (seed a fresh i2v roll from
-             where this take ended), Open in Editor, Reveal in Finder. One
+             where this take ended), Open in Editor, Reveal in Finder, Share. One
              popover, video-only (CSS/JS hide it for stills and audio). -->
         <div class="kebab-wrap" id="playerMoreWrap">
           <button id="playerMoreBtn" class="po-act" type="button"
@@ -4521,6 +4521,11 @@ The last line"></textarea>
                     title="Show this file in Finder">
               <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 5 a1 1 0 0 1 1-1 h3 l1.2 1.6 H13 a1 1 0 0 1 1 1 V12 a1 1 0 0 1-1 1 H3 a1 1 0 0 1-1-1 Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
               Reveal in Finder
+            </button>
+            <button type="button" role="menuitem" onclick="kebabToggle('playerMorePop',false);shareActive()"
+                    title="Copy a one-line caption with the Phosphene link and select this file in Finder, ready to post">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2 V10 M5 5 L8 2 L11 5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 8.5 V13 a1 1 0 0 0 1 1 H12 a1 1 0 0 0 1-1 V8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+              Share
             </button>
           </div>
         </div>

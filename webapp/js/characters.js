@@ -1172,6 +1172,7 @@ async function audioStudioEnhancePrompt() {
     }
     const r = await fetch('/prompt/enhance', { method: 'POST', body: fd });
     const res = await r.json();
+    if ((typeof packNeededToast === 'function' && packNeededToast(res))) return;   // 4.20: Gemma 3 still downloading / not yet fetched
     if (res.error) { phosToast('Enhance failed: ' + res.error, { kind: 'danger', duration: 8000 }); return; }
     // No native confirm (it blocked the page and could not be undone): apply
     // the result, say what the LoRAs changed, and offer Undo in the toast.
@@ -2098,8 +2099,8 @@ function charactersRenderGrid() {
     return `
       <div class="characters-card" role="button" tabindex="0"
            data-character-id="${charactersEscapeAttr(c.id)}"
-           onclick="charactersOpenCompose('${charactersEscapeAttr(c.id)}')"
-           onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();charactersOpenCompose('${charactersEscapeAttr(c.id)}')}">
+           onclick="charactersOpenCompose(${escapeHtml(JSON.stringify(String(c.id)))})"
+           onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();charactersOpenCompose(${escapeHtml(JSON.stringify(String(c.id)))})}">
         ${img}
         ${silentOverlay}
         <div class="characters-card-meta">
@@ -2132,7 +2133,7 @@ function charactersRenderChips() {
                data-val="${charactersEscapeAttr(val)}"
                data-pipeline="${charactersEscapeAttr((row && row.pipeline) || '')}"
                title="${charactersEscapeAttr(title)}"
-               onclick="charactersPickChip('${fieldName}', '${charactersEscapeAttr(val)}')">${charactersEscapeHtml(label)}</button>`
+               onclick="charactersPickChip(${escapeHtml(JSON.stringify(String(fieldName)))}, ${escapeHtml(JSON.stringify(String(val)))})">${charactersEscapeHtml(label)}</button>`
       );
     }).join('');
   };
@@ -3260,7 +3261,7 @@ function trainRenderThumbs() {
     const cls = 'train-thumb' + (img.uploading ? ' uploading' : '');
     const removeAttr = img.uploading
       ? ''
-      : `onclick="trainRemoveImage('${img.filename.replace(/'/g, "\\'")}')"`;
+      : `onclick="trainRemoveImage(${escapeHtml(JSON.stringify(img.filename))})"`;
     const capCls = img.uploading ? '' :
       (img.captioned ? 'captioned' : 'uncaptioned');
     const capLabel = img.uploading ? '' :
@@ -3445,6 +3446,7 @@ async function trainAutoCaption() {
   const j = await r.json().catch(() => ({}));
   if (!r.ok || !j.ok) {
     if (status) status.textContent = 'Failed: ' + (j.error || `HTTP ${r.status}`);
+    (typeof packNeededToast === 'function' && packNeededToast(j));   // 4.20: the captioning model may still be downloading
     trainAutoCaptionFinish();
     return;
   }
@@ -3943,7 +3945,6 @@ async function trainRefreshLoraList() {
     list.innerHTML = items.map(it => {
       const safeTrig = (it.trigger || '').replace(/[<>&"']/g, c =>
         ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'})[c]);
-      const safePath = (it.path || '').replace(/'/g, "\\'");
       const displayName = it.name || it.filename;
       // The verdict rides on the chip so a dead LoRA is visible in the list,
       // not only in the log of the run that made it (#62). `unknown` — every
@@ -3959,7 +3960,7 @@ async function trainRefreshLoraList() {
         ? `<span class="train-lora-verdict">${verdict === 'inert' ? 'DEAD' : 'WEAK'}</span>`
         : '';
       return `<a href="#" class="train-lora-chip${flagged ? ' is-weak' : ''}" title="${escapeHtml(title)}"
-        onclick="trainUseInVideo('${safePath}','${safeTrig}','t2v'); return false;">${displayName}${badge}</a>`;
+        onclick="trainUseInVideo(${escapeHtml(JSON.stringify(it.path || ''))},${escapeHtml(JSON.stringify(it.trigger || ''))},'t2v'); return false;">${escapeHtml(displayName)}${badge}</a>`;
     }).join('');
   } catch (e) {
     list.innerHTML = '<div class="hint">Load failed: ' + (e.message || 'unknown') + '</div>';

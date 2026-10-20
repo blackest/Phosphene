@@ -386,7 +386,11 @@ for (const [label, re] of [["the IC-LoRA fetches", /IC-LoRA-Colorizer/], ["the L
   if (!postH3.length) failures.push("post_update.sh does not run scripts/pinokio/h3_deps.sh - an Update would never repair a drifted H3 venv.")
   else {
     const next = (code[code.indexOf(postH3[0]) + 1] || {}).t || ""
-    if (!/2>&1/.test(postH3[0].t) || !/sed -u -e 's\/\[Ee\]\[Rr\]\[Rr\]\[Oo\]\[Rr\]:/.test(next)) failures.push(`post_update.sh line ${postH3[0].n}: h3_deps.sh's output is not piped through the "error:" defang - a failed optional H3 repair would end the Update before the LTX import gate.`)
+    // Either the old inline pipe, or (4.20) the `defang` helper - whose own
+    // body must carry the same sed.
+    const viaHelper = /\bdefang\s+bash\b/.test(postH3[0].t) &&
+      /^defang\(\)[\s\S]*?sed -u -e 's\/FATAL \[Ee\]rror:\/WARN:\/g' -e 's\/\[Ee\]\[Rr\]\[Rr\]\[Oo\]\[Rr\]:\//m.test(lines.join("\n"))
+    if (!viaHelper && (!/2>&1/.test(postH3[0].t) || !/sed -u -e 's\/\[Ee\]\[Rr\]\[Rr\]\[Oo\]\[Rr\]:/.test(next))) failures.push(`post_update.sh line ${postH3[0].n}: h3_deps.sh's output is not piped through the "error:" defang - a failed optional H3 repair would end the Update before the LTX import gate.`)
     else console.log(`  ok    post_update.sh runs h3_deps.sh (line ${postH3[0].n}), "error:" defanged`)
     const gate = code.find((l) => /import ltx_core_mlx, ltx_pipelines_mlx, mlx/.test(l.t))
     if (gate && postH3[0].n > gate.n) failures.push("post_update.sh runs h3_deps.sh after the import gate - the gate must stay the last install step.")
